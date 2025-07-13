@@ -1,13 +1,17 @@
 # Taskmux
 
-A modern tmux development environment manager with real-time health monitoring, auto-restart capabilities, and WebSocket API. Built with Python using libtmux for reliable session management.
+A modern tmux development environment manager for LLM development tools with real-time health monitoring, auto-restart capabilities, and WebSocket API.
 
 ## Why Taskmux?
 
-Instead of manually managing multiple tmux windows or remembering complex command sequences, Taskmux provides:
+LLM coding tools like Claude Code and Cursor can struggle with background tasks required in development. Taskmux provides an LLM tool friendly interface to managing multiple background tasks, restarting them, checking on status, reading logs and more from within LLM coding tools.
+
+The interface is a CLI and MCP server that is built to be called by both humans and LLMs.
+
+Taskmux provides:
 
 - **Dynamic task management**: Define tasks in JSON, manage via modern CLI
-- **Health monitoring**: Real-time task health checks with visual indicators  
+- **Health monitoring**: Real-time task health checks with visual indicators
 - **Auto-restart**: Automatically restart failed tasks to keep development flowing
 - **WebSocket API**: Real-time status updates and remote task management
 - **Rich CLI**: Beautiful terminal output with Typer and Rich integration
@@ -70,7 +74,7 @@ After installation, `taskmux` command will be available globally.
   "name": "myproject",
   "tasks": {
     "server": "npm run dev",
-    "build": "npm run build:watch", 
+    "build": "npm run build:watch",
     "test": "npm run test:watch",
     "db": "docker-compose up postgres"
   }
@@ -101,7 +105,7 @@ taskmux status                   # Show session and task status
 taskmux list                     # List all tasks with health indicators
 taskmux stop                     # Stop session and all tasks
 
-# Task Management  
+# Task Management
 taskmux restart <task>           # Restart specific task
 taskmux kill <task>              # Kill specific task
 taskmux add <task> "<command>"   # Add new task to config
@@ -191,35 +195,6 @@ Create `taskmux.json` in your project root:
 }
 ```
 
-**Data Science**:
-```json
-{
-  "name": "analysis",
-  "tasks": {
-    "jupyter": "jupyter lab --port=8888",
-    "mlflow": "mlflow ui --port=5000",
-    "airflow": "airflow webserver",
-    "postgres": "docker run -p 5432:5432 postgres:13",
-    "tensorboard": "tensorboard --logdir=./logs"
-  }
-}
-```
-
-**Microservices**:
-```json
-{
-  "name": "microservices", 
-  "tasks": {
-    "api-gateway": "node gateway/server.js",
-    "user-service": "go run services/user/main.go",
-    "order-service": "python services/orders/app.py",
-    "redis": "redis-server",
-    "postgres": "docker-compose up -d db",
-    "monitoring": "prometheus --config.file=prometheus.yml"
-  }
-}
-```
-
 ## Advanced Features
 
 ### Daemon Mode with WebSocket API
@@ -252,7 +227,7 @@ ws.send(JSON.stringify({
 
 // Get logs
 ws.send(JSON.stringify({
-  command: "logs", 
+  command: "logs",
   params: { task: "server", lines: 50 }
 }));
 ```
@@ -265,22 +240,6 @@ Taskmux continuously monitors task health and can auto-restart failed processes:
 - **Process monitoring**: Detects when tasks exit or become unresponsive
 - **Auto-restart**: Daemon mode automatically restarts failed tasks
 - **Health checks**: Run `taskmux health` for detailed status
-
-### File Watching
-
-Monitor config changes in real-time:
-
-```bash
-# Terminal 1: Start file watcher
-taskmux watch
-
-# Terminal 2: Edit config
-echo '{"name": "test", "tasks": {"new": "echo hello"}}' > taskmux.json
-# Watcher automatically reloads config and updates running tasks
-
-# New task is immediately available
-taskmux restart new
-```
 
 ## Workflow Integration
 
@@ -335,7 +294,7 @@ Each project gets its own tmux session based on the `name` field:
 cd ~/projects/webapp
 taskmux start
 
-# Project B (session: "api") 
+# Project B (session: "api")
 cd ~/projects/api
 taskmux start
 
@@ -344,17 +303,6 @@ tmux list-sessions
 # webapp: 4 windows
 # api: 2 windows
 ```
-
-## Architecture
-
-Taskmux is built with modern Python tooling:
-
-- **libtmux**: Reliable Python API for tmux session management
-- **Typer**: Modern CLI framework with rich help and validation
-- **Rich**: Beautiful terminal output with tables and progress bars
-- **WebSockets**: Real-time API for remote monitoring and control
-- **asyncio**: Async health monitoring and daemon capabilities
-- **Watchdog**: File system monitoring for config changes
 
 ## Troubleshooting
 
@@ -390,7 +338,7 @@ View detailed tmux session information:
 # Check if session exists
 tmux has-session -t myproject
 
-# List windows in session  
+# List windows in session
 tmux list-windows -t myproject
 
 # View logs manually
@@ -400,15 +348,6 @@ tmux capture-pane -t myproject:taskname -p
 tail -f ~/.taskmux/daemon.log
 ```
 
-## Contributing
-
-Taskmux follows modern Python development practices:
-
-1. **Modular architecture**: Separate concerns (CLI, tmux management, daemon, config)
-2. **Type hints**: Full type annotation for better IDE support
-3. **Rich CLI**: Beautiful, user-friendly command-line interface
-4. **Async support**: Background monitoring and WebSocket API
-5. **Comprehensive testing**: Test across different tmux versions and platforms
 
 ## License
 

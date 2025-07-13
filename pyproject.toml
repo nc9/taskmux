@@ -1,7 +1,7 @@
 [project]
 name = "taskmux"
 version = "0.1.0"
-description = "Modern tmux development environment manager with real-time health monitoring, auto-restart, and WebSocket API"
+description = "Modern tmux-based task manager for LLM development tools"
 readme = "README.md"
 license-file = "LICENSE"
 requires-python = ">=3.8"
@@ -47,8 +47,16 @@ Repository = "https://github.com/nc9/taskmux"
 Issues = "https://github.com/nc9/taskmux/issues"
 
 [build-system]
-requires = ["uv_build>=0.7.20,<0.8.0"]
-build-backend = "uv_build"
-source-include = ["taskmux/templates/*.md"]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.uv.build-backend]
+[tool.hatch.build.targets.wheel]
+packages = ["src/taskmux"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/taskmux",
+    "src/taskmux/templates/*.md",
+    "README.md",
+    "LICENSE",
+]
