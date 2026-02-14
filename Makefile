@@ -10,12 +10,12 @@ test:
 	uv run pytest -v
 
 lint:
-	uv run ruff check src/taskmux/ tests/
-	uv run basedpyright src/taskmux/
+	uv run ruff check taskmux/ tests/
+	uv run basedpyright taskmux/
 
 fmt:
-	uv run ruff format src/taskmux/ tests/
-	uv run ruff check --fix src/taskmux/ tests/
+	uv run ruff format taskmux/ tests/
+	uv run ruff check --fix taskmux/ tests/
 
 check: fmt lint test
 

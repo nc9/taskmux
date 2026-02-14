@@ -69,11 +69,11 @@ pythonVersion = "3.11"
 typeCheckingMode = "standard"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/taskmux"]
+packages = ["taskmux"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/taskmux",
+    "taskmux",
     "README.md",
     "LICENSE",
 ]
