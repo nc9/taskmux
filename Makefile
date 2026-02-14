@@ -1,49 +1,46 @@
-.PHONY: build clean publish test-build test-publish help
+.DEFAULT_GOAL := dev
+BUMP ?= patch
 
-# Default target
-help:
-	@echo "Available targets:"
-	@echo "  build         - Build the package"
-	@echo "  clean         - Clean build artifacts"
-	@echo "  publish       - Publish to PyPI (requires PYPI_TOKEN)"
-	@echo "  test-build    - Test the built package locally"
-	@echo "  test-publish  - Publish to TestPyPI (requires TESTPYPI_TOKEN)"
-	@echo ""
-	@echo "Usage:"
-	@echo "  make build"
-	@echo "  PYPI_TOKEN=your_token make publish"
+.PHONY: dev test lint fmt check link unlink bump publish release clean
 
-# Clean build artifacts
-clean:
-	rm -rf dist/ build/ *.egg-info/
+dev:
+	uv sync
 
-# Build the package
-build: clean
+test:
+	uv run pytest -v
+
+lint:
+	uv run ruff check src/taskmux/ tests/
+	uv run basedpyright src/taskmux/
+
+fmt:
+	uv run ruff format src/taskmux/ tests/
+	uv run ruff check --fix src/taskmux/ tests/
+
+check: fmt lint test
+
+link:
+	ln -sf $(shell uv run which taskmux) ~/.local/bin/taskmux
+
+unlink:
+	rm -f ~/.local/bin/taskmux
+
+bump:
+	uv version --bump $(BUMP)
+
+publish:
 	uv build
+	uv publish
 
-# Test the built package locally
-test-build: build
-	@echo "Testing package import..."
-	uv run --with ./dist/taskmux-*.whl --no-project -- python -c "import taskmux; print('✅ Package import successful')"
+release: check
+	@if [ -n "$$(git status --porcelain)" ]; then echo "dirty tree"; exit 1; fi
+	uv version --bump $(BUMP)
+	git add pyproject.toml
+	git commit -m "chore(release): v$$(uv version)"
+	git tag "v$$(uv version)"
+	git push --follow-tags
+	uv build
+	uv publish
 
-# Publish to PyPI
-publish: build
-	@if [ -z "$(PYPI_TOKEN)" ]; then \
-		echo "❌ Error: PYPI_TOKEN environment variable is required"; \
-		echo "Usage: PYPI_TOKEN=your_token make publish"; \
-		exit 1; \
-	fi
-	@echo "🚀 Publishing to PyPI..."
-	uv publish --token $(PYPI_TOKEN)
-	@echo "✅ Published successfully!"
-
-# Publish to TestPyPI for testing
-test-publish: build
-	@if [ -z "$(TESTPYPI_TOKEN)" ]; then \
-		echo "❌ Error: TESTPYPI_TOKEN environment variable is required"; \
-		echo "Usage: TESTPYPI_TOKEN=your_token make test-publish"; \
-		exit 1; \
-	fi
-	@echo "🧪 Publishing to TestPyPI..."
-	uv publish --publish-url https://test.pypi.org/legacy/ --token $(TESTPYPI_TOKEN)
-	@echo "✅ Published to TestPyPI successfully!"
+clean:
+	rm -rf dist/ build/ *.egg-info/ .pytest_cache/

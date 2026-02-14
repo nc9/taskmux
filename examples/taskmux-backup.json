@@ -1,9 +1,0 @@
-{
-  "name": "taskmux-dev",
-  "tasks": {
-    "server": "echo 'Starting server...' && sleep 2 && echo 'Server running on port 3000' && while true; do echo $(date): Server heartbeat; sleep 5; done",
-    "build": "echo 'Building project...' && sleep 3 && echo 'Build complete!' && exit 0",
-    "test": "echo 'Running tests...' && sleep 1 && echo 'All tests passed!' && exit 0",
-    "monitor": "while true; do echo $(date): Monitoring system; sleep 10; done"
-  }
-}

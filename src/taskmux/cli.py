@@ -1,6 +1,4 @@
-"""
-Typer-based CLI interface for Taskmux.
-"""
+"""Typer-based CLI interface for Taskmux."""
 
 import asyncio
 
@@ -8,13 +6,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .config import TaskmuxConfig
+from .config import addTask, loadConfig, removeTask
 from .daemon import SimpleConfigWatcher, TaskmuxDaemon
+from .models import TaskmuxConfig
 from .tmux_manager import TmuxManager
 
 app = typer.Typer(
     name="taskmux",
-    help="Modern tmux development environment manager with real-time health monitoring, auto-restart, and WebSocket API",
+    help="Modern tmux development environment manager with health monitoring and auto-restart",
     epilog="Uses libtmux API with health monitoring and daemon capabilities.",
     rich_markup_mode="rich",
 )
@@ -26,24 +25,21 @@ class TaskmuxCLI:
     """Main CLI application class."""
 
     def __init__(self):
-        self.config = TaskmuxConfig()
+        self.config: TaskmuxConfig = loadConfig()
         self.tmux = TmuxManager(self.config)
 
     def handle_config_reload(self):
         """Handle config file reload in daemon mode"""
-        # Check for new or changed tasks and restart them
         current_windows = self.tmux.list_windows()
 
-        for task_name, command in self.config.tasks.items():
+        for task_name, _task_cfg in self.config.tasks.items():
             if task_name in current_windows:
-                # Task exists, check if command changed (simplified check)
-                console.print(f"🔄 Reloading task '{task_name}' due to config change")
+                console.print(f"Reloading task '{task_name}' due to config change")
                 self.tmux.restart_task(task_name)
             else:
-                # New task, create window
                 if self.tmux.session_exists():
-                    console.print(f"➕ Adding new task '{task_name}'")
-                    self.tmux.restart_task(task_name)  # This will create if not exists
+                    console.print(f"Adding new task '{task_name}'")
+                    self.tmux.restart_task(task_name)
 
 
 @app.command()
@@ -95,9 +91,8 @@ def add(
     command: str = typer.Argument(..., help="Command to run"),
 ):
     """Add a new task."""
-    config = TaskmuxConfig()
-    config.add_task(task, command)
-    console.print(f"✓ Added task '{task}': {command}")
+    addTask(None, task, command)
+    console.print(f"Added task '{task}': {command}")
 
 
 @app.command()
@@ -107,13 +102,12 @@ def remove(
     """Remove a task."""
     cli = TaskmuxCLI()
 
-    # Kill the task if it's running
     if cli.tmux.session_exists():
         cli.tmux.kill_task(task)
 
-    # Remove from config
-    if cli.config.remove_task(task):
-        console.print(f"✓ Removed task '{task}'")
+    _, removed = removeTask(None, task)
+    if removed:
+        console.print(f"Removed task '{task}'")
     else:
         console.print(f"Task '{task}' not found in config", style="red")
 
@@ -134,7 +128,7 @@ def health():
         console.print("No session running", style="yellow")
         return
 
-    table = Table(title="🏥 Health Check Results")
+    table = Table(title="Health Check Results")
     table.add_column("Status", style="cyan")
     table.add_column("Task", style="magenta")
     table.add_column("Health", style="green")
@@ -144,7 +138,7 @@ def health():
 
     for task_name in cli.config.tasks:
         is_healthy = cli.tmux.check_task_health(task_name)
-        status_icon = "💚" if is_healthy else "🔴"
+        status_icon = "G" if is_healthy else "R"
         status_text = "Healthy" if is_healthy else "Unhealthy"
 
         table.add_row(status_icon, task_name, status_text)
@@ -169,8 +163,8 @@ def daemon(
     port: int = typer.Option(8765, "--port", help="WebSocket API port"),
 ):
     """Run in daemon mode with API."""
-    daemon = TaskmuxDaemon(api_port=port)
-    asyncio.run(daemon.start())
+    d = TaskmuxDaemon(api_port=port)
+    asyncio.run(d.start())
 
 
 @app.command()

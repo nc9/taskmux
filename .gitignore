@@ -12,3 +12,4 @@ wheels/
 # project claude rules
 CLAUDE.md
 .env*
+.DS_Store

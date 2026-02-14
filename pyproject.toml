@@ -1,10 +1,10 @@
 [project]
 name = "taskmux"
-version = "0.1.0"
+version = "0.2.0"
 description = "Modern tmux-based task manager for LLM development tools"
 readme = "README.md"
 license-file = "LICENSE"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 authors = [
     {name = "Nik Cubrilovic", email = "git@nikcub.me"}
 ]
@@ -17,9 +17,6 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Build Tools",
@@ -36,12 +33,16 @@ dependencies = [
     "aiofiles>=23.0.0",
     "typer>=0.12.0",
     "rich>=13.0.0",
+    "tomlkit>=0.13",
+    "pydantic>=2.0",
 ]
 
 [dependency-groups]
 dev = [
     "ruff>=0.12.3",
-    "ty>=0.0.1a14",
+    "basedpyright>=1.20",
+    "pytest>=8.0",
+    "pytest-tmp-files>=0.0.2",
 ]
 
 [project.scripts]
@@ -57,40 +58,15 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.ruff]
-target-version = "py38"
-extend-exclude = [
-    "crates/ty_vendored/vendor/",
-    "crates/ruff/resources/",
-    "crates/ruff_linter/resources/",
-    "crates/ruff_python_formatter/resources/",
-    "crates/ruff_python_parser/resources/",
-    "crates/ruff_python_semantic/resources/"
-]
+target-version = "py311"
+line-length = 100
 
 [tool.ruff.lint]
-select = [
-    "E", # pycodestyle (error)
-    "F", # pyflakes
-    "B", # bugbear
-    "B9",
-    "C4", # flake8-comprehensions
-    "SIM", # flake8-simplify
-    "I", # isort
-    "UP", # pyupgrade
-    "PIE", # flake8-pie
-    "PGH", # pygrep-hooks
-    "PYI", # flake8-pyi
-    "RUF",
-]
+select = ["E", "F", "I", "UP", "B", "SIM"]
 
-ignore = [
-    # only relevant if you run a script with `python -0`,
-    # which seems unlikely for any of the scripts in this repo
-    "B011",
-    # Leave it to the formatter to split long lines and
-    # the judgement of all of us.
-    "E501"
-]
+[tool.basedpyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/taskmux"]
@@ -98,7 +74,6 @@ packages = ["src/taskmux"]
 [tool.hatch.build.targets.sdist]
 include = [
     "src/taskmux",
-    "src/taskmux/templates/*.md",
     "README.md",
     "LICENSE",
 ]

@@ -1,21 +1,18 @@
-"""
-Taskmux - Modern tmux development environment manager
+"""Taskmux - Modern tmux development environment manager."""
 
-A dynamic tmux session manager with libtmux integration, health monitoring,
-auto-restart capabilities, and WebSocket API for real-time communication.
-"""
-
-__version__ = "2.0.0"
+__version__ = "0.2.0"
 __author__ = "Taskmux Contributors"
 
-from .config import TaskmuxConfig
+from .config import addTask, loadConfig, removeTask, writeConfig
+from .models import TaskConfig, TaskmuxConfig
 from .tmux_manager import TmuxManager
-from .daemon import TaskmuxDaemon
-from .cli import TaskmuxCLI
 
 __all__ = [
+    "TaskConfig",
     "TaskmuxConfig",
-    "TmuxManager", 
-    "TaskmuxDaemon",
-    "TaskmuxCLI",
+    "TmuxManager",
+    "addTask",
+    "loadConfig",
+    "removeTask",
+    "writeConfig",
 ]

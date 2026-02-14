@@ -1,0 +1,14 @@
+name = "taskmux-dev"
+
+[tasks.server]
+command = "echo 'Starting server...' && while true; do echo $(date): Server heartbeat; sleep 5; done"
+
+[tasks.build]
+command = "echo 'Building project...' && sleep 3 && echo 'Build complete!'"
+
+[tasks.test]
+command = "echo 'Running tests...' && sleep 1 && echo 'All tests passed!'"
+
+[tasks.monitor]
+command = "while true; do echo $(date): Monitoring system; sleep 10; done"
+auto_start = false
