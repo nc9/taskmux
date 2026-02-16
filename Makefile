@@ -29,18 +29,19 @@ bump:
 	uv version --bump $(BUMP)
 
 publish:
+	rm -rf dist/
 	uv build
 	uv publish
 
 release: check
-	@if [ -n "$$(git status --porcelain)" ]; then echo "dirty tree"; exit 1; fi
+	@if [ -n "$$(git status --porcelain)" ]; then echo "ERROR: dirty working tree" && exit 1; fi
 	uv version --bump $(BUMP)
-	git add pyproject.toml
-	git commit -m "chore(release): v$$(uv version)"
-	git tag "v$$(uv version)"
-	git push --follow-tags
-	uv build
-	uv publish
+	$(eval VERSION := $(shell uv version --short))
+	git add pyproject.toml uv.lock
+	git commit -m "chore(release): v$(VERSION)"
+	git tag "v$(VERSION)"
+	git push && git push --tags
+	$(MAKE) publish
 
 clean:
 	rm -rf dist/ build/ *.egg-info/ .pytest_cache/
