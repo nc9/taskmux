@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from taskmux.config import addTask, configExists, loadConfig, removeTask, writeConfig
-from taskmux.models import TaskConfig, TaskmuxConfig
+from taskmux.models import HookConfig, TaskConfig, TaskmuxConfig
 
 
 class TestConfigExists:
@@ -30,6 +30,26 @@ class TestLoadConfig:
     def test_parses_auto_start_false(self, sample_toml: Path):
         cfg = loadConfig(sample_toml)
         assert cfg.tasks["watcher"].auto_start is False
+
+    def test_parses_global_hooks(self, sample_toml_hooks: Path):
+        cfg = loadConfig(sample_toml_hooks)
+        assert cfg.hooks.before_start == "echo global-before"
+        assert cfg.hooks.after_stop == "echo global-after"
+        assert cfg.hooks.after_start is None
+
+    def test_parses_task_hooks(self, sample_toml_hooks: Path):
+        cfg = loadConfig(sample_toml_hooks)
+        assert cfg.tasks["server"].hooks.before_start == "echo server-before"
+        assert cfg.tasks["server"].hooks.after_start is None
+
+    def test_parses_global_auto_start_false(self, sample_toml_no_auto: Path):
+        cfg = loadConfig(sample_toml_no_auto)
+        assert cfg.auto_start is False
+        assert cfg.name == "lazy-session"
+
+    def test_default_global_auto_start_true(self, sample_toml: Path):
+        cfg = loadConfig(sample_toml)
+        assert cfg.auto_start is True
 
 
 class TestWriteConfig:
@@ -60,6 +80,47 @@ class TestWriteConfig:
         text = p.read_text()
         assert "auto_start" not in text
 
+    def test_roundtrip_hooks(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="hooked",
+            hooks=HookConfig(before_start="echo pre", after_stop="echo post"),
+            tasks={
+                "srv": TaskConfig(
+                    command="echo srv",
+                    hooks=HookConfig(before_start="echo srv-pre"),
+                ),
+            },
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+
+        loaded = loadConfig(p)
+        assert loaded.hooks.before_start == "echo pre"
+        assert loaded.hooks.after_stop == "echo post"
+        assert loaded.hooks.after_start is None
+        assert loaded.tasks["srv"].hooks.before_start == "echo srv-pre"
+
+    def test_omits_empty_hooks(self, config_dir: Path):
+        cfg = TaskmuxConfig(name="x", tasks={"t": TaskConfig(command="echo t")})
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert "[hooks]" not in text
+
+    def test_writes_global_auto_start_false(self, config_dir: Path):
+        cfg = TaskmuxConfig(name="x", auto_start=False)
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert "auto_start = false" in text
+
+    def test_roundtrip_global_auto_start_false(self, config_dir: Path):
+        cfg = TaskmuxConfig(name="x", auto_start=False, tasks={"a": TaskConfig(command="echo a")})
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.auto_start is False
+
 
 class TestAddTask:
     def test_persists(self, sample_toml: Path):
@@ -69,6 +130,12 @@ class TestAddTask:
         reloaded = loadConfig(sample_toml)
         assert "new-task" in reloaded.tasks
         assert reloaded.tasks["new-task"].command == "echo new"
+
+    def test_preserves_hooks(self, sample_toml_hooks: Path):
+        addTask(sample_toml_hooks, "new-task", "echo new")
+        reloaded = loadConfig(sample_toml_hooks)
+        assert reloaded.hooks.before_start == "echo global-before"
+        assert "new-task" in reloaded.tasks
 
 
 class TestRemoveTask:
