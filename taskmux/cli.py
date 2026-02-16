@@ -1,6 +1,7 @@
 """Typer-based CLI interface for Taskmux."""
 
 import asyncio
+import json
 
 import typer
 from rich.console import Console
@@ -8,6 +9,7 @@ from rich.table import Table
 
 from .config import addTask, loadConfig, removeTask
 from .daemon import SimpleConfigWatcher, TaskmuxDaemon
+from .init import initProject
 from .models import TaskmuxConfig
 from .tmux_manager import TmuxManager
 
@@ -43,6 +45,14 @@ class TaskmuxCLI:
 
 
 @app.command()
+def init(
+    defaults: bool = typer.Option(False, "--defaults", help="Accept all defaults"),
+):
+    """Initialize taskmux config in current directory."""
+    initProject(defaults=defaults)
+
+
+@app.command()
 def list():
     """List all tasks and their status."""
     cli = TaskmuxCLI()
@@ -50,19 +60,39 @@ def list():
 
 
 @app.command()
-def start():
-    """Start all tasks."""
+def start(
+    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
+):
+    """Start all tasks or a specific task."""
     cli = TaskmuxCLI()
-    cli.tmux.create_session()
+    if task:
+        cli.tmux.start_task(task)
+    else:
+        cli.tmux.start_all()
+
+
+@app.command()
+def stop(
+    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
+):
+    """Stop all tasks or a specific task (graceful C-c)."""
+    cli = TaskmuxCLI()
+    if task:
+        cli.tmux.stop_task(task)
+    else:
+        cli.tmux.stop_all()
 
 
 @app.command()
 def restart(
-    task: str = typer.Argument(..., help="Task name to restart"),
+    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
 ):
-    """Restart a specific task."""
+    """Restart all tasks or a specific task."""
     cli = TaskmuxCLI()
-    cli.tmux.restart_task(task)
+    if task:
+        cli.tmux.restart_task(task)
+    else:
+        cli.tmux.restart_all()
 
 
 @app.command()
@@ -79,10 +109,22 @@ def logs(
     task: str = typer.Argument(..., help="Task name"),
     follow: bool = typer.Option(False, "-f", "--follow", help="Follow logs"),
     lines: int = typer.Option(100, "-n", "--lines", help="Number of lines"),
+    grep: str | None = typer.Option(None, "-g", "--grep", help="Filter logs by pattern"),
+    context: int = typer.Option(3, "-C", "--context", help="Context lines around grep matches"),
 ):
     """Show logs for a task."""
     cli = TaskmuxCLI()
-    cli.tmux.show_logs(task, follow, lines)
+    cli.tmux.show_logs(task, follow, lines, grep=grep, context=context)
+
+
+@app.command()
+def inspect(
+    task: str = typer.Argument(..., help="Task name to inspect"),
+):
+    """Inspect task state as JSON."""
+    cli = TaskmuxCLI()
+    data = cli.tmux.inspect_task(task)
+    console.print_json(json.dumps(data))
 
 
 @app.command()
@@ -165,13 +207,6 @@ def daemon(
     """Run in daemon mode with API."""
     d = TaskmuxDaemon(api_port=port)
     asyncio.run(d.start())
-
-
-@app.command()
-def stop():
-    """Stop the session and all tasks."""
-    cli = TaskmuxCLI()
-    cli.tmux.stop_session()
 
 
 def main():
