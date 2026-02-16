@@ -27,13 +27,36 @@ uv tool install .
 
 ## Quick Start
 
-Create a `taskmux.toml` in your project root:
+```bash
+# Initialize in your project (creates taskmux.toml, injects agent context)
+taskmux init
+
+# Add tasks
+taskmux add server "npm run dev"
+taskmux add build "npm run build:watch"
+taskmux add db "docker compose up postgres"
+
+# Start all auto_start tasks
+taskmux start
+
+# Check status
+taskmux status
+```
+
+Or create a `taskmux.toml` manually:
 
 ```toml
 name = "myproject"
 
+[hooks]
+before_start = "echo starting stack"
+after_stop = "echo stack stopped"
+
 [tasks.server]
 command = "npm run dev"
+
+[tasks.server.hooks]
+before_start = "npm run build"
 
 [tasks.build]
 command = "npm run build:watch"
@@ -46,47 +69,46 @@ command = "docker compose up postgres"
 auto_start = false
 ```
 
-Tasks have `auto_start = true` by default. Set `auto_start = false` for tasks you want to start manually.
-
-```bash
-# Start all auto_start tasks
-taskmux start
-
-# Check status
-taskmux list
-
-# Restart a task
-taskmux restart server
-
-# Follow logs
-taskmux logs -f test
-```
-
 ## Commands
 
 ```bash
 # Session
 taskmux start                    # Start all auto_start tasks
-taskmux stop                     # Stop session and all tasks
+taskmux start <task>             # Start a single task
+taskmux stop                     # Stop all tasks (graceful C-c)
+taskmux stop <task>              # Stop a single task (graceful C-c)
+taskmux restart                  # Restart all tasks
+taskmux restart <task>           # Restart a single task
 taskmux status                   # Show session status
 taskmux list                     # List tasks with health indicators
 
 # Tasks
-taskmux restart <task>           # Restart a task
-taskmux kill <task>              # Kill a task
+taskmux kill <task>              # Hard-kill a task (destroys window)
 taskmux add <task> "<command>"   # Add task to config
 taskmux remove <task>            # Remove task from config
+taskmux inspect <task>           # JSON task state (pid, command, health)
 
-# Monitoring
-taskmux health                   # Health check table
+# Logs
 taskmux logs <task>              # Show recent logs
 taskmux logs -f <task>           # Follow logs live
 taskmux logs -n 100 <task>       # Last N lines
+taskmux logs <task> -g "error"   # Search logs with grep
+taskmux logs <task> -g "error" -C 5  # Grep with context lines
 
-# Advanced
+# Init
+taskmux init                     # Interactive project setup
+taskmux init --defaults          # Non-interactive, use defaults
+
+# Monitoring
+taskmux health                   # Health check table
 taskmux watch                    # Watch config for changes, reload on edit
 taskmux daemon --port 8765       # Run with WebSocket API + auto-restart
 ```
+
+### stop vs kill
+
+- **`stop`** sends C-c (graceful). Window stays alive so you can see exit output.
+- **`kill`** destroys the window immediately.
 
 ## Configuration
 
@@ -96,9 +118,17 @@ Config file is `taskmux.toml` in the current directory:
 
 ```toml
 name = "session-name"
+auto_start = true       # global toggle, default true
+
+[hooks]
+before_start = "echo starting"
+after_stop = "echo done"
 
 [tasks.server]
 command = "python manage.py runserver"
+
+[tasks.server.hooks]
+before_start = "python manage.py migrate"
 
 [tasks.worker]
 command = "celery worker -A myapp"
@@ -110,20 +140,54 @@ auto_start = false
 
 ### Fields
 
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `name` | yes | — | tmux session name |
-| `tasks.<name>.command` | yes | — | Shell command to run |
-| `tasks.<name>.auto_start` | no | `true` | Start with `taskmux start` |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | `"taskmux"` | tmux session name |
+| `auto_start` | `true` | Global toggle — if false, `start` creates session but launches nothing |
+| `hooks.before_start` | — | Run before starting tasks |
+| `hooks.after_start` | — | Run after starting tasks |
+| `hooks.before_stop` | — | Run before stopping tasks |
+| `hooks.after_stop` | — | Run after stopping tasks |
+| `tasks.<name>.command` | — | Shell command to run |
+| `tasks.<name>.auto_start` | `true` | Start with `taskmux start` |
+| `tasks.<name>.hooks.*` | — | Per-task lifecycle hooks (same fields as global) |
 
-### Managing tasks via CLI
+### Hook Cascade
 
-```bash
-# Add a task (auto_start defaults to true)
-taskmux add redis "redis-server"
+Hooks fire in this order:
+1. **Start**: global `before_start` → task `before_start` → _run command_ → task `after_start` → global `after_start`
+2. **Stop**: global `before_stop` → task `before_stop` → _send C-c_ → task `after_stop` → global `after_stop`
 
-# Remove a task (kills it if running)
-taskmux remove redis
+If a `before_*` hook fails (non-zero exit), the action is aborted.
+
+### Init & Agent Context
+
+`taskmux init` bootstraps your project:
+1. Creates `taskmux.toml` with session name (defaults to directory name)
+2. Detects installed AI coding agents (Claude, Codex, OpenCode)
+3. Injects taskmux usage instructions into agent context files:
+   - Claude: `.claude/rules/taskmux.md`
+   - Codex/OpenCode: `AGENTS.md`
+
+Use `--defaults` to skip prompts (CI/automation).
+
+### Inspect
+
+`taskmux inspect <task>` returns JSON with task state:
+
+```json
+{
+  "name": "server",
+  "command": "npm run dev",
+  "auto_start": true,
+  "running": true,
+  "healthy": true,
+  "pid": "12345",
+  "pane_current_command": "node",
+  "pane_current_path": "/home/user/project",
+  "window_id": "@1",
+  "pane_id": "%1"
+}
 ```
 
 ## Daemon Mode
