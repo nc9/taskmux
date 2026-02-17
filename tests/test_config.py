@@ -122,6 +122,57 @@ class TestWriteConfig:
         assert loaded.auto_start is False
 
 
+class TestWriteConfigNewFields:
+    def test_roundtrip_cwd(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            tasks={"api": TaskConfig(command="cargo run", cwd="apps/api")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.tasks["api"].cwd == "apps/api"
+
+    def test_roundtrip_health_check(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            tasks={
+                "db": TaskConfig(command="docker up", health_check="pg_isready", health_interval=5),
+            },
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.tasks["db"].health_check == "pg_isready"
+        assert loaded.tasks["db"].health_interval == 5
+
+    def test_roundtrip_depends_on(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            tasks={
+                "db": TaskConfig(command="echo db"),
+                "api": TaskConfig(command="echo api", depends_on=["db"]),
+            },
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.tasks["api"].depends_on == ["db"]
+
+    def test_omits_default_new_fields(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            tasks={"t": TaskConfig(command="echo t")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert "cwd" not in text
+        assert "health_check" not in text
+        assert "health_interval" not in text
+        assert "depends_on" not in text
+
+
 class TestAddTask:
     def test_persists(self, sample_toml: Path):
         cfg = addTask(sample_toml, "new-task", "echo new")

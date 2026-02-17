@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from typing import List, Optional  # noqa: UP035
 
 import typer
 from rich.console import Console
@@ -106,13 +107,13 @@ def kill(
 
 @app.command()
 def logs(
-    task: str = typer.Argument(..., help="Task name"),
+    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
     follow: bool = typer.Option(False, "-f", "--follow", help="Follow logs"),
     lines: int = typer.Option(100, "-n", "--lines", help="Number of lines"),
     grep: str | None = typer.Option(None, "-g", "--grep", help="Filter logs by pattern"),
     context: int = typer.Option(3, "-C", "--context", help="Context lines around grep matches"),
 ):
-    """Show logs for a task."""
+    """Show logs for a task, or all tasks if none specified."""
     cli = TaskmuxCLI()
     cli.tmux.show_logs(task, follow, lines, grep=grep, context=context)
 
@@ -131,9 +132,14 @@ def inspect(
 def add(
     task: str = typer.Argument(..., help="Task name"),
     command: str = typer.Argument(..., help="Command to run"),
+    cwd: str | None = typer.Option(None, "--cwd", help="Working directory"),
+    health_check: str | None = typer.Option(None, "--health-check", help="Health check command"),
+    depends_on: Optional[List[str]] = typer.Option(  # noqa: UP006, UP045, B008
+        None, "--depends-on", help="Dependency task names"
+    ),
 ):
     """Add a new task."""
-    addTask(None, task, command)
+    addTask(None, task, command, cwd=cwd, health_check=health_check, depends_on=depends_on)
     console.print(f"Added task '{task}': {command}")
 
 

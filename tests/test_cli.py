@@ -126,6 +126,18 @@ class TestLogsCommand:
             "server", False, 100, grep="error", context=2
         )
 
+    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.loadConfig")
+    def test_logs_all(self, mock_load, mock_tmux):
+        from taskmux.models import TaskmuxConfig
+
+        mock_load.return_value = TaskmuxConfig()
+        result = runner.invoke(app, ["logs"])
+        assert result.exit_code == 0
+        mock_tmux.return_value.show_logs.assert_called_once_with(
+            None, False, 100, grep=None, context=3
+        )
+
 
 class TestAddCommand:
     def test_add_creates_task(self, sample_toml: Path):
@@ -135,7 +147,38 @@ class TestAddCommand:
         ):
             result = runner.invoke(app, ["add", "web", "npm start"])
             assert result.exit_code == 0
-            mock_add.assert_called_once_with(None, "web", "npm start")
+            mock_add.assert_called_once_with(
+                None, "web", "npm start", cwd=None, health_check=None, depends_on=None
+            )
+
+    def test_add_with_options(self, sample_toml: Path):
+        with (
+            patch("taskmux.cli.loadConfig", side_effect=lambda: loadConfig(sample_toml)),
+            patch("taskmux.cli.addTask") as mock_add,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "add",
+                    "api",
+                    "cargo run",
+                    "--cwd",
+                    "apps/api",
+                    "--health-check",
+                    "curl -sf localhost:4000/health",
+                    "--depends-on",
+                    "db",
+                ],
+            )
+            assert result.exit_code == 0
+            mock_add.assert_called_once_with(
+                None,
+                "api",
+                "cargo run",
+                cwd="apps/api",
+                health_check="curl -sf localhost:4000/health",
+                depends_on=["db"],
+            )
 
 
 class TestRemoveCommand:

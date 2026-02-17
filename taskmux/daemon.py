@@ -191,7 +191,7 @@ class TaskmuxDaemon:
             if task_name and self.cli.tmux.session_exists():
                 try:
                     sess = self.cli.tmux._get_session()
-                    window = sess.windows.get(window_name=task_name)
+                    window = sess.windows.get(window_name=task_name, default=None)
                     if window and window.active_pane:
                         output = window.active_pane.cmd(
                             "capture-pane", "-p", "-S", f"-{lines}"

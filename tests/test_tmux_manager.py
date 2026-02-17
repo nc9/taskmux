@@ -229,6 +229,199 @@ class TestRestartTask:
         mgr.restart_task("nonexistent")  # should print error, not crash
 
 
+class TestToposortTasks:
+    def test_no_deps(self):
+        cfg = _make_config(tasks={"a": "echo a", "b": "echo b"})
+        mgr = _make_manager(cfg)
+        result = mgr._toposort_tasks(["a", "b"])
+        assert set(result) == {"a", "b"}
+
+    def test_linear_deps(self):
+        cfg = _make_config(
+            tasks={
+                "db": "echo db",
+                "api": {"command": "echo api", "depends_on": ["db"]},
+                "web": {"command": "echo web", "depends_on": ["api"]},
+            }
+        )
+        mgr = _make_manager(cfg)
+        result = mgr._toposort_tasks(["db", "api", "web"])
+        assert result.index("db") < result.index("api") < result.index("web")
+
+    def test_diamond_deps(self):
+        cfg = _make_config(
+            tasks={
+                "db": "echo db",
+                "cache": "echo cache",
+                "api": {"command": "echo api", "depends_on": ["db", "cache"]},
+            }
+        )
+        mgr = _make_manager(cfg)
+        result = mgr._toposort_tasks(["db", "cache", "api"])
+        assert result.index("db") < result.index("api")
+        assert result.index("cache") < result.index("api")
+
+
+class TestIsTaskHealthy:
+    @patch("taskmux.tmux_manager.subprocess.run")
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_health_check_command_success(self, mock_server_cls, mock_run):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_server.sessions.get.side_effect = Exception("not found")
+        mock_run.return_value = MagicMock(returncode=0)
+
+        cfg = _make_config(tasks={"api": {"command": "echo api", "health_check": "curl localhost"}})
+        mgr = TmuxManager(cfg)
+        assert mgr.is_task_healthy("api") is True
+        mock_run.assert_called_once()
+
+    @patch("taskmux.tmux_manager.subprocess.run")
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_health_check_command_failure(self, mock_server_cls, mock_run):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_server.sessions.get.side_effect = Exception("not found")
+        mock_run.return_value = MagicMock(returncode=1)
+
+        cfg = _make_config(tasks={"api": {"command": "echo api", "health_check": "curl localhost"}})
+        mgr = TmuxManager(cfg)
+        assert mgr.is_task_healthy("api") is False
+
+    @patch("taskmux.tmux_manager.subprocess.run")
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_health_check_timeout(self, mock_server_cls, mock_run):
+        import subprocess
+
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_server.sessions.get.side_effect = Exception("not found")
+        mock_run.side_effect = subprocess.TimeoutExpired("cmd", 5)
+
+        cfg = _make_config(tasks={"api": {"command": "echo api", "health_check": "curl localhost"}})
+        mgr = TmuxManager(cfg)
+        assert mgr.is_task_healthy("api") is False
+
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_fallback_to_pane_alive(self, mock_server_cls):
+        """No health_check configured -> falls back to _is_pane_alive."""
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+
+        mock_session = MagicMock()
+        mock_server.sessions.get.return_value = mock_session
+        mock_window = MagicMock()
+        mock_pane = MagicMock()
+        mock_pane.pane_current_command = "node"
+        mock_window.active_pane = mock_pane
+        mock_session.windows.get.return_value = mock_window
+
+        cfg = _make_config(tasks={"server": "echo hi"})
+        mgr = TmuxManager(cfg)
+        assert mgr.is_task_healthy("server") is True
+
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_unknown_task(self, mock_server_cls):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_server.sessions.get.side_effect = Exception("not found")
+
+        cfg = _make_config(tasks={"server": "echo hi"})
+        mgr = TmuxManager(cfg)
+        assert mgr.is_task_healthy("ghost") is False
+
+
+class TestCwd:
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_send_command_passes_start_directory(self, mock_server_cls):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+
+        mock_session = MagicMock()
+        mock_server.sessions.get.return_value = mock_session
+        mock_window = MagicMock()
+        mock_window.active_pane = MagicMock()
+        mock_session.new_window.return_value = mock_window
+
+        cfg = _make_config(tasks={"api": {"command": "cargo run", "cwd": "apps/api"}})
+        mgr = TmuxManager(cfg)
+        mgr._send_command_to_window(mock_session, "api", "cargo run", "apps/api")
+        mock_session.new_window.assert_called_once_with(
+            attach=False, window_name="api", start_directory="apps/api"
+        )
+
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_send_command_no_cwd(self, mock_server_cls):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+
+        mock_session = MagicMock()
+        mock_window = MagicMock()
+        mock_window.active_pane = MagicMock()
+        mock_session.new_window.return_value = mock_window
+
+        cfg = _make_config(tasks={"api": "cargo run"})
+        mgr = TmuxManager(cfg)
+        mgr._send_command_to_window(mock_session, "api", "cargo run")
+        mock_session.new_window.assert_called_once_with(attach=False, window_name="api")
+
+
+class TestShowAllLogs:
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_prefixed_output(self, mock_server_cls, capsys):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+
+        mock_session = MagicMock()
+        mock_server.sessions.get.return_value = mock_session
+
+        # Create two windows with output
+        mock_pane_a = MagicMock()
+        mock_pane_a.cmd.return_value = MagicMock(stdout=["line1", "line2"])
+        mock_window_a = MagicMock()
+        mock_window_a.active_pane = mock_pane_a
+
+        mock_pane_b = MagicMock()
+        mock_pane_b.cmd.return_value = MagicMock(stdout=["lineX"])
+        mock_window_b = MagicMock()
+        mock_window_b.active_pane = mock_pane_b
+
+        def get_window(window_name, default=None):
+            return {"srv": mock_window_a, "web": mock_window_b}.get(window_name, default)
+
+        mock_session.windows.get = get_window
+
+        cfg = _make_config(tasks={"srv": "echo srv", "web": "echo web"})
+        mgr = TmuxManager(cfg)
+        mgr.show_all_logs(lines=50)
+
+        captured = capsys.readouterr().out
+        assert "[srv] line1" in captured
+        assert "[srv] line2" in captured
+        assert "[web] lineX" in captured
+
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_grep_filter(self, mock_server_cls, capsys):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_session = MagicMock()
+        mock_server.sessions.get.return_value = mock_session
+
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value = MagicMock(stdout=["info ok", "ERROR bad", "info fine"])
+        mock_window = MagicMock()
+        mock_window.active_pane = mock_pane
+        mock_session.windows.get.return_value = mock_window
+
+        cfg = _make_config(tasks={"srv": "echo srv"})
+        mgr = TmuxManager(cfg)
+        mgr.show_all_logs(grep="error")
+
+        captured = capsys.readouterr().out
+        assert "[srv] ERROR bad" in captured
+        assert "info ok" not in captured
+
+
 class TestPrintGrepResults:
     def test_matching_lines(self, capsys):
         output = ["line 1", "error here", "line 3", "another error", "line 5"]

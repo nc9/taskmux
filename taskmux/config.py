@@ -104,6 +104,18 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
         inner.add("command", task_cfg.command)
         if not task_cfg.auto_start:
             inner.add("auto_start", False)
+        if task_cfg.cwd is not None:
+            inner.add("cwd", task_cfg.cwd)
+        if task_cfg.health_check is not None:
+            inner.add("health_check", task_cfg.health_check)
+        if task_cfg.health_interval != 10:
+            inner.add("health_interval", task_cfg.health_interval)
+        if task_cfg.health_timeout != 5:
+            inner.add("health_timeout", task_cfg.health_timeout)
+        if task_cfg.health_retries != 3:
+            inner.add("health_retries", task_cfg.health_retries)
+        if task_cfg.depends_on:
+            inner.add("depends_on", task_cfg.depends_on)
         # Task-level hooks
         task_hooks_tbl = _writeHooksTable(task_cfg.hooks)
         if task_hooks_tbl:
@@ -115,11 +127,26 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
     return p
 
 
-def addTask(path: Path | None, name: str, command: str) -> TaskmuxConfig:
+def addTask(
+    path: Path | None,
+    name: str,
+    command: str,
+    *,
+    cwd: str | None = None,
+    health_check: str | None = None,
+    depends_on: list[str] | None = None,
+) -> TaskmuxConfig:
     """Add a task to config and persist."""
     cfg = loadConfig(path)
     new_tasks = dict(cfg.tasks)
-    new_tasks[name] = TaskConfig(command=command)
+    kwargs: dict = {"command": command}
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+    if health_check is not None:
+        kwargs["health_check"] = health_check
+    if depends_on:
+        kwargs["depends_on"] = depends_on
+    new_tasks[name] = TaskConfig(**kwargs)
     cfg = TaskmuxConfig(name=cfg.name, auto_start=cfg.auto_start, hooks=cfg.hooks, tasks=new_tasks)
     writeConfig(path, cfg)
     return cfg

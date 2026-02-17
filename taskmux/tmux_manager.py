@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
 import time
+from collections import deque
 from datetime import datetime
 
 import libtmux
@@ -47,6 +49,39 @@ class TmuxManager:
         except Exception:
             return []
 
+    def _is_pane_alive(self, task_name: str) -> bool:
+        """Check if task's pane has a running process (not just a shell)."""
+        if not self.session_exists():
+            return False
+        try:
+            window = self._get_session().windows.get(window_name=task_name, default=None)
+            if window and window.active_pane:
+                cmd = getattr(window.active_pane, "pane_current_command", "")
+                return cmd != "" and cmd != "bash"
+        except Exception:
+            pass
+        return False
+
+    def is_task_healthy(self, task_name: str) -> bool:
+        """Check task health. Uses health_check command if configured, falls back to pane-alive."""
+        task_cfg = self.config.tasks.get(task_name)
+        if not task_cfg:
+            return False
+
+        if not task_cfg.health_check:
+            return self._is_pane_alive(task_name)
+
+        try:
+            result = subprocess.run(
+                task_cfg.health_check,
+                shell=True,
+                capture_output=True,
+                timeout=task_cfg.health_timeout,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+
     def get_task_status(self, task_name: str) -> dict[str, str | bool]:
         """Get detailed status for a task"""
         task_cfg = self.config.tasks.get(task_name)
@@ -64,26 +99,64 @@ class TmuxManager:
         windows = self.list_windows()
         status["running"] = task_name in windows
 
-        if self.session and status["running"]:
-            try:
-                window = self._get_session().windows.get(window_name=task_name, default=None)
-                if window and window.active_pane:
-                    current_command = getattr(window.active_pane, "pane_current_command", "")
-                    status["healthy"] = current_command != "" and current_command != "bash"
-            except Exception:
-                pass
+        if status["running"]:
+            status["healthy"] = self.is_task_healthy(task_name)
 
         return status
 
     def _send_command_to_window(
-        self, sess: libtmux.Session, task_name: str, command: str
+        self, sess: libtmux.Session, task_name: str, command: str, cwd: str | None = None
     ) -> libtmux.Window:
         """Create a new window and send a command to it."""
-        window = sess.new_window(attach=False, window_name=task_name)
+        kwargs: dict = {"attach": False, "window_name": task_name}
+        if cwd:
+            kwargs["start_directory"] = cwd
+        window = sess.new_window(**kwargs)
         pane = window.active_pane
         if pane:
             pane.send_keys(command, enter=True)
         return window
+
+    def _toposort_tasks(self, task_names: list[str]) -> list[str]:
+        """Topological sort tasks by depends_on (Kahn's algorithm). Raises on cycles."""
+        # Build adjacency + in-degree for the subset
+        in_degree: dict[str, int] = {n: 0 for n in task_names}
+        dependents: dict[str, list[str]] = {n: [] for n in task_names}
+        name_set = set(task_names)
+
+        for name in task_names:
+            for dep in self.config.tasks[name].depends_on:
+                if dep in name_set:
+                    in_degree[name] += 1
+                    dependents[dep].append(name)
+
+        queue: deque[str] = deque(n for n in task_names if in_degree[n] == 0)
+        result: list[str] = []
+
+        while queue:
+            node = queue.popleft()
+            result.append(node)
+            for dep in dependents[node]:
+                in_degree[dep] -= 1
+                if in_degree[dep] == 0:
+                    queue.append(dep)
+
+        if len(result) != len(task_names):
+            raise ValueError("Dependency cycle detected in tasks")
+
+        return result
+
+    def _wait_for_healthy(self, task_name: str, timeout: float) -> bool:
+        """Poll is_task_healthy until True or timeout."""
+        task_cfg = self.config.tasks[task_name]
+        interval = task_cfg.health_interval
+        elapsed = 0.0
+        while elapsed < timeout:
+            if self.is_task_healthy(task_name):
+                return True
+            time.sleep(interval)
+            elapsed += interval
+        return self.is_task_healthy(task_name)
 
     def start_task(self, task_name: str) -> None:
         """Start a single task (create window + send command)."""
@@ -104,6 +177,11 @@ class TmuxManager:
             print(f"Task '{task_name}' already running")
             return
 
+        # Warn if deps aren't running
+        for dep in task_cfg.depends_on:
+            if dep not in self.list_windows():
+                print(f"Warning: dependency '{dep}' is not running")
+
         # Hooks: global before_start, then task before_start
         if not runHook(self.config.hooks.before_start, task_name):
             return
@@ -118,11 +196,13 @@ class TmuxManager:
                 default.rename_window(task_name)
                 pane = default.active_pane
                 if pane:
+                    if task_cfg.cwd:
+                        pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
                     pane.send_keys(task_cfg.command, enter=True)
             else:
-                self._send_command_to_window(sess, task_name, task_cfg.command)
+                self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
         else:
-            self._send_command_to_window(sess, task_name, task_cfg.command)
+            self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
 
         runHook(task_cfg.hooks.after_start, task_name)
         runHook(self.config.hooks.after_start, task_name)
@@ -160,7 +240,7 @@ class TmuxManager:
         print(f"Stopped task '{task_name}'")
 
     def start_all(self) -> None:
-        """Start all auto_start tasks (or create session if global auto_start=False)."""
+        """Start all auto_start tasks in dependency order."""
         if self.session_exists():
             print(f"Session '{self.config.name}' already exists")
             return
@@ -171,10 +251,13 @@ class TmuxManager:
             print(f"Created session '{self.config.name}' (auto_start disabled, no tasks launched)")
             return
 
-        auto_tasks = [(name, cfg) for name, cfg in self.config.tasks.items() if cfg.auto_start]
+        auto_tasks = {name: cfg for name, cfg in self.config.tasks.items() if cfg.auto_start}
         if not auto_tasks:
             print("No auto-start tasks defined in config")
             return
+
+        # Topological sort for dependency ordering
+        sorted_names = self._toposort_tasks(list(auto_tasks.keys()))
 
         # Global before_start
         if not runHook(self.config.hooks.before_start):
@@ -183,20 +266,38 @@ class TmuxManager:
         self.session = self.server.new_session(session_name=self.config.name, attach=False)
         sess = self._get_session()
 
-        # First task reuses default window
-        first_name, first_cfg = auto_tasks[0]
-        runHook(first_cfg.hooks.before_start, first_name)
-        if sess.windows:
-            default_window = sess.windows[0]
-            default_window.rename_window(first_name)
-            pane = default_window.active_pane
-            if pane:
-                pane.send_keys(first_cfg.command, enter=True)
-        runHook(first_cfg.hooks.after_start, first_name)
+        first = True
+        for task_name in sorted_names:
+            task_cfg = auto_tasks[task_name]
 
-        for task_name, task_cfg in auto_tasks[1:]:
+            # Wait for dependencies to become healthy before starting
+            skip = False
+            for dep in task_cfg.depends_on:
+                if dep in auto_tasks:
+                    dep_cfg = auto_tasks[dep]
+                    timeout = dep_cfg.health_retries * dep_cfg.health_interval
+                    if not self._wait_for_healthy(dep, timeout):
+                        print(f"Warning: dependency '{dep}' not healthy, skipping '{task_name}'")
+                        skip = True
+                        break
+            if skip:
+                continue
+
             runHook(task_cfg.hooks.before_start, task_name)
-            self._send_command_to_window(sess, task_name, task_cfg.command)
+
+            if first and sess.windows:
+                # First task reuses default window
+                default_window = sess.windows[0]
+                default_window.rename_window(task_name)
+                pane = default_window.active_pane
+                if pane:
+                    if task_cfg.cwd:
+                        pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
+                    pane.send_keys(task_cfg.command, enter=True)
+                first = False
+            else:
+                self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
+
             runHook(task_cfg.hooks.after_start, task_name)
 
         # Global after_start
@@ -265,11 +366,13 @@ class TmuxManager:
             runHook(task_cfg.hooks.before_start, task_name)
             pane = window.active_pane
             if pane:
+                if task_cfg.cwd:
+                    pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
                 pane.send_keys(command, enter=True)
             runHook(task_cfg.hooks.after_start, task_name)
         else:
             runHook(task_cfg.hooks.before_start, task_name)
-            self._send_command_to_window(sess, task_name, command)
+            self._send_command_to_window(sess, task_name, command, task_cfg.cwd)
             runHook(task_cfg.hooks.after_start, task_name)
 
         print(f"Restarted task '{task_name}'")
@@ -297,6 +400,9 @@ class TmuxManager:
             "name": task_name,
             "command": task_cfg.command,
             "auto_start": task_cfg.auto_start,
+            "cwd": task_cfg.cwd,
+            "health_check": task_cfg.health_check,
+            "depends_on": task_cfg.depends_on,
             "running": False,
             "healthy": False,
             "pid": None,
@@ -324,22 +430,24 @@ class TmuxManager:
             info["pane_current_command"] = getattr(pane, "pane_current_command", None)
             info["pane_current_path"] = getattr(pane, "pane_current_path", None)
 
-            current_cmd = info["pane_current_command"] or ""
-            info["healthy"] = current_cmd != "" and current_cmd != "bash"
-
+        info["healthy"] = self.is_task_healthy(task_name)
         return info
 
     def show_logs(
         self,
-        task_name: str,
+        task_name: str | None,
         follow: bool = False,
         lines: int = 100,
         grep: str | None = None,
         context: int = 3,
     ) -> None:
-        """Show logs for a task, optionally filtering with grep."""
+        """Show logs for a task or all tasks."""
         if not self.session_exists():
             print(f"Session '{self.config.name}' doesn't exist")
+            return
+
+        if task_name is None:
+            self.show_all_logs(follow=follow, lines=lines, grep=grep, context=context)
             return
 
         if task_name not in self.config.tasks:
@@ -365,6 +473,36 @@ class TmuxManager:
                     for line in output:
                         print(line)
 
+    def show_all_logs(
+        self,
+        follow: bool = False,
+        lines: int = 100,
+        grep: str | None = None,
+        context: int = 3,
+    ) -> None:
+        """Show logs from all running tasks."""
+        sess = self._get_session()
+
+        if follow:
+            sess.attach()
+            return
+
+        for task_name in self.config.tasks:
+            window = sess.windows.get(window_name=task_name, default=None)
+            if not window:
+                continue
+            pane = window.active_pane
+            if not pane:
+                continue
+            output = pane.cmd("capture-pane", "-p", "-S", f"-{lines}").stdout
+            if grep:
+                matching = [line for line in output if grep.lower() in line.lower()]
+                for line in matching:
+                    print(f"[{task_name}] {line}")
+            else:
+                for line in output:
+                    print(f"[{task_name}] {line}")
+
     def list_tasks(self) -> None:
         """List all tasks and their status"""
         print(f"Session: {self.config.name}")
@@ -381,7 +519,12 @@ class TmuxManager:
                 "Healthy" if status["healthy"] else "Running" if status["running"] else "Stopped"
             )
             auto = "" if task_cfg.auto_start else " [manual]"
-            print(f"{health_icon} {status_text:8} {task_name:15} {task_cfg.command}{auto}")
+            extras = ""
+            if task_cfg.cwd:
+                extras += f" cwd={task_cfg.cwd}"
+            if task_cfg.depends_on:
+                extras += f" deps=[{','.join(task_cfg.depends_on)}]"
+            print(f"{health_icon} {status_text:8} {task_name:15} {task_cfg.command}{auto}{extras}")
 
     def show_status(self) -> None:
         """Show overall session status"""
@@ -394,9 +537,9 @@ class TmuxManager:
             self.list_tasks()
 
     def check_task_health(self, task_name: str) -> bool:
-        """Check if a task is healthy (process still running)"""
+        """Check if a task is healthy"""
+        is_healthy = self.is_task_healthy(task_name)
         status = self.get_task_status(task_name)
-        is_healthy = bool(status["running"] and status["healthy"])
 
         self.task_health[task_name] = {
             "healthy": is_healthy,
