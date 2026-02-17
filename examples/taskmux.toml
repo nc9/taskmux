@@ -1,13 +1,19 @@
 name = "taskmux-dev"
 
+[tasks.db]
+command = "echo 'Starting postgres...' && while true; do echo $(date): DB heartbeat; sleep 5; done"
+health_check = "echo 'DB ready'"
+health_interval = 3
+
 [tasks.server]
 command = "echo 'Starting server...' && while true; do echo $(date): Server heartbeat; sleep 5; done"
+cwd = "examples"
+depends_on = ["db"]
+health_check = "echo 'Server ready'"
 
 [tasks.build]
 command = "echo 'Building project...' && sleep 3 && echo 'Build complete!'"
-
-[tasks.test]
-command = "echo 'Running tests...' && sleep 1 && echo 'All tests passed!'"
+depends_on = ["server"]
 
 [tasks.monitor]
 command = "while true; do echo $(date): Monitoring system; sleep 10; done"
