@@ -3,7 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 from taskmux.models import TaskConfig, TaskmuxConfig
-from taskmux.tmux_manager import TmuxManager, _print_grep_results
+from taskmux.tmux_manager import TmuxManager, _find_new_lines, _print_grep_results
 
 
 def _make_config(**kwargs) -> TaskmuxConfig:
@@ -449,3 +449,66 @@ class TestPrintGrepResults:
         _print_grep_results(output, "MATCH", context=0)
         captured = capsys.readouterr().out
         assert "--" in captured
+
+
+class TestFindNewLines:
+    def test_no_prev_returns_all(self):
+        assert _find_new_lines(["a", "b", "c"], []) == ["a", "b", "c"]
+
+    def test_exact_match_returns_empty(self):
+        lines = ["a", "b", "c"]
+        assert _find_new_lines(lines, ["a", "b", "c"]) == []
+
+    def test_new_lines_appended(self):
+        prev = ["a", "b", "c"]
+        current = ["a", "b", "c", "d", "e"]
+        assert _find_new_lines(current, prev) == ["d", "e"]
+
+    def test_prev_scrolled_away_returns_all(self):
+        prev = ["x", "y", "z"]
+        current = ["a", "b", "c"]
+        assert _find_new_lines(current, prev) == ["a", "b", "c"]
+
+    def test_partial_overlap(self):
+        prev = ["b", "c"]
+        current = ["a", "b", "c", "d"]
+        assert _find_new_lines(current, prev) == ["d"]
+
+
+class TestTailPanes:
+    @patch("taskmux.tmux_manager.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_prints_colored_prefix(self, mock_server_cls, _mock_sleep, capsys):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_server.sessions.get.side_effect = Exception("not found")
+
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value = MagicMock(stdout=["hello world"])
+
+        cfg = _make_config(tasks={"db": "echo db"})
+        mgr = TmuxManager(cfg)
+        mgr._tail_panes([("db", mock_pane, "cyan")])
+
+        captured = capsys.readouterr().out
+        assert "[db]" in captured
+        assert "hello world" in captured
+        assert "Stopped following" in captured
+
+    @patch("taskmux.tmux_manager.time.sleep", side_effect=KeyboardInterrupt)
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_grep_filters(self, mock_server_cls, _mock_sleep, capsys):
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_server.sessions.get.side_effect = Exception("not found")
+
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value = MagicMock(stdout=["info ok", "ERROR bad", "info fine"])
+
+        cfg = _make_config(tasks={"api": "echo api"})
+        mgr = TmuxManager(cfg)
+        mgr._tail_panes([("api", mock_pane, "green")], grep="error")
+
+        captured = capsys.readouterr().out
+        assert "ERROR bad" in captured
+        assert "info ok" not in captured

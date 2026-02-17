@@ -8,9 +8,26 @@ from collections import deque
 from datetime import datetime
 
 import libtmux
+from rich.console import Console
+from rich.markup import escape
 
 from .hooks import runHook
 from .models import TaskmuxConfig
+
+TASK_COLORS = ["cyan", "green", "yellow", "magenta", "blue", "red"]
+
+
+def _find_new_lines(current: list[str], prev_tail: list[str]) -> list[str]:
+    """Return lines in current that are new since prev_tail."""
+    if not prev_tail:
+        return current
+    target = prev_tail[-1]
+    for i in range(len(current) - 1, -1, -1):
+        if current[i] == target:
+            ctx = min(len(prev_tail), i + 1)
+            if current[i - ctx + 1 : i + 1] == prev_tail[-ctx:]:
+                return current[i + 1 :]
+    return current  # no match, prev scrolled away — return all
 
 
 class TmuxManager:
@@ -433,6 +450,54 @@ class TmuxManager:
         info["healthy"] = self.is_task_healthy(task_name)
         return info
 
+    def _tail_panes(
+        self,
+        panes: list[tuple[str, libtmux.Pane, str]],
+        lines: int = 100,
+        grep: str | None = None,
+    ) -> None:
+        """Poll capture-pane and print new lines with colored task prefixes."""
+        console = Console()
+        state: dict[str, list[str]] = {}
+
+        try:
+            while True:
+                for task_name, pane, color in panes:
+                    output = pane.cmd("capture-pane", "-p", "-S", f"-{lines}").stdout
+                    while output and not output[-1].strip():
+                        output.pop()
+
+                    prev = state.get(task_name, [])
+                    new = _find_new_lines(output, prev)
+
+                    if grep:
+                        new = [ln for ln in new if grep.lower() in ln.lower()]
+
+                    for line in new:
+                        prefix = escape(f"[{task_name}]")
+                        console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
+
+                    if output:
+                        state[task_name] = output[-50:]
+
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Stopped following logs[/dim]")
+
+    def _collect_panes(self, task_names: list[str]) -> list[tuple[str, libtmux.Pane, str]]:
+        """Collect (name, pane, color) tuples for running tasks."""
+        sess = self._get_session()
+        result: list[tuple[str, libtmux.Pane, str]] = []
+        for i, name in enumerate(task_names):
+            window = sess.windows.get(window_name=name, default=None)
+            if not window:
+                continue
+            pane = window.active_pane
+            if pane:
+                color = TASK_COLORS[i % len(TASK_COLORS)]
+                result.append((name, pane, color))
+        return result
+
     def show_logs(
         self,
         task_name: str | None,
@@ -461,8 +526,9 @@ class TmuxManager:
             return
 
         if follow:
-            window.select_window()
-            sess.attach()
+            panes = self._collect_panes([task_name])
+            if panes:
+                self._tail_panes(panes, lines=lines, grep=grep)
         else:
             pane = window.active_pane
             if pane:
@@ -482,26 +548,33 @@ class TmuxManager:
     ) -> None:
         """Show logs from all running tasks."""
         sess = self._get_session()
+        console = Console()
+        task_names = list(self.config.tasks.keys())
 
         if follow:
-            sess.attach()
+            panes = self._collect_panes(task_names)
+            if panes:
+                self._tail_panes(panes, lines=lines, grep=grep)
             return
 
-        for task_name in self.config.tasks:
+        for i, task_name in enumerate(task_names):
             window = sess.windows.get(window_name=task_name, default=None)
             if not window:
                 continue
             pane = window.active_pane
             if not pane:
                 continue
+            color = TASK_COLORS[i % len(TASK_COLORS)]
             output = pane.cmd("capture-pane", "-p", "-S", f"-{lines}").stdout
             if grep:
                 matching = [line for line in output if grep.lower() in line.lower()]
                 for line in matching:
-                    print(f"[{task_name}] {line}")
+                    prefix = escape(f"[{task_name}]")
+                    console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
             else:
                 for line in output:
-                    print(f"[{task_name}] {line}")
+                    prefix = escape(f"[{task_name}]")
+                    console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
 
     def list_tasks(self) -> None:
         """List all tasks and their status"""
