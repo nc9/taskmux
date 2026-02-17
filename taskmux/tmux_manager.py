@@ -66,7 +66,7 @@ class TmuxManager:
 
         if self.session and status["running"]:
             try:
-                window = self._get_session().windows.get(window_name=task_name)
+                window = self._get_session().windows.get(window_name=task_name, default=None)
                 if window and window.active_pane:
                     current_command = getattr(window.active_pane, "pane_current_command", "")
                     status["healthy"] = current_command != "" and current_command != "bash"
@@ -99,7 +99,7 @@ class TmuxManager:
         task_cfg = self.config.tasks[task_name]
 
         # Check if already running
-        existing = sess.windows.get(window_name=task_name)
+        existing = sess.windows.get(window_name=task_name, default=None)
         if existing:
             print(f"Task '{task_name}' already running")
             return
@@ -139,7 +139,7 @@ class TmuxManager:
             return
 
         sess = self._get_session()
-        window = sess.windows.get(window_name=task_name)
+        window = sess.windows.get(window_name=task_name, default=None)
         if not window:
             print(f"Task '{task_name}' not running")
             return
@@ -215,7 +215,7 @@ class TmuxManager:
         # Stop each task with hooks
         sess = self._get_session()
         for task_name, task_cfg in self.config.tasks.items():
-            window = sess.windows.get(window_name=task_name)
+            window = sess.windows.get(window_name=task_name, default=None)
             if window:
                 runHook(task_cfg.hooks.before_stop, task_name)
                 pane = window.active_pane
@@ -253,7 +253,7 @@ class TmuxManager:
         task_cfg = self.config.tasks[task_name]
         command = task_cfg.command
 
-        window = sess.windows.get(window_name=task_name)
+        window = sess.windows.get(window_name=task_name, default=None)
         if window:
             runHook(task_cfg.hooks.before_stop, task_name)
             pane = window.active_pane
@@ -280,7 +280,7 @@ class TmuxManager:
             print(f"Session '{self.config.name}' doesn't exist")
             return
 
-        window = self._get_session().windows.get(window_name=task_name)
+        window = self._get_session().windows.get(window_name=task_name, default=None)
         if window:
             window.kill()
             print(f"Killed task '{task_name}'")
@@ -310,7 +310,7 @@ class TmuxManager:
             return info
 
         sess = self._get_session()
-        window = sess.windows.get(window_name=task_name)
+        window = sess.windows.get(window_name=task_name, default=None)
         if not window:
             return info
 
@@ -347,7 +347,7 @@ class TmuxManager:
             return
 
         sess = self._get_session()
-        window = sess.windows.get(window_name=task_name)
+        window = sess.windows.get(window_name=task_name, default=None)
         if not window:
             print(f"Task '{task_name}' not found")
             return
