@@ -103,7 +103,8 @@ class TmuxManager:
         try:
             result = subprocess.run(
                 ["pgrep", "-P", str(shell_pid)],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             pids = result.stdout.strip().split("\n")
             return int(pids[0]) if pids and pids[0] else None
@@ -123,7 +124,8 @@ class TmuxManager:
         try:
             result = subprocess.run(
                 ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             for pid_str in result.stdout.strip().split("\n"):
                 if pid_str.strip():
@@ -415,9 +417,7 @@ class TmuxManager:
                     pane_map[task_name] = (pane, pid)
 
         # Wait for graceful exit (use max grace period across tasks)
-        max_grace = max(
-            (cfg.stop_grace_period for cfg in self.config.tasks.values()), default=5
-        )
+        max_grace = max((cfg.stop_grace_period for cfg in self.config.tasks.values()), default=5)
         time.sleep(max_grace)
 
         # Phase 2: SIGTERM then SIGKILL any survivors
