@@ -57,7 +57,15 @@ class TestBuildContextBlock:
         block = buildContextBlock(cfg)
         assert "server" in block
         assert "npm start" in block
-        assert "(manual)" in block
+        assert "| no |" in block
+
+    def test_table_includes_port(self):
+        cfg = TaskmuxConfig(
+            name="test",
+            tasks={"api": TaskConfig(command="bun dev", port=4001)},
+        )
+        block = buildContextBlock(cfg)
+        assert "| 4001 |" in block
 
     def test_empty_tasks_message(self):
         cfg = TaskmuxConfig(name="test")

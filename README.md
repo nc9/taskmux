@@ -90,17 +90,22 @@ health_check = "test -f .migrate-complete"
 [tasks.api]
 command = "python manage.py runserver 0.0.0.0:8000"
 cwd = "apps/api"
+port = 8000
 depends_on = ["migrate"]
 health_check = "curl -sf http://localhost:8000/health"
+stop_grace_period = 10
 
 [tasks.worker]
 command = "celery -A myapp worker -l info"
 cwd = "apps/api"
 depends_on = ["db"]
+max_restarts = 3
+restart_backoff = 3.0
 
 [tasks.web]
 command = "bun dev"
 cwd = "apps/web"
+port = 3000
 depends_on = ["api"]
 health_check = "curl -sf http://localhost:3000"
 
@@ -136,8 +141,8 @@ taskmux start storybook          # Start a manual task
 # Session
 taskmux start                    # Start all auto_start tasks
 taskmux start <task>             # Start a single task
-taskmux stop                     # Stop all tasks (graceful C-c)
-taskmux stop <task>              # Stop a single task (graceful C-c)
+taskmux stop                     # Stop all tasks (C-c → SIGTERM → SIGKILL)
+taskmux stop <task>              # Stop a single task (signal escalation)
 taskmux restart                  # Restart all tasks
 taskmux restart <task>           # Restart a single task
 taskmux status                   # Show session status
@@ -171,8 +176,8 @@ taskmux daemon --port 8765       # Run with WebSocket API + auto-restart
 
 ### stop vs kill
 
-- **`stop`** sends C-c (graceful). Window stays alive so you can see exit output.
-- **`kill`** destroys the window immediately.
+- **`stop`** sends C-c, then escalates to SIGTERM → SIGKILL if the process doesn't exit within the grace period. Window stays alive so you can see exit output.
+- **`kill`** kills the process group and destroys the window immediately.
 
 ## Configuration
 
@@ -191,7 +196,9 @@ after_stop = "echo done"
 [tasks.server]
 command = "python manage.py runserver"
 cwd = "apps/api"
+port = 8000
 health_check = "curl -sf http://localhost:8000/health"
+stop_grace_period = 10
 depends_on = ["db"]
 
 [tasks.server.hooks]
@@ -204,6 +211,7 @@ health_check = "pg_isready -h localhost"
 [tasks.worker]
 command = "celery worker -A myapp"
 depends_on = ["db"]
+max_restarts = 3
 
 [tasks.tailwind]
 command = "npx tailwindcss -w"
@@ -223,10 +231,14 @@ auto_start = false
 | `tasks.<name>.command` | — | Shell command to run |
 | `tasks.<name>.auto_start` | `true` | Start with `taskmux start` |
 | `tasks.<name>.cwd` | — | Working directory for the task |
+| `tasks.<name>.port` | — | Port to clean up before starting (kills orphaned listeners) |
 | `tasks.<name>.health_check` | — | Shell command to check health (exit 0 = healthy) |
 | `tasks.<name>.health_interval` | `10` | Seconds between health checks |
 | `tasks.<name>.health_timeout` | `5` | Seconds before health check times out |
 | `tasks.<name>.health_retries` | `3` | Consecutive failures before "unhealthy" |
+| `tasks.<name>.stop_grace_period` | `5` | Seconds to wait after C-c before escalating to SIGTERM |
+| `tasks.<name>.max_restarts` | `5` | Max auto-restarts in daemon mode before giving up (0 = unlimited) |
+| `tasks.<name>.restart_backoff` | `2.0` | Multiplier for restart delay (1s, 2s, 4s, 8s… capped at 60s) |
 | `tasks.<name>.depends_on` | `[]` | Task names that must be healthy before this task starts |
 | `tasks.<name>.hooks.*` | — | Per-task lifecycle hooks (same fields as global) |
 
@@ -254,6 +266,20 @@ Hooks fire in this order:
 2. **Stop**: global `before_stop` → task `before_stop` → _send C-c_ → task `after_stop` → global `after_stop`
 
 If a `before_*` hook fails (non-zero exit), the action is aborted.
+
+### Process Lifecycle
+
+Taskmux ensures processes are fully stopped before restarting and that orphaned port listeners don't block new starts.
+
+**Stop escalation** (`stop`, `restart`):
+
+1. **C-c** (SIGINT) — waits `stop_grace_period` seconds (default 5)
+2. **SIGTERM** to process group — waits 3 seconds
+3. **SIGKILL** to process group — force kill
+
+**Port cleanup** (`start`, `restart`): If `port` is configured, taskmux kills any process listening on that port before starting. This handles orphaned processes from crashed sessions.
+
+**Auto-restart backoff** (daemon mode): When a task keeps crashing, restart delays increase exponentially (`restart_backoff` multiplier, capped at 60s). After `max_restarts` failures, the task is left stopped. The counter resets after 60 seconds of healthy uptime.
 
 ### Init & Agent Context
 
@@ -290,12 +316,14 @@ Use `--defaults` to skip prompts (CI/automation).
 
 ## Daemon Mode
 
-Run as a background daemon with WebSocket API and auto-restart:
+Run as a background daemon with WebSocket API and auto-restart with exponential backoff:
 
 ```bash
 taskmux daemon              # Default port 8765
 taskmux daemon --port 9000  # Custom port
 ```
+
+The daemon monitors task health every 30 seconds. Unhealthy tasks are restarted with exponential backoff (controlled by `restart_backoff` and `max_restarts`). Tasks that stay healthy for 60+ seconds have their restart counter reset.
 
 WebSocket API:
 
