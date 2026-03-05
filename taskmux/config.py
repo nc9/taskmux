@@ -106,6 +106,8 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("auto_start", False)
         if task_cfg.cwd is not None:
             inner.add("cwd", task_cfg.cwd)
+        if task_cfg.port is not None:
+            inner.add("port", task_cfg.port)
         if task_cfg.health_check is not None:
             inner.add("health_check", task_cfg.health_check)
         if task_cfg.health_interval != 10:
@@ -114,6 +116,12 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("health_timeout", task_cfg.health_timeout)
         if task_cfg.health_retries != 3:
             inner.add("health_retries", task_cfg.health_retries)
+        if task_cfg.stop_grace_period != 5:
+            inner.add("stop_grace_period", task_cfg.stop_grace_period)
+        if task_cfg.max_restarts != 5:
+            inner.add("max_restarts", task_cfg.max_restarts)
+        if task_cfg.restart_backoff != 2.0:
+            inner.add("restart_backoff", task_cfg.restart_backoff)
         if task_cfg.depends_on:
             inner.add("depends_on", task_cfg.depends_on)
         # Task-level hooks

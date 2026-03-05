@@ -37,10 +37,14 @@ class TaskConfig(_StrictConfig):
     command: str
     auto_start: bool = True
     cwd: str | None = None
+    port: int | None = None
     health_check: str | None = None
     health_interval: int = 10
     health_timeout: int = 5
     health_retries: int = 3
+    stop_grace_period: int = 5
+    max_restarts: int = 5
+    restart_backoff: float = 2.0
     depends_on: list[str] = []
     hooks: HookConfig = HookConfig()
 

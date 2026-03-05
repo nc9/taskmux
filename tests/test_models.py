@@ -40,10 +40,14 @@ class TestTaskConfig:
         assert t.command == "echo hi"
         assert t.auto_start is True
         assert t.cwd is None
+        assert t.port is None
         assert t.health_check is None
         assert t.health_interval == 10
         assert t.health_timeout == 5
         assert t.health_retries == 3
+        assert t.stop_grace_period == 5
+        assert t.max_restarts == 5
+        assert t.restart_backoff == 2.0
         assert t.depends_on == []
         assert t.hooks == HookConfig()
 
@@ -51,13 +55,21 @@ class TestTaskConfig:
         t = TaskConfig(
             command="cargo run",
             cwd="apps/api",
+            port=4001,
             health_check="curl -sf localhost:4000/health",
             health_interval=5,
+            stop_grace_period=10,
+            max_restarts=3,
+            restart_backoff=3.0,
             depends_on=["db"],
         )
         assert t.cwd == "apps/api"
+        assert t.port == 4001
         assert t.health_check == "curl -sf localhost:4000/health"
         assert t.health_interval == 5
+        assert t.stop_grace_period == 10
+        assert t.max_restarts == 3
+        assert t.restart_backoff == 3.0
         assert t.depends_on == ["db"]
 
     def test_auto_start_false(self):

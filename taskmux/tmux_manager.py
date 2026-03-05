@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal as sig
 import subprocess
 import time
 from collections import deque
@@ -13,6 +16,8 @@ from rich.markup import escape
 
 from .hooks import runHook
 from .models import TaskmuxConfig
+
+SHELL_NAMES = frozenset(("bash", "zsh", "sh", "fish"))
 
 TASK_COLORS = ["cyan", "green", "yellow", "magenta", "blue", "red"]
 
@@ -74,10 +79,58 @@ class TmuxManager:
             window = self._get_session().windows.get(window_name=task_name, default=None)
             if window and window.active_pane:
                 cmd = getattr(window.active_pane, "pane_current_command", "")
-                return cmd != "" and cmd != "bash"
+                return cmd != "" and cmd not in SHELL_NAMES
         except Exception:
             pass
         return False
+
+    def _wait_for_exit(self, pane: libtmux.Pane, timeout: float) -> bool:
+        """Poll pane_current_command until it returns to a shell or timeout."""
+        elapsed = 0.0
+        while elapsed < timeout:
+            time.sleep(0.5)
+            elapsed += 0.5
+            cmd = getattr(pane, "pane_current_command", "")
+            if cmd == "" or cmd in SHELL_NAMES:
+                return True
+        return False
+
+    def _get_pane_child_pid(self, pane: libtmux.Pane) -> int | None:
+        """Get the child process PID running inside the pane's shell."""
+        shell_pid = getattr(pane, "pane_pid", None)
+        if not shell_pid:
+            return None
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(shell_pid)],
+                capture_output=True, text=True,
+            )
+            pids = result.stdout.strip().split("\n")
+            return int(pids[0]) if pids and pids[0] else None
+        except (ValueError, OSError):
+            return None
+
+    def _kill_process_tree(self, pid: int, signal_num: int = sig.SIGKILL) -> None:
+        """Kill process and all children via process group."""
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal_num)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    def _cleanup_port(self, port: int) -> None:
+        """Kill any process listening on port."""
+        try:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"],
+                capture_output=True, text=True,
+            )
+            for pid_str in result.stdout.strip().split("\n"):
+                if pid_str.strip():
+                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                        os.kill(int(pid_str.strip()), sig.SIGKILL)
+        except OSError:
+            pass
 
     def is_task_healthy(self, task_name: str) -> bool:
         """Check task health. Uses health_check command if configured, falls back to pane-alive."""
@@ -188,6 +241,10 @@ class TmuxManager:
         sess = self._get_session()
         task_cfg = self.config.tasks[task_name]
 
+        # Kill anything occupying the port before starting
+        if task_cfg.port:
+            self._cleanup_port(task_cfg.port)
+
         # Check if already running
         existing = sess.windows.get(window_name=task_name, default=None)
         if existing:
@@ -226,7 +283,7 @@ class TmuxManager:
         print(f"Started task '{task_name}'")
 
     def stop_task(self, task_name: str) -> None:
-        """Graceful stop (C-c) a single task. Window stays alive."""
+        """Graceful stop with signal escalation: C-c → SIGTERM → SIGKILL."""
         if not self.session_exists():
             print(f"Session '{self.config.name}' doesn't exist")
             return
@@ -249,7 +306,21 @@ class TmuxManager:
 
         pane = window.active_pane
         if pane:
+            # Phase 1: SIGINT (Ctrl+C)
             pane.send_keys("C-c")
+
+            if not self._wait_for_exit(pane, timeout=task_cfg.stop_grace_period):
+                # Phase 2: SIGTERM via process group
+                pid = self._get_pane_child_pid(pane)
+                if pid:
+                    self._kill_process_tree(pid, sig.SIGTERM)
+
+                if not self._wait_for_exit(pane, timeout=3):
+                    # Phase 3: SIGKILL entire process group
+                    if pid:
+                        self._kill_process_tree(pid, sig.SIGKILL)
+                    # Final wait for cleanup
+                    self._wait_for_exit(pane, timeout=1)
 
         # Hooks: task after_stop, then global after_stop
         runHook(task_cfg.hooks.after_stop, task_name)
@@ -322,7 +393,7 @@ class TmuxManager:
         print(f"Started session '{self.config.name}' with {len(auto_tasks)} tasks")
 
     def stop_all(self) -> None:
-        """Stop all tasks then kill session."""
+        """Stop all tasks with signal escalation then kill session."""
         if not self.session_exists():
             print("No session running")
             return
@@ -330,8 +401,9 @@ class TmuxManager:
         # Global before_stop
         runHook(self.config.hooks.before_stop)
 
-        # Stop each task with hooks
+        # Phase 1: send C-c to all tasks
         sess = self._get_session()
+        pane_map: dict[str, tuple[libtmux.Pane, int | None]] = {}
         for task_name, task_cfg in self.config.tasks.items():
             window = sess.windows.get(window_name=task_name, default=None)
             if window:
@@ -339,7 +411,32 @@ class TmuxManager:
                 pane = window.active_pane
                 if pane:
                     pane.send_keys("C-c")
-                runHook(task_cfg.hooks.after_stop, task_name)
+                    pid = self._get_pane_child_pid(pane)
+                    pane_map[task_name] = (pane, pid)
+
+        # Wait for graceful exit (use max grace period across tasks)
+        max_grace = max(
+            (cfg.stop_grace_period for cfg in self.config.tasks.values()), default=5
+        )
+        time.sleep(max_grace)
+
+        # Phase 2: SIGTERM then SIGKILL any survivors
+        for _name, (pane, pid) in pane_map.items():
+            cmd = getattr(pane, "pane_current_command", "")
+            if cmd and cmd not in SHELL_NAMES and pid:
+                self._kill_process_tree(pid, sig.SIGTERM)
+
+        time.sleep(1)
+
+        for _name, (pane, pid) in pane_map.items():
+            cmd = getattr(pane, "pane_current_command", "")
+            if cmd and cmd not in SHELL_NAMES and pid:
+                self._kill_process_tree(pid, sig.SIGKILL)
+
+        # Run after_stop hooks
+        for task_name in pane_map:
+            task_cfg = self.config.tasks[task_name]
+            runHook(task_cfg.hooks.after_stop, task_name)
 
         sess.kill()
 
@@ -358,7 +455,7 @@ class TmuxManager:
         self.start_all()
 
     def restart_task(self, task_name: str) -> None:
-        """Restart a specific task (works regardless of auto_start)"""
+        """Restart a specific task with full stop escalation."""
         if not self.session_exists():
             print(f"Session '{self.config.name}' doesn't exist. Run 'taskmux start' first.")
             return
@@ -373,12 +470,24 @@ class TmuxManager:
 
         window = sess.windows.get(window_name=task_name, default=None)
         if window:
+            # Full stop with signal escalation
             runHook(task_cfg.hooks.before_stop, task_name)
             pane = window.active_pane
             if pane:
                 pane.send_keys("C-c")
-                time.sleep(0.5)
+                if not self._wait_for_exit(pane, timeout=task_cfg.stop_grace_period):
+                    pid = self._get_pane_child_pid(pane)
+                    if pid:
+                        self._kill_process_tree(pid, sig.SIGTERM)
+                    if not self._wait_for_exit(pane, timeout=3):
+                        if pid:
+                            self._kill_process_tree(pid, sig.SIGKILL)
+                        self._wait_for_exit(pane, timeout=1)
             runHook(task_cfg.hooks.after_stop, task_name)
+
+            # Port cleanup before restart
+            if task_cfg.port:
+                self._cleanup_port(task_cfg.port)
 
             runHook(task_cfg.hooks.before_start, task_name)
             pane = window.active_pane
@@ -388,6 +497,9 @@ class TmuxManager:
                 pane.send_keys(command, enter=True)
             runHook(task_cfg.hooks.after_start, task_name)
         else:
+            # Port cleanup before start
+            if task_cfg.port:
+                self._cleanup_port(task_cfg.port)
             runHook(task_cfg.hooks.before_start, task_name)
             self._send_command_to_window(sess, task_name, command, task_cfg.cwd)
             runHook(task_cfg.hooks.after_start, task_name)
@@ -395,13 +507,18 @@ class TmuxManager:
         print(f"Restarted task '{task_name}'")
 
     def kill_task(self, task_name: str) -> None:
-        """Kill a specific task"""
+        """Kill a specific task (process group + window)."""
         if not self.session_exists():
             print(f"Session '{self.config.name}' doesn't exist")
             return
 
         window = self._get_session().windows.get(window_name=task_name, default=None)
         if window:
+            pane = window.active_pane
+            if pane:
+                pid = self._get_pane_child_pid(pane)
+                if pid:
+                    self._kill_process_tree(pid)
             window.kill()
             print(f"Killed task '{task_name}'")
         else:

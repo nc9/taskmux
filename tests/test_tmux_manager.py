@@ -97,6 +97,8 @@ class TestStopTask:
 
         mock_window = MagicMock()
         mock_pane = MagicMock()
+        # After C-c, pane returns to shell so _wait_for_exit succeeds immediately
+        mock_pane.pane_current_command = "bash"
         mock_window.active_pane = mock_pane
         mock_session.windows.get.return_value = mock_window
 
@@ -117,6 +119,41 @@ class TestStopTask:
         mgr = TmuxManager(cfg)
         mgr.stop_task("server")
         assert "not running" in capsys.readouterr().out
+
+    @patch("taskmux.tmux_manager.os.killpg")
+    @patch("taskmux.tmux_manager.os.getpgid", return_value=999)
+    @patch("taskmux.tmux_manager.subprocess.run")
+    @patch("taskmux.tmux_manager.libtmux.Server")
+    def test_escalates_to_sigterm(self, mock_server_cls, mock_run, _getpgid, mock_killpg):
+        """If process doesn't exit after C-c, escalates to SIGTERM."""
+        import signal as signal_mod
+
+        mock_server = MagicMock()
+        mock_server_cls.return_value = mock_server
+        mock_session = MagicMock()
+        mock_server.sessions.get.return_value = mock_session
+
+        mock_window = MagicMock()
+        mock_pane = MagicMock()
+        # Process stays running (never returns to shell)
+        mock_pane.pane_current_command = "node"
+        mock_pane.pane_pid = "100"
+        mock_window.active_pane = mock_pane
+        mock_session.windows.get.return_value = mock_window
+
+        # pgrep returns child PID
+        mock_run.return_value = MagicMock(stdout="200\n")
+
+        cfg = _make_config(tasks={"server": {"command": "echo hi", "stop_grace_period": 1}})
+        mgr = TmuxManager(cfg)
+        mgr.stop_task("server")
+
+        # Should have sent C-c then escalated
+        mock_pane.send_keys.assert_called_with("C-c")
+        # Should have called killpg with SIGTERM then SIGKILL
+        calls = [c.args for c in mock_killpg.call_args_list]
+        assert (999, signal_mod.SIGTERM) in calls
+        assert (999, signal_mod.SIGKILL) in calls
 
 
 class TestStopAll:

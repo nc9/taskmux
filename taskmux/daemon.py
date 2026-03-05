@@ -39,6 +39,26 @@ class ConfigWatcher(FileSystemEventHandler):
                 self.taskmux_cli.handle_config_reload()
 
 
+class RestartTracker:
+    """Tracks per-task restart counts and timestamps for backoff."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, dict[str, float]] = {}
+
+    def get(self, task_name: str) -> dict[str, float]:
+        return self._data.get(task_name, {"count": 0, "last": 0.0})
+
+    def record(self, task_name: str) -> None:
+        info = self.get(task_name)
+        self._data[task_name] = {
+            "count": info["count"] + 1,
+            "last": time.time(),
+        }
+
+    def reset(self, task_name: str) -> None:
+        self._data.pop(task_name, None)
+
+
 class TaskmuxDaemon:
     """Daemon mode for Taskmux with enhanced monitoring and API"""
 
@@ -51,6 +71,7 @@ class TaskmuxDaemon:
         self.health_check_interval = 30
         self.health_check_task: asyncio.Task | None = None
         self.websocket_clients: set = set()
+        self.restart_tracker = RestartTracker()
         self.logger = self._setup_logging()
 
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -124,11 +145,11 @@ class TaskmuxDaemon:
         self.logger.info("Taskmux daemon stopped")
 
     async def _health_check_loop(self) -> None:
-        """Continuous health checking loop"""
+        """Continuous health checking loop with restart backoff."""
         while self.running:
             try:
                 if self.cli and self.cli.tmux.session_exists():
-                    self.cli.tmux.auto_restart_unhealthy_tasks()
+                    self._auto_restart_with_backoff()
 
                     if self.websocket_clients:
                         status = await self._get_full_status()
@@ -138,6 +159,42 @@ class TaskmuxDaemon:
             except Exception as e:
                 self.logger.error(f"Health check error: {e}")
                 await asyncio.sleep(5)
+
+    def _auto_restart_with_backoff(self) -> None:
+        """Auto-restart unhealthy tasks with exponential backoff."""
+        assert self.cli is not None
+        now = time.time()
+
+        for task_name, task_cfg in self.cli.config.tasks.items():
+            healthy = self.cli.tmux.check_task_health(task_name)
+
+            if healthy:
+                # Reset tracker if healthy for >60s
+                info = self.restart_tracker.get(task_name)
+                if info["count"] > 0 and now - info["last"] > 60:
+                    self.restart_tracker.reset(task_name)
+                continue
+
+            # Skip if not previously healthy (avoid restart loop on first check)
+            prev_health = self.cli.tmux.task_health.get(task_name, {}).get("healthy", True)
+            if not prev_health:
+                info = self.restart_tracker.get(task_name)
+
+                # Check max_restarts
+                if task_cfg.max_restarts and info["count"] >= task_cfg.max_restarts:
+                    self.logger.warning(
+                        f"Task '{task_name}' exceeded max restarts ({task_cfg.max_restarts})"
+                    )
+                    continue
+
+                # Check backoff delay
+                delay = min(task_cfg.restart_backoff ** info["count"], 60)
+                if info["last"] and now - info["last"] < delay:
+                    continue
+
+            self.logger.info(f"Auto-restarting unhealthy task: {task_name}")
+            self.cli.tmux.restart_task(task_name)
+            self.restart_tracker.record(task_name)
 
     async def _start_api_server(self) -> None:
         """Start WebSocket API server"""
