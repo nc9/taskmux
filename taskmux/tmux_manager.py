@@ -694,8 +694,12 @@ class TmuxManager:
                     console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
 
     def list_tasks(self) -> None:
-        """List all tasks and their status"""
-        print(f"Session: {self.config.name}")
+        """List all tasks and their status."""
+        exists = self.session_exists()
+        print(f"Session '{self.config.name}': {'Running' if exists else 'Stopped'}")
+        if exists:
+            windows = self.list_windows()
+            print(f"Active tasks: {len(windows)}")
         print("-" * 70)
 
         if not self.config.tasks:
@@ -715,16 +719,6 @@ class TmuxManager:
             if task_cfg.depends_on:
                 extras += f" deps=[{','.join(task_cfg.depends_on)}]"
             print(f"{health_icon} {status_text:8} {task_name:15} {task_cfg.command}{auto}{extras}")
-
-    def show_status(self) -> None:
-        """Show overall session status"""
-        exists = self.session_exists()
-        print(f"Session '{self.config.name}': {'Running' if exists else 'Stopped'} (libtmux)")
-
-        if exists:
-            windows = self.list_windows()
-            print(f"Active tasks: {len(windows)}")
-            self.list_tasks()
 
     def check_task_health(self, task_name: str) -> bool:
         """Check if a task is healthy"""

@@ -54,13 +54,6 @@ def init(
 
 
 @app.command()
-def list():
-    """List all tasks and their status."""
-    cli = TaskmuxCLI()
-    cli.tmux.list_tasks()
-
-
-@app.command()
 def start(
     task: str | None = typer.Argument(None, help="Task name (omit for all)"),
 ):
@@ -160,11 +153,15 @@ def remove(
         console.print(f"Task '{task}' not found in config", style="red")
 
 
-@app.command()
-def status():
-    """Show session status."""
+def _status():
+    """Show session and task status."""
     cli = TaskmuxCLI()
-    cli.tmux.show_status()
+    cli.tmux.list_tasks()
+
+
+app.command(name="status")(_status)
+app.command(name="list", hidden=True)(_status)
+app.command(name="ls", hidden=True)(_status)
 
 
 @app.command()
