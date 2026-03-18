@@ -713,12 +713,14 @@ class TmuxManager:
                 "Healthy" if status["healthy"] else "Running" if status["running"] else "Stopped"
             )
             auto = "" if task_cfg.auto_start else " [manual]"
+            port = f" :{task_cfg.port}" if task_cfg.port else ""
             extras = ""
             if task_cfg.cwd:
                 extras += f" cwd={task_cfg.cwd}"
             if task_cfg.depends_on:
                 extras += f" deps=[{','.join(task_cfg.depends_on)}]"
-            print(f"{health_icon} {status_text:8} {task_name:15} {task_cfg.command}{auto}{extras}")
+            line = f"{health_icon} {status_text:8} {task_name:15}{port:7} {task_cfg.command}"
+            print(f"{line}{auto}{extras}")
 
     def check_task_health(self, task_name: str) -> bool:
         """Check if a task is healthy"""
