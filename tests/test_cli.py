@@ -52,6 +52,18 @@ class TestStartCommand:
         assert result.exit_code == 0
         mock_tmux.return_value.start_task.assert_called_once_with("server")
 
+    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.loadConfig")
+    def test_start_multiple(self, mock_load, mock_tmux):
+        from taskmux.models import TaskmuxConfig
+
+        mock_load.return_value = TaskmuxConfig()
+        result = runner.invoke(app, ["start", "api", "web"])
+        assert result.exit_code == 0
+        assert mock_tmux.return_value.start_task.call_count == 2
+        mock_tmux.return_value.start_task.assert_any_call("api")
+        mock_tmux.return_value.start_task.assert_any_call("web")
+
 
 class TestStopCommand:
     @patch("taskmux.cli.TmuxManager")
@@ -74,6 +86,18 @@ class TestStopCommand:
         assert result.exit_code == 0
         mock_tmux.return_value.stop_task.assert_called_once_with("server")
 
+    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.loadConfig")
+    def test_stop_multiple(self, mock_load, mock_tmux):
+        from taskmux.models import TaskmuxConfig
+
+        mock_load.return_value = TaskmuxConfig()
+        result = runner.invoke(app, ["stop", "api", "web"])
+        assert result.exit_code == 0
+        assert mock_tmux.return_value.stop_task.call_count == 2
+        mock_tmux.return_value.stop_task.assert_any_call("api")
+        mock_tmux.return_value.stop_task.assert_any_call("web")
+
 
 class TestRestartCommand:
     @patch("taskmux.cli.TmuxManager")
@@ -95,6 +119,18 @@ class TestRestartCommand:
         result = runner.invoke(app, ["restart", "server"])
         assert result.exit_code == 0
         mock_tmux.return_value.restart_task.assert_called_once_with("server")
+
+    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.loadConfig")
+    def test_restart_multiple(self, mock_load, mock_tmux):
+        from taskmux.models import TaskmuxConfig
+
+        mock_load.return_value = TaskmuxConfig()
+        result = runner.invoke(app, ["restart", "api", "web"])
+        assert result.exit_code == 0
+        assert mock_tmux.return_value.restart_task.call_count == 2
+        mock_tmux.return_value.restart_task.assert_any_call("api")
+        mock_tmux.return_value.restart_task.assert_any_call("web")
 
 
 class TestInspectCommand:

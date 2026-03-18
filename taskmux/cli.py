@@ -55,36 +55,39 @@ def init(
 
 @app.command()
 def start(
-    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
+    tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
 ):
-    """Start all tasks or a specific task."""
+    """Start tasks (all if none specified)."""
     cli = TaskmuxCLI()
-    if task:
-        cli.tmux.start_task(task)
+    if tasks:
+        for task in tasks:
+            cli.tmux.start_task(task)
     else:
         cli.tmux.start_all()
 
 
 @app.command()
 def stop(
-    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
+    tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
 ):
-    """Stop all tasks or a specific task (graceful C-c)."""
+    """Stop tasks (all if none specified)."""
     cli = TaskmuxCLI()
-    if task:
-        cli.tmux.stop_task(task)
+    if tasks:
+        for task in tasks:
+            cli.tmux.stop_task(task)
     else:
         cli.tmux.stop_all()
 
 
 @app.command()
 def restart(
-    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
+    tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
 ):
-    """Restart all tasks or a specific task."""
+    """Restart tasks (all if none specified)."""
     cli = TaskmuxCLI()
-    if task:
-        cli.tmux.restart_task(task)
+    if tasks:
+        for task in tasks:
+            cli.tmux.restart_task(task)
     else:
         cli.tmux.restart_all()
 
