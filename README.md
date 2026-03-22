@@ -1,6 +1,6 @@
 # Taskmux
 
-A modern tmux session manager for LLM development tools with health monitoring, auto-restart, and WebSocket API.
+A modern tmux session manager for LLM development tools with health monitoring, restart policies, and WebSocket API.
 
 ## Why Taskmux?
 
@@ -99,7 +99,8 @@ stop_grace_period = 10
 command = "celery -A myapp worker -l info"
 cwd = "apps/api"
 depends_on = ["db"]
-max_restarts = 3
+restart_policy = "always"
+max_restarts = 10
 restart_backoff = 3.0
 
 [tasks.web]
@@ -138,46 +139,49 @@ taskmux start storybook          # Start a manual task
 ## Commands
 
 ```bash
-# Session
-taskmux start                    # Start all auto_start tasks
-taskmux start <task>             # Start a single task
-taskmux stop                     # Stop all tasks (C-c → SIGTERM → SIGKILL)
-taskmux stop <task>              # Stop a single task (signal escalation)
+# Session lifecycle
+taskmux start                    # Start all auto_start tasks in dependency order
+taskmux start <task> [task2...]  # Start specific tasks
+taskmux start -m                 # Start + stay in foreground monitoring health/restarting
+taskmux stop                     # Stop all (C-c → SIGTERM → SIGKILL), prevents auto-restart
+taskmux stop <task> [task2...]   # Stop specific tasks
 taskmux restart                  # Restart all tasks
-taskmux restart <task>           # Restart a single task
-taskmux status                   # Show session status
-taskmux list                     # List tasks with health indicators
+taskmux restart <task> [task2...] # Restart specific tasks, re-enables auto-restart
 
-# Tasks
-taskmux kill <task>              # Hard-kill a task (destroys window)
-taskmux add <task> "<command>"   # Add task to config
-taskmux remove <task>            # Remove task from config
-taskmux inspect <task>           # JSON task state (pid, command, health)
+# Task management
+taskmux kill <task>              # Hard-kill (SIGKILL + destroy window), prevents auto-restart
+taskmux add <task> "<command>"   # Add task to taskmux.toml
+taskmux remove <task>            # Remove task (kills if running)
+taskmux inspect <task>           # JSON state: pid, health, restart_policy, pane info
+
+# Status & health
+taskmux status                   # Session + task overview (aliases: list, ls)
+taskmux health                   # Health check table for all tasks
 
 # Logs
 taskmux logs                     # Interleaved logs from all tasks
-taskmux logs <task>              # Show recent logs for a task
-taskmux logs -f                  # Attach to session (switch windows with tmux keybinds)
-taskmux logs -f <task>           # Follow a task's logs live
+taskmux logs <task>              # Recent logs for a task
+taskmux logs -f [task]           # Follow logs live (colored prefixes)
 taskmux logs -n 200 <task>       # Last N lines
-taskmux logs -g "error"          # Search all tasks
-taskmux logs <task> -g "error"   # Search one task
-taskmux logs <task> -g "error" -C 5  # Grep with context lines
+taskmux logs -g "error"          # Grep all tasks
+taskmux logs <task> -g "err" -C 5  # Grep one task with context
 
-# Init
-taskmux init                     # Interactive project setup
-taskmux init --defaults          # Non-interactive, use defaults
-
-# Monitoring
-taskmux health                   # Health check table
-taskmux watch                    # Watch config for changes, reload on edit
-taskmux daemon --port 8765       # Run with WebSocket API + auto-restart
+# Setup & monitoring
+taskmux init                     # Interactive project setup + agent context injection
+taskmux init --defaults          # Non-interactive setup
+taskmux watch                    # Watch taskmux.toml, reload on change
+taskmux daemon --port 8765       # Daemon mode: WebSocket API + health monitoring
 ```
 
-### stop vs kill
+### stop vs kill vs restart
 
-- **`stop`** sends C-c, then escalates to SIGTERM → SIGKILL if the process doesn't exit within the grace period. Window stays alive so you can see exit output.
-- **`kill`** kills the process group and destroys the window immediately.
+| Command | Signal | Window | Auto-restart |
+|---------|--------|--------|--------------|
+| `stop` | C-c → SIGTERM → SIGKILL (graceful) | Stays alive | Blocked (manually stopped) |
+| `kill` | SIGKILL (immediate) | Destroyed | Blocked (manually stopped) |
+| `restart` | Full stop + restart | Reused | Re-enabled |
+
+Both `stop` and `kill` mark the task as **manually stopped**, preventing auto-restart even with `restart_policy = "always"`. Use `restart` or `start` to clear this flag and re-enable auto-restart.
 
 ## Configuration
 
@@ -211,11 +215,13 @@ health_check = "pg_isready -h localhost"
 [tasks.worker]
 command = "celery worker -A myapp"
 depends_on = ["db"]
-max_restarts = 3
+restart_policy = "always"
+max_restarts = 10
 
 [tasks.tailwind]
 command = "npx tailwindcss -w"
 auto_start = false
+restart_policy = "no"
 ```
 
 ### Fields
@@ -235,10 +241,11 @@ auto_start = false
 | `tasks.<name>.health_check` | — | Shell command to check health (exit 0 = healthy) |
 | `tasks.<name>.health_interval` | `10` | Seconds between health checks |
 | `tasks.<name>.health_timeout` | `5` | Seconds before health check times out |
-| `tasks.<name>.health_retries` | `3` | Consecutive failures before "unhealthy" |
+| `tasks.<name>.health_retries` | `3` | Consecutive health failures before triggering a restart |
 | `tasks.<name>.stop_grace_period` | `5` | Seconds to wait after C-c before escalating to SIGTERM |
-| `tasks.<name>.max_restarts` | `5` | Max auto-restarts in daemon mode before giving up (0 = unlimited) |
-| `tasks.<name>.restart_backoff` | `2.0` | Multiplier for restart delay (1s, 2s, 4s, 8s… capped at 60s) |
+| `tasks.<name>.restart_policy` | `"on-failure"` | When to auto-restart: `"no"`, `"on-failure"`, or `"always"` (see below) |
+| `tasks.<name>.max_restarts` | `5` | Max auto-restarts before giving up (resets after 60s healthy) |
+| `tasks.<name>.restart_backoff` | `2.0` | Exponential backoff base for restart delay (1s, 2s, 4s… capped at 60s) |
 | `tasks.<name>.depends_on` | `[]` | Task names that must be healthy before this task starts |
 | `tasks.<name>.hooks.*` | — | Per-task lifecycle hooks (same fields as global) |
 
@@ -250,14 +257,42 @@ Circular dependencies and references to nonexistent tasks are rejected at config
 
 When starting a single task with `taskmux start <task>`, dependencies are not auto-started — you get a warning if they aren't running.
 
+### Restart Policies
+
+Each task has a `restart_policy` that controls automatic restart behavior. Restart policies are enforced by `taskmux start --monitor` and `taskmux daemon`.
+
+| Policy | Behavior |
+|--------|----------|
+| `"no"` | Never auto-restart. Task stays stopped after crash or health failure. |
+| `"on-failure"` | **(default)** Restart on crash (process exits) or after `health_retries` consecutive health check failures. |
+| `"always"` | Restart whenever the task stops, including clean exits. |
+
+**Manual stops override all policies.** Running `taskmux stop` or `taskmux kill` marks the task as manually stopped — it will not auto-restart even with `restart_policy = "always"`. Use `taskmux restart` or `taskmux start` to clear this flag.
+
+**`restart_policy` vs `auto_start`** — these are orthogonal. `auto_start` controls whether a task launches on `taskmux start`. `restart_policy` controls what happens after a running task exits or fails. A task with `auto_start = false` and `restart_policy = "always"` won't start automatically, but once started manually, it will auto-restart on exit.
+
+| `restart_policy` | `auto_start` | Behavior |
+|---|---|---|
+| `"no"` | `true` | Starts with session, never auto-restarts |
+| `"no"` | `false` | Manual start only, never auto-restarts |
+| `"on-failure"` | `true` | Starts with session, restarts on crash/health failure |
+| `"on-failure"` | `false` | Manual start, restarts on crash/health failure once running |
+| `"always"` | `true` | Starts with session, restarts on any exit |
+| `"always"` | `false` | Manual start, restarts on any exit once running |
+
+**Backoff & limits:** When a task keeps failing, restart delays increase exponentially: `restart_backoff ^ attempt` seconds (capped at 60s). After `max_restarts` consecutive restarts, the task is left stopped. The restart counter resets after 60 seconds of healthy uptime.
+
 ### Health Checks
 
 If `health_check` is set, taskmux runs it as a shell command. Exit code 0 means healthy. If not set, taskmux falls back to checking if the tmux pane has a running process (not just a shell prompt).
 
+A task must fail `health_retries` consecutive health checks (default 3) before being considered unhealthy and triggering a restart. If the task becomes healthy again, the failure counter resets.
+
 Health checks are used by:
 - `taskmux health` — shows a table of all task health
 - `taskmux start` — waits for dependencies to be healthy before starting dependents
-- `taskmux daemon` — continuously monitors and auto-restarts unhealthy tasks
+- `taskmux start --monitor` — continuously monitors and auto-restarts per restart_policy
+- `taskmux daemon` — same as --monitor, plus WebSocket API and config watching
 
 ### Hook Cascade
 
@@ -279,7 +314,7 @@ Taskmux ensures processes are fully stopped before restarting and that orphaned 
 
 **Port cleanup** (`start`, `restart`): If `port` is configured, taskmux kills any process listening on that port before starting. This handles orphaned processes from crashed sessions.
 
-**Auto-restart backoff** (daemon mode): When a task keeps crashing, restart delays increase exponentially (`restart_backoff` multiplier, capped at 60s). After `max_restarts` failures, the task is left stopped. The counter resets after 60 seconds of healthy uptime.
+**Auto-restart** (`start --monitor`, `daemon`): Tasks with `restart_policy = "on-failure"` or `"always"` are automatically restarted. Health checks must fail `health_retries` times before triggering a restart. Restart delays increase exponentially (`restart_backoff` base, capped at 60s). After `max_restarts` failures, the task is left stopped. The counter resets after 60 seconds of healthy uptime.
 
 ### Init & Agent Context
 
@@ -301,6 +336,7 @@ Use `--defaults` to skip prompts (CI/automation).
   "name": "api",
   "command": "python manage.py runserver 0.0.0.0:8000",
   "auto_start": true,
+  "restart_policy": "on-failure",
   "cwd": "apps/api",
   "health_check": "curl -sf http://localhost:8000/health",
   "depends_on": ["db"],
@@ -314,16 +350,28 @@ Use `--defaults` to skip prompts (CI/automation).
 }
 ```
 
-## Daemon Mode
+## Monitoring & Auto-restart
 
-Run as a background daemon with WebSocket API and auto-restart with exponential backoff:
+### start --monitor (lightweight)
+
+Start tasks and stay in the foreground monitoring health:
+
+```bash
+taskmux start --monitor     # or: taskmux start -m
+```
+
+Checks health every 30 seconds and auto-restarts tasks according to their `restart_policy`. No WebSocket API — just monitoring and restart. Press Ctrl+C to stop monitoring (tasks keep running).
+
+### Daemon Mode (full)
+
+Run as a background daemon with WebSocket API, config watching, and auto-restart:
 
 ```bash
 taskmux daemon              # Default port 8765
 taskmux daemon --port 9000  # Custom port
 ```
 
-The daemon monitors task health every 30 seconds. Unhealthy tasks are restarted with exponential backoff (controlled by `restart_backoff` and `max_restarts`). Tasks that stay healthy for 60+ seconds have their restart counter reset.
+The daemon monitors task health every 30 seconds. Tasks are restarted per their `restart_policy` with exponential backoff (controlled by `restart_backoff` and `max_restarts`). Tasks that stay healthy for 60+ seconds have their restart counter reset. Config file changes are detected and applied automatically.
 
 WebSocket API:
 
