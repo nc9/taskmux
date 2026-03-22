@@ -3,7 +3,7 @@
 from unittest.mock import MagicMock, patch
 
 from taskmux.models import TaskConfig, TaskmuxConfig
-from taskmux.tmux_manager import TmuxManager, _find_new_lines, _print_grep_results
+from taskmux.tmux_manager import RestartTracker, TmuxManager, _find_new_lines, _print_grep_results
 
 
 def _make_config(**kwargs) -> TaskmuxConfig:
@@ -549,3 +549,151 @@ class TestTailPanes:
         captured = capsys.readouterr().out
         assert "ERROR bad" in captured
         assert "info ok" not in captured
+
+
+class TestRestartTracker:
+    def test_initial_state(self):
+        tracker = RestartTracker()
+        info = tracker.get("t")
+        assert info["count"] == 0
+        assert info["last"] == 0.0
+
+    def test_record_increments(self):
+        tracker = RestartTracker()
+        tracker.record("t")
+        assert tracker.get("t")["count"] == 1
+        tracker.record("t")
+        assert tracker.get("t")["count"] == 2
+
+    def test_reset_clears(self):
+        tracker = RestartTracker()
+        tracker.record("t")
+        tracker.reset("t")
+        assert tracker.get("t")["count"] == 0
+
+    def test_health_failures(self):
+        tracker = RestartTracker()
+        assert tracker.record_health_failure("t") == 1
+        assert tracker.record_health_failure("t") == 2
+        tracker.reset_health_failures("t")
+        assert tracker.record_health_failure("t") == 1
+
+    def test_manual_stop(self):
+        tracker = RestartTracker()
+        assert not tracker.is_manually_stopped("t")
+        tracker.mark_manually_stopped("t")
+        assert tracker.is_manually_stopped("t")
+        tracker.clear_manually_stopped("t")
+        assert not tracker.is_manually_stopped("t")
+
+
+class TestAutoRestartTasks:
+    def _make_manager_with_session(self, tasks: dict) -> TmuxManager:
+        cfg = _make_config(tasks=tasks)
+        mgr = _make_manager(cfg)
+        mock_session = MagicMock()
+        mgr.session = mock_session
+        # Clear the side_effect from _make_manager and set return_value
+        mgr.server.sessions.get.side_effect = None
+        mgr.server.sessions.get.return_value = mock_session
+        return mgr
+
+    def test_policy_no_skips_restart(self):
+        mgr = self._make_manager_with_session({"t": {"command": "echo t", "restart_policy": "no"}})
+        mgr.is_task_healthy = MagicMock(return_value=False)
+        mgr._is_pane_alive = MagicMock(return_value=False)
+        mgr.restart_task = MagicMock()
+
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_not_called()
+
+    def test_manually_stopped_skips_restart(self):
+        mgr = self._make_manager_with_session(
+            {"t": {"command": "echo t", "restart_policy": "always"}}
+        )
+        mgr.restart_tracker.mark_manually_stopped("t")
+        mgr.is_task_healthy = MagicMock(return_value=False)
+        mgr._is_pane_alive = MagicMock(return_value=False)
+        mgr.restart_task = MagicMock()
+
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_not_called()
+
+    def test_on_failure_restarts_on_crash(self):
+        mgr = self._make_manager_with_session(
+            {"t": {"command": "echo t", "restart_policy": "on-failure"}}
+        )
+        mgr.check_task_health = MagicMock(return_value=False)
+        mgr._is_pane_alive = MagicMock(return_value=False)
+        mgr.restart_task = MagicMock()
+
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_called_once_with("t")
+
+    def test_always_restarts_on_clean_exit(self):
+        mgr = self._make_manager_with_session(
+            {"t": {"command": "echo t", "restart_policy": "always"}}
+        )
+        mgr.check_task_health = MagicMock(return_value=False)
+        mgr._is_pane_alive = MagicMock(return_value=False)
+        mgr.restart_task = MagicMock()
+
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_called_once_with("t")
+
+    def test_health_retries_respected(self):
+        mgr = self._make_manager_with_session(
+            {"t": {"command": "echo t", "restart_policy": "on-failure", "health_retries": 3}}
+        )
+        mgr.check_task_health = MagicMock(return_value=False)
+        mgr._is_pane_alive = MagicMock(return_value=True)  # pane alive, health failing
+        mgr.restart_task = MagicMock()
+
+        # First two calls: health failing but retries not exceeded
+        mgr.auto_restart_tasks()
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_not_called()
+
+        # Third call: retries exceeded, should restart
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_called_once_with("t")
+
+    def test_max_restarts_enforced(self):
+        mgr = self._make_manager_with_session(
+            {"t": {"command": "echo t", "restart_policy": "on-failure", "max_restarts": 2}}
+        )
+        mgr.check_task_health = MagicMock(return_value=False)
+        mgr._is_pane_alive = MagicMock(return_value=False)
+        mgr.restart_task = MagicMock()
+
+        # Simulate having already hit max_restarts
+        mgr.restart_tracker.record("t")
+        mgr.restart_tracker.record("t")
+
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_not_called()
+
+    def test_healthy_resets_failures(self):
+        mgr = self._make_manager_with_session(
+            {"t": {"command": "echo t", "restart_policy": "on-failure", "health_retries": 3}}
+        )
+        mgr._is_pane_alive = MagicMock(return_value=True)
+        mgr.restart_task = MagicMock()
+
+        # Fail twice
+        mgr.check_task_health = MagicMock(return_value=False)
+        mgr.auto_restart_tasks()
+        mgr.auto_restart_tasks()
+
+        # Become healthy — should reset failure count
+        mgr.check_task_health = MagicMock(return_value=True)
+        mgr.auto_restart_tasks()
+
+        # Fail again — should need 3 more failures
+        mgr.check_task_health = MagicMock(return_value=False)
+        mgr.auto_restart_tasks()
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_not_called()
+
+        mgr.auto_restart_tasks()
+        mgr.restart_task.assert_called_once_with("t")

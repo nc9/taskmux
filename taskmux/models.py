@@ -1,8 +1,17 @@
 """Pydantic models for Taskmux configuration."""
 
 import warnings
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, model_validator
+
+
+class RestartPolicy(StrEnum):
+    """Docker-style restart policy for tasks."""
+
+    NO = "no"
+    ON_FAILURE = "on-failure"
+    ALWAYS = "always"
 
 
 class _StrictConfig(BaseModel):
@@ -45,6 +54,7 @@ class TaskConfig(_StrictConfig):
     stop_grace_period: int = 5
     max_restarts: int = 5
     restart_backoff: float = 2.0
+    restart_policy: RestartPolicy = RestartPolicy.ON_FAILURE
     depends_on: list[str] = []
     hooks: HookConfig = HookConfig()
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import tomlkit
 
-from .models import HookConfig, TaskConfig, TaskmuxConfig
+from .models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
 
 CONFIG_FILENAME = "taskmux.toml"
 
@@ -122,6 +122,8 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("max_restarts", task_cfg.max_restarts)
         if task_cfg.restart_backoff != 2.0:
             inner.add("restart_backoff", task_cfg.restart_backoff)
+        if task_cfg.restart_policy != RestartPolicy.ON_FAILURE:
+            inner.add("restart_policy", str(task_cfg.restart_policy))
         if task_cfg.depends_on:
             inner.add("depends_on", task_cfg.depends_on)
         # Task-level hooks

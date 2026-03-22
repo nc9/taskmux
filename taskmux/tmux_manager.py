@@ -15,11 +15,50 @@ from rich.console import Console
 from rich.markup import escape
 
 from .hooks import runHook
-from .models import TaskmuxConfig
+from .models import RestartPolicy, TaskmuxConfig
 
 SHELL_NAMES = frozenset(("bash", "zsh", "sh", "fish"))
 
 TASK_COLORS = ["cyan", "green", "yellow", "magenta", "blue", "red"]
+
+
+class RestartTracker:
+    """Tracks per-task restart counts, health failures, and manual-stop state."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, dict[str, float]] = {}
+        self._consecutive_failures: dict[str, int] = {}
+        self._manually_stopped: set[str] = set()
+
+    def get(self, task_name: str) -> dict[str, float]:
+        return self._data.get(task_name, {"count": 0, "last": 0.0})
+
+    def record(self, task_name: str) -> None:
+        info = self.get(task_name)
+        self._data[task_name] = {
+            "count": info["count"] + 1,
+            "last": time.time(),
+        }
+
+    def reset(self, task_name: str) -> None:
+        self._data.pop(task_name, None)
+
+    def record_health_failure(self, task_name: str) -> int:
+        count = self._consecutive_failures.get(task_name, 0) + 1
+        self._consecutive_failures[task_name] = count
+        return count
+
+    def reset_health_failures(self, task_name: str) -> None:
+        self._consecutive_failures.pop(task_name, None)
+
+    def mark_manually_stopped(self, task_name: str) -> None:
+        self._manually_stopped.add(task_name)
+
+    def clear_manually_stopped(self, task_name: str) -> None:
+        self._manually_stopped.discard(task_name)
+
+    def is_manually_stopped(self, task_name: str) -> bool:
+        return task_name in self._manually_stopped
 
 
 def _find_new_lines(current: list[str], prev_tail: list[str]) -> list[str]:
@@ -43,6 +82,7 @@ class TmuxManager:
         self.server = libtmux.Server()
         self.session: libtmux.Session | None = None
         self.task_health: dict = {}
+        self.restart_tracker = RestartTracker()
         self._refresh_session()
 
     def _refresh_session(self) -> None:
@@ -232,6 +272,7 @@ class TmuxManager:
 
     def start_task(self, task_name: str) -> None:
         """Start a single task (create window + send command)."""
+        self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             print(f"Task '{task_name}' not found in config")
             return
@@ -286,6 +327,7 @@ class TmuxManager:
 
     def stop_task(self, task_name: str) -> None:
         """Graceful stop with signal escalation: C-c → SIGTERM → SIGKILL."""
+        self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
             print(f"Session '{self.config.name}' doesn't exist")
             return
@@ -396,6 +438,9 @@ class TmuxManager:
 
     def stop_all(self) -> None:
         """Stop all tasks with signal escalation then kill session."""
+        for task_name in self.config.tasks:
+            self.restart_tracker.mark_manually_stopped(task_name)
+
         if not self.session_exists():
             print("No session running")
             return
@@ -456,6 +501,7 @@ class TmuxManager:
 
     def restart_task(self, task_name: str) -> None:
         """Restart a specific task with full stop escalation."""
+        self.restart_tracker.clear_manually_stopped(task_name)
         if not self.session_exists():
             print(f"Session '{self.config.name}' doesn't exist. Run 'taskmux start' first.")
             return
@@ -508,6 +554,7 @@ class TmuxManager:
 
     def kill_task(self, task_name: str) -> None:
         """Kill a specific task (process group + window)."""
+        self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
             print(f"Session '{self.config.name}' doesn't exist")
             return
@@ -534,6 +581,7 @@ class TmuxManager:
             "name": task_name,
             "command": task_cfg.command,
             "auto_start": task_cfg.auto_start,
+            "restart_policy": str(task_cfg.restart_policy),
             "cwd": task_cfg.cwd,
             "health_check": task_cfg.health_check,
             "depends_on": task_cfg.depends_on,
@@ -717,6 +765,8 @@ class TmuxManager:
             extras = ""
             if task_cfg.cwd:
                 extras += f" cwd={task_cfg.cwd}"
+            if task_cfg.restart_policy != RestartPolicy.ON_FAILURE:
+                extras += f" restart={task_cfg.restart_policy}"
             if task_cfg.depends_on:
                 extras += f" deps=[{','.join(task_cfg.depends_on)}]"
             line = f"{health_icon} {status_text:8} {task_name:15}{port:7} {task_cfg.command}"
@@ -735,17 +785,68 @@ class TmuxManager:
 
         return is_healthy
 
-    def auto_restart_unhealthy_tasks(self) -> None:
-        """Auto-restart tasks that have become unhealthy"""
+    def auto_restart_tasks(self) -> None:
+        """Auto-restart tasks based on restart_policy, health_retries, max_restarts, and backoff."""
         if not self.session_exists():
             return
 
-        for task_name in self.config.tasks:
-            if not self.check_task_health(task_name):
-                prev_health = self.task_health.get(task_name, {}).get("healthy", True)
-                if prev_health:
-                    print(f"Auto-restarting unhealthy task: {task_name}")
-                    self.restart_task(task_name)
+        now = time.time()
+
+        for task_name, task_cfg in self.config.tasks.items():
+            if task_cfg.restart_policy == RestartPolicy.NO:
+                continue
+            if self.restart_tracker.is_manually_stopped(task_name):
+                continue
+
+            healthy = self.check_task_health(task_name)
+            pane_alive = self._is_pane_alive(task_name)
+
+            if healthy:
+                self.restart_tracker.reset_health_failures(task_name)
+                # Reset restart tracker after 60s stable
+                info = self.restart_tracker.get(task_name)
+                if info["count"] > 0 and now - info["last"] > 60:
+                    self.restart_tracker.reset(task_name)
+                continue
+
+            # "on-failure": restart on crash or health_retries exceeded
+            # "always": restart whenever pane is dead (even clean exit)
+            should_restart = False
+
+            if not pane_alive:
+                # Process exited — restart for both on-failure and always
+                should_restart = True
+            elif task_cfg.restart_policy == RestartPolicy.ON_FAILURE:
+                # Pane alive but health check failing — count consecutive failures
+                failures = self.restart_tracker.record_health_failure(task_name)
+                if failures >= task_cfg.health_retries:
+                    should_restart = True
+            elif task_cfg.restart_policy == RestartPolicy.ALWAYS:
+                failures = self.restart_tracker.record_health_failure(task_name)
+                if failures >= task_cfg.health_retries:
+                    should_restart = True
+
+            if not should_restart:
+                continue
+
+            # Check max_restarts limit
+            info = self.restart_tracker.get(task_name)
+            if task_cfg.max_restarts and info["count"] >= task_cfg.max_restarts:
+                continue
+
+            # Check backoff delay
+            delay = min(task_cfg.restart_backoff ** info["count"], 60)
+            if info["last"] and now - info["last"] < delay:
+                continue
+
+            print(f"Auto-restarting task: {task_name}")
+            self.restart_task(task_name)
+            self.restart_tracker.record(task_name)
+            self.restart_tracker.reset_health_failures(task_name)
+
+    def auto_restart_unhealthy_tasks(self) -> None:
+        """Deprecated: use auto_restart_tasks() instead."""
+        self.auto_restart_tasks()
 
     def stop_session(self) -> None:
         """Stop the entire tmux session (legacy, wraps stop_all)."""

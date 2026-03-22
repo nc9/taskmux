@@ -5,7 +5,7 @@ import warnings
 import pytest
 from pydantic import ValidationError
 
-from taskmux.models import HookConfig, TaskConfig, TaskmuxConfig
+from taskmux.models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
 
 
 class TestHookConfig:
@@ -34,6 +34,27 @@ class TestHookConfig:
             assert any("bogus" in str(warning.message) for warning in w)
 
 
+class TestRestartPolicy:
+    def test_enum_values(self):
+        assert RestartPolicy.NO == "no"
+        assert RestartPolicy.ON_FAILURE == "on-failure"
+        assert RestartPolicy.ALWAYS == "always"
+
+    def test_str_conversion(self):
+        assert str(RestartPolicy.NO) == "no"
+        assert str(RestartPolicy.ON_FAILURE) == "on-failure"
+        assert str(RestartPolicy.ALWAYS) == "always"
+
+    def test_from_string(self):
+        assert RestartPolicy("no") == RestartPolicy.NO
+        assert RestartPolicy("on-failure") == RestartPolicy.ON_FAILURE
+        assert RestartPolicy("always") == RestartPolicy.ALWAYS
+
+    def test_invalid_raises(self):
+        with pytest.raises(ValueError):
+            RestartPolicy("invalid")
+
+
 class TestTaskConfig:
     def test_defaults(self):
         t = TaskConfig(command="echo hi")
@@ -48,8 +69,21 @@ class TestTaskConfig:
         assert t.stop_grace_period == 5
         assert t.max_restarts == 5
         assert t.restart_backoff == 2.0
+        assert t.restart_policy == RestartPolicy.ON_FAILURE
         assert t.depends_on == []
         assert t.hooks == HookConfig()
+
+    def test_restart_policy_no(self):
+        t = TaskConfig(command="echo hi", restart_policy="no")
+        assert t.restart_policy == RestartPolicy.NO
+
+    def test_restart_policy_always(self):
+        t = TaskConfig(command="echo hi", restart_policy="always")
+        assert t.restart_policy == RestartPolicy.ALWAYS
+
+    def test_restart_policy_invalid(self):
+        with pytest.raises(ValidationError):
+            TaskConfig(command="echo hi", restart_policy="invalid")
 
     def test_new_fields(self):
         t = TaskConfig(

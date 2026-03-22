@@ -16,8 +16,14 @@ from .tmux_manager import TmuxManager
 
 app = typer.Typer(
     name="taskmux",
-    help="Modern tmux development environment manager with health monitoring and auto-restart",
-    epilog="Uses libtmux API with health monitoring and daemon capabilities.",
+    help=(
+        "Tmux session manager for development environments.\n\n"
+        "Reads task definitions from taskmux.toml, manages tmux sessions/windows, "
+        "provides health monitoring, restart policies (no/on-failure/always), "
+        "dependency ordering, lifecycle hooks, and a WebSocket API.\n\n"
+        "Quick start: taskmux init → edit taskmux.toml → taskmux start"
+    ),
+    epilog="Docs: https://github.com/nc9/taskmux",
     rich_markup_mode="rich",
 )
 
@@ -49,15 +55,32 @@ class TaskmuxCLI:
 def init(
     defaults: bool = typer.Option(False, "--defaults", help="Accept all defaults"),
 ):
-    """Initialize taskmux config in current directory."""
+    """Initialize taskmux config in current directory.
+
+    Creates taskmux.toml with session name (defaults to directory name).
+    Detects installed AI coding agents (Claude, Codex, OpenCode) and injects
+    taskmux usage instructions into their context files.
+    Use --defaults to skip interactive prompts.
+    """
     initProject(defaults=defaults)
 
 
 @app.command()
 def start(
     tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
+    monitor: bool = typer.Option(  # noqa: B008
+        False, "-m", "--monitor", help="Stay running, auto-restart per restart_policy"
+    ),
 ):
-    """Start tasks (all if none specified)."""
+    """Start tasks (all auto_start tasks if none specified).
+
+    Starts tasks in dependency order, waiting for each dependency's health check
+    to pass before starting dependents. With --monitor, stays in the foreground
+    and auto-restarts tasks according to their restart_policy (no/on-failure/always),
+    respecting health_retries, max_restarts, and exponential backoff.
+    """
+    import time
+
     cli = TaskmuxCLI()
     if tasks:
         for task in tasks:
@@ -65,12 +88,26 @@ def start(
     else:
         cli.tmux.start_all()
 
+    if monitor:
+        console.print("Monitoring tasks (Ctrl+C to stop)...")
+        try:
+            while True:
+                time.sleep(30)
+                cli.tmux.auto_restart_tasks()
+        except KeyboardInterrupt:
+            console.print("\nStopped monitoring")
+
 
 @app.command()
 def stop(
     tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
 ):
-    """Stop tasks (all if none specified)."""
+    """Stop tasks (all if none specified).
+
+    Uses signal escalation: C-c → SIGTERM → SIGKILL. Waits stop_grace_period
+    seconds (default 5) after C-c before escalating. Stopped tasks are marked
+    as manually stopped and will not be auto-restarted even with restart_policy="always".
+    """
     cli = TaskmuxCLI()
     if tasks:
         for task in tasks:
@@ -83,7 +120,11 @@ def stop(
 def restart(
     tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
 ):
-    """Restart tasks (all if none specified)."""
+    """Restart tasks (all if none specified).
+
+    Full stop with signal escalation, port cleanup, then restart.
+    Clears the manually-stopped flag so auto-restart policies resume.
+    """
     cli = TaskmuxCLI()
     if tasks:
         for task in tasks:
@@ -96,7 +137,11 @@ def restart(
 def kill(
     task: str = typer.Argument(..., help="Task name to kill"),
 ):
-    """Kill a specific task."""
+    """Kill a specific task (SIGKILL + destroy window).
+
+    Unlike stop, kill is immediate with no grace period. The tmux window is
+    destroyed. The task is marked as manually stopped (no auto-restart).
+    """
     cli = TaskmuxCLI()
     cli.tmux.kill_task(task)
 
@@ -109,7 +154,11 @@ def logs(
     grep: str | None = typer.Option(None, "-g", "--grep", help="Filter logs by pattern"),
     context: int = typer.Option(3, "-C", "--context", help="Context lines around grep matches"),
 ):
-    """Show logs for a task, or all tasks if none specified."""
+    """Show logs for a task, or interleaved logs from all tasks.
+
+    Without -f, prints recent output. With -f, follows logs live with colored
+    task prefixes. Use -g to grep across tasks and -C for context lines.
+    """
     cli = TaskmuxCLI()
     cli.tmux.show_logs(task, follow, lines, grep=grep, context=context)
 
@@ -118,7 +167,11 @@ def logs(
 def inspect(
     task: str = typer.Argument(..., help="Task name to inspect"),
 ):
-    """Inspect task state as JSON."""
+    """Inspect task state as JSON.
+
+    Returns detailed info: name, command, restart_policy, running/healthy status,
+    pid, pane command, cwd, window/pane IDs, health_check, and depends_on.
+    """
     cli = TaskmuxCLI()
     data = cli.tmux.inspect_task(task)
     console.print_json(json.dumps(data))
@@ -134,7 +187,7 @@ def add(
         None, "--depends-on", help="Dependency task names"
     ),
 ):
-    """Add a new task."""
+    """Add a new task to taskmux.toml."""
     addTask(None, task, command, cwd=cwd, health_check=health_check, depends_on=depends_on)
     console.print(f"Added task '{task}': {command}")
 
@@ -143,7 +196,7 @@ def add(
 def remove(
     task: str = typer.Argument(..., help="Task name to remove"),
 ):
-    """Remove a task."""
+    """Remove a task from taskmux.toml (kills it first if running)."""
     cli = TaskmuxCLI()
 
     if cli.tmux.session_exists():
@@ -157,7 +210,11 @@ def remove(
 
 
 def _status():
-    """Show session and task status."""
+    """Show session and task status.
+
+    Lists all tasks with health indicators, running state, ports, restart policy
+    (if non-default), working directory, and dependencies. Aliases: list, ls.
+    """
     cli = TaskmuxCLI()
     cli.tmux.list_tasks()
 
@@ -169,7 +226,11 @@ app.command(name="ls", hidden=True)(_status)
 
 @app.command()
 def health():
-    """Check health of all tasks."""
+    """Check health of all tasks.
+
+    Runs each task's health_check command (or falls back to pane-alive check).
+    Displays a table with health status for every configured task.
+    """
     cli = TaskmuxCLI()
 
     if not cli.tmux.session_exists():
@@ -200,7 +261,11 @@ def health():
 
 @app.command()
 def watch():
-    """Watch config file for changes."""
+    """Watch taskmux.toml for changes and reload on edit.
+
+    Stays in the foreground. When the config file changes, reloads it and
+    restarts affected tasks.
+    """
     cli = TaskmuxCLI()
     watcher = SimpleConfigWatcher(cli)
     watcher.watch_config()
@@ -210,7 +275,12 @@ def watch():
 def daemon(
     port: int = typer.Option(8765, "--port", help="WebSocket API port"),
 ):
-    """Run in daemon mode with API."""
+    """Run in daemon mode with WebSocket API and health monitoring.
+
+    Monitors task health every 30s and auto-restarts per restart_policy with
+    exponential backoff. Watches config for changes. Exposes a WebSocket API
+    for status, restart, kill, and logs commands.
+    """
     d = TaskmuxDaemon(api_port=port)
     asyncio.run(d.start())
 

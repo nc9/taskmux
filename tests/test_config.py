@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from taskmux.config import addTask, configExists, loadConfig, removeTask, writeConfig
-from taskmux.models import HookConfig, TaskConfig, TaskmuxConfig
+from taskmux.models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
 
 
 class TestConfigExists:
@@ -171,6 +171,47 @@ class TestWriteConfigNewFields:
         assert "health_check" not in text
         assert "health_interval" not in text
         assert "depends_on" not in text
+        assert "restart_policy" not in text
+
+    def test_omits_default_restart_policy(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            tasks={"t": TaskConfig(command="echo t", restart_policy="on-failure")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert "restart_policy" not in text
+
+    def test_writes_non_default_restart_policy(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            tasks={
+                "a": TaskConfig(command="echo a", restart_policy="no"),
+                "b": TaskConfig(command="echo b", restart_policy="always"),
+            },
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert 'restart_policy = "no"' in text
+        assert 'restart_policy = "always"' in text
+
+    def test_roundtrip_restart_policy(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            tasks={
+                "a": TaskConfig(command="echo a", restart_policy="no"),
+                "b": TaskConfig(command="echo b", restart_policy="always"),
+                "c": TaskConfig(command="echo c"),  # default on-failure
+            },
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.tasks["a"].restart_policy == RestartPolicy.NO
+        assert loaded.tasks["b"].restart_policy == RestartPolicy.ALWAYS
+        assert loaded.tasks["c"].restart_policy == RestartPolicy.ON_FAILURE
 
 
 class TestAddTask:
