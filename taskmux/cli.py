@@ -12,6 +12,7 @@ from .config import addTask, loadConfig, removeTask
 from .daemon import SimpleConfigWatcher, TaskmuxDaemon
 from .init import initProject
 from .models import TaskmuxConfig
+from .output import is_json_mode, print_result, set_json_mode
 from .tmux_manager import TmuxManager
 
 app = typer.Typer(
@@ -30,6 +31,41 @@ app = typer.Typer(
 console = Console()
 
 
+def _print_result_human(result: dict) -> None:
+    """Print a TmuxManager result dict in human-readable format."""
+    if not result.get("ok"):
+        console.print(result.get("error", "Unknown error"), style="red")
+        return
+    action = result.get("action", "")
+    if "task" in result:
+        console.print(f"{action.title()} task '{result['task']}'")
+    elif "session" in result:
+        tasks = result.get("tasks", [])
+        msg = f"{action.title()} session '{result['session']}'"
+        if tasks:
+            msg += f" with {len(tasks)} tasks"
+        console.print(msg)
+    for w in result.get("warnings", []):
+        console.print(f"  Warning: {w}", style="yellow")
+
+
+def _handle_result(result: dict) -> None:
+    """Output result as JSON or human-readable."""
+    if is_json_mode():
+        print_result(result)
+    else:
+        _print_result_human(result)
+
+
+def _handle_results(results: list[dict]) -> None:
+    """Output multiple results."""
+    if is_json_mode():
+        print_result({"ok": all(r.get("ok") for r in results), "results": results})
+    else:
+        for r in results:
+            _print_result_human(r)
+
+
 class TaskmuxCLI:
     """Main CLI application class."""
 
@@ -43,12 +79,20 @@ class TaskmuxCLI:
 
         for task_name, _task_cfg in self.config.tasks.items():
             if task_name in current_windows:
-                console.print(f"Reloading task '{task_name}' due to config change")
                 self.tmux.restart_task(task_name)
             else:
                 if self.tmux.session_exists():
-                    console.print(f"Adding new task '{task_name}'")
                     self.tmux.restart_task(task_name)
+
+
+@app.callback()
+def main_callback(
+    json_output: bool = typer.Option(  # noqa: B008
+        False, "--json", help="Output as JSON for programmatic use"
+    ),
+):
+    """Taskmux CLI."""
+    set_json_mode(json_output)
 
 
 @app.command()
@@ -62,7 +106,15 @@ def init(
     taskmux usage instructions into their context files.
     Use --defaults to skip interactive prompts.
     """
-    initProject(defaults=defaults)
+    result = initProject(defaults=defaults)
+    if is_json_mode():
+        print_result(
+            {
+                "ok": True,
+                "session": result.name,
+                "config_path": "taskmux.toml",
+            }
+        )
 
 
 @app.command()
@@ -83,19 +135,22 @@ def start(
 
     cli = TaskmuxCLI()
     if tasks:
-        for task in tasks:
-            cli.tmux.start_task(task)
+        results = [cli.tmux.start_task(t) for t in tasks]
+        _handle_results(results)
     else:
-        cli.tmux.start_all()
+        result = cli.tmux.start_all()
+        _handle_result(result)
 
     if monitor:
-        console.print("Monitoring tasks (Ctrl+C to stop)...")
+        if not is_json_mode():
+            console.print("Monitoring tasks (Ctrl+C to stop)...")
         try:
             while True:
                 time.sleep(30)
                 cli.tmux.auto_restart_tasks()
         except KeyboardInterrupt:
-            console.print("\nStopped monitoring")
+            if not is_json_mode():
+                console.print("\nStopped monitoring")
 
 
 @app.command()
@@ -110,10 +165,10 @@ def stop(
     """
     cli = TaskmuxCLI()
     if tasks:
-        for task in tasks:
-            cli.tmux.stop_task(task)
+        results = [cli.tmux.stop_task(t) for t in tasks]
+        _handle_results(results)
     else:
-        cli.tmux.stop_all()
+        _handle_result(cli.tmux.stop_all())
 
 
 @app.command()
@@ -127,10 +182,10 @@ def restart(
     """
     cli = TaskmuxCLI()
     if tasks:
-        for task in tasks:
-            cli.tmux.restart_task(task)
+        results = [cli.tmux.restart_task(t) for t in tasks]
+        _handle_results(results)
     else:
-        cli.tmux.restart_all()
+        _handle_result(cli.tmux.restart_all())
 
 
 @app.command()
@@ -143,7 +198,7 @@ def kill(
     destroyed. The task is marked as manually stopped (no auto-restart).
     """
     cli = TaskmuxCLI()
-    cli.tmux.kill_task(task)
+    _handle_result(cli.tmux.kill_task(task))
 
 
 @app.command()
@@ -153,14 +208,78 @@ def logs(
     lines: int = typer.Option(100, "-n", "--lines", help="Number of lines"),
     grep: str | None = typer.Option(None, "-g", "--grep", help="Filter logs by pattern"),
     context: int = typer.Option(3, "-C", "--context", help="Context lines around grep matches"),
+    since: str | None = typer.Option(  # noqa: B008
+        None, "--since", help="Show logs since time (e.g. '5m', '1h', '2d', or ISO timestamp)"
+    ),
 ):
     """Show logs for a task, or interleaved logs from all tasks.
 
-    Without -f, prints recent output. With -f, follows logs live with colored
-    task prefixes. Use -g to grep across tasks and -C for context lines.
+    Reads from persistent log files when available (with timestamps, survives
+    session kill). Falls back to tmux scrollback. Use --since to filter by time,
+    -g to grep, -f to follow live. Logs are stored at ~/.taskmux/logs/.
     """
     cli = TaskmuxCLI()
-    cli.tmux.show_logs(task, follow, lines, grep=grep, context=context)
+    if is_json_mode() and not follow:
+        # Return logs as JSON
+
+        if task:
+            log_path = cli.tmux.getLogPath(task)
+            if log_path:
+                output = cli.tmux._read_log_file(log_path, lines, grep, since)
+                print_result({"task": task, "lines": output})
+            else:
+                print_result({"task": task, "lines": []})
+        else:
+            tasks_logs: dict[str, list[str]] = {}
+            for name in cli.config.tasks:
+                log_path = cli.tmux.getLogPath(name)
+                if log_path:
+                    tasks_logs[name] = cli.tmux._read_log_file(log_path, lines, grep, since)
+                else:
+                    tasks_logs[name] = []
+            print_result({"tasks": tasks_logs})
+        return
+    cli.tmux.show_logs(task, follow, lines, grep=grep, context=context, since=since)
+
+
+@app.command(name="logs-clean")
+def logs_clean(
+    task: str | None = typer.Argument(None, help="Task name (omit for all)"),
+):
+    """Delete persistent log files.
+
+    Removes log files from ~/.taskmux/logs/. Specify a task name to clean only
+    that task's logs, or omit to clean all logs for the current session.
+    """
+    from pathlib import Path
+
+    cli = TaskmuxCLI()
+    log_dir = Path.home() / ".taskmux" / "logs" / cli.config.name
+
+    if not log_dir.exists():
+        if is_json_mode():
+            print_result({"ok": True, "deleted": 0})
+        else:
+            console.print("No log files found")
+        return
+
+    if task:
+        count = 0
+        for f in log_dir.glob(f"{task}.log*"):
+            f.unlink()
+            count += 1
+        if is_json_mode():
+            print_result({"ok": True, "task": task, "deleted": count})
+        else:
+            console.print(f"Deleted {count} log file(s) for '{task}'")
+    else:
+        import shutil
+
+        shutil.rmtree(log_dir)
+        if is_json_mode():
+            print_result({"ok": True, "session": cli.config.name, "action": "logs_cleaned"})
+        else:
+            console.print(f"Deleted all logs for session '{cli.config.name}'")
 
 
 @app.command()
@@ -174,7 +293,11 @@ def inspect(
     """
     cli = TaskmuxCLI()
     data = cli.tmux.inspect_task(task)
-    console.print_json(json.dumps(data))
+    # inspect always outputs JSON regardless of --json flag
+    if is_json_mode():
+        print_result(data)
+    else:
+        console.print_json(json.dumps(data))
 
 
 @app.command()
@@ -189,7 +312,10 @@ def add(
 ):
     """Add a new task to taskmux.toml."""
     addTask(None, task, command, cwd=cwd, health_check=health_check, depends_on=depends_on)
-    console.print(f"Added task '{task}': {command}")
+    if is_json_mode():
+        print_result({"ok": True, "task": task, "command": command, "action": "added"})
+    else:
+        console.print(f"Added task '{task}': {command}")
 
 
 @app.command()
@@ -203,7 +329,9 @@ def remove(
         cli.tmux.kill_task(task)
 
     _, removed = removeTask(None, task)
-    if removed:
+    if is_json_mode():
+        print_result({"ok": removed, "task": task, "action": "removed"})
+    elif removed:
         console.print(f"Removed task '{task}'")
     else:
         console.print(f"Task '{task}' not found in config", style="red")
@@ -216,7 +344,39 @@ def _status():
     (if non-default), working directory, and dependencies. Aliases: list, ls.
     """
     cli = TaskmuxCLI()
-    cli.tmux.list_tasks()
+    data = cli.tmux.list_tasks()
+    if is_json_mode():
+        print_result(data)
+        return
+
+    # Human-readable output
+    session = data["session"]
+    running = data["running"]
+    console.print(f"Session '{session}': {'Running' if running else 'Stopped'}")
+    if running:
+        console.print(f"Active tasks: {data['active_tasks']}")
+    console.print("-" * 70)
+
+    if not data["tasks"]:
+        console.print("No tasks configured")
+        return
+
+    from .models import RestartPolicy
+
+    for t in data["tasks"]:
+        health_icon = "G" if t["healthy"] else "R" if t["running"] else "o"
+        status_text = "Healthy" if t["healthy"] else "Running" if t["running"] else "Stopped"
+        auto = "" if t["auto_start"] else " [manual]"
+        port = f" :{t['port']}" if t.get("port") else ""
+        extras = ""
+        if t.get("restart_policy") and t["restart_policy"] != str(RestartPolicy.ON_FAILURE):
+            extras += f" restart={t['restart_policy']}"
+        if t.get("cwd"):
+            extras += f" cwd={t['cwd']}"
+        if t.get("depends_on"):
+            extras += f" deps=[{','.join(t['depends_on'])}]"
+        line = f"{health_icon} {status_text:8} {t['name']:15}{port:7} {t['command']}"
+        console.print(f"{line}{auto}{extras}")
 
 
 app.command(name="status")(_status)
@@ -234,7 +394,30 @@ def health():
     cli = TaskmuxCLI()
 
     if not cli.tmux.session_exists():
-        console.print("No session running", style="yellow")
+        if is_json_mode():
+            print_result({"healthy_count": 0, "total_count": 0, "tasks": []})
+        else:
+            console.print("No session running", style="yellow")
+        return
+
+    healthy_count = 0
+    total_count = len(cli.config.tasks)
+    tasks_health: list[dict] = []
+
+    for task_name in cli.config.tasks:
+        is_healthy = cli.tmux.check_task_health(task_name)
+        tasks_health.append({"name": task_name, "healthy": is_healthy})
+        if is_healthy:
+            healthy_count += 1
+
+    if is_json_mode():
+        print_result(
+            {
+                "healthy_count": healthy_count,
+                "total_count": total_count,
+                "tasks": tasks_health,
+            }
+        )
         return
 
     table = Table(title="Health Check Results")
@@ -242,21 +425,49 @@ def health():
     table.add_column("Task", style="magenta")
     table.add_column("Health", style="green")
 
-    healthy_count = 0
-    total_count = len(cli.config.tasks)
-
-    for task_name in cli.config.tasks:
-        is_healthy = cli.tmux.check_task_health(task_name)
-        status_icon = "G" if is_healthy else "R"
-        status_text = "Healthy" if is_healthy else "Unhealthy"
-
-        table.add_row(status_icon, task_name, status_text)
-
-        if is_healthy:
-            healthy_count += 1
+    for t in tasks_health:
+        icon = "G" if t["healthy"] else "R"
+        text = "Healthy" if t["healthy"] else "Unhealthy"
+        table.add_row(icon, t["name"], text)
 
     console.print(table)
     console.print(f"Health: {healthy_count}/{total_count} tasks healthy")
+
+
+@app.command()
+def events(
+    task: str | None = typer.Option(None, "--task", help="Filter by task name"),
+    since: str | None = typer.Option(None, "--since", help="Time filter (e.g. 10m, 1h, 2d)"),
+    limit: int = typer.Option(50, "-n", "--limit", help="Max events to show"),
+):
+    """Show recent lifecycle events.
+
+    Displays task start/stop/restart/kill events, health check failures,
+    auto-restarts, and config reloads. Stored at ~/.taskmux/events.jsonl.
+    """
+    from .events import queryEvents
+    from .tmux_manager import _parseSince
+
+    since_dt = _parseSince(since) if since else None
+    results = queryEvents(task=task, since=since_dt, limit=limit)
+
+    if is_json_mode():
+        print_result({"events": results, "count": len(results)})
+        return
+
+    if not results:
+        console.print("No events found")
+        return
+
+    for ev in results:
+        ts = ev["ts"][:19]
+        task_str = f" [{ev['task']}]" if "task" in ev else ""
+        extra_parts = []
+        for k, v in ev.items():
+            if k not in ("ts", "event", "task", "session"):
+                extra_parts.append(f"{k}={v}")
+        extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
+        console.print(f"{ts}{task_str} {ev['event']}{extra}")
 
 
 @app.command()
