@@ -1,10 +1,10 @@
 # Taskmux
 
-A modern tmux session manager for LLM development tools with health monitoring, restart policies, and WebSocket API.
+A modern tmux session manager for LLM development tools with persistent logs, JSON output, health monitoring, restart policies, event history, and WebSocket API.
 
 ## Why Taskmux?
 
-LLM coding tools like Claude Code and Cursor struggle with background tasks. Taskmux provides an LLM-friendly CLI for managing multiple background processes — restarting, checking status, reading logs — all from within your AI coding environment.
+LLM coding tools like Claude Code and Cursor struggle with background tasks. Taskmux provides an LLM-friendly CLI for managing multiple background processes — restarting, checking status, reading logs — all from within your AI coding environment. Every command supports `--json` for programmatic consumption, logs persist to disk with timestamps, and all lifecycle events are recorded for debugging.
 
 ## Installation
 
@@ -126,17 +126,21 @@ What happens on `taskmux start`:
 
 ```bash
 taskmux start                    # Starts everything in dependency order
-taskmux logs                     # Interleaved logs from all tasks
+taskmux logs                     # Interleaved logs from all tasks (persistent, timestamped)
 taskmux logs -g "ERROR"          # Grep all tasks for errors
-taskmux logs api                 # Logs from just the API
+taskmux logs api --since 5m      # API logs from last 5 minutes
 taskmux logs -f api              # Follow API logs live
-taskmux health                   # Health check table
+taskmux status --json            # Machine-readable status for agents
+taskmux health --json            # Health check as JSON
+taskmux events --task worker     # Lifecycle events for the worker
 taskmux inspect api              # JSON state for a single task
 taskmux restart worker           # Restart just the worker
 taskmux start storybook          # Start a manual task
 ```
 
 ## Commands
+
+All commands support `--json` for machine-readable output (see [JSON Output](#json-output)).
 
 ```bash
 # Session lifecycle
@@ -158,13 +162,23 @@ taskmux inspect <task>           # JSON state: pid, health, restart_policy, pane
 taskmux status                   # Session + task overview (aliases: list, ls)
 taskmux health                   # Health check table for all tasks
 
-# Logs
+# Logs (persistent, timestamped — stored at ~/.taskmux/logs/)
 taskmux logs                     # Interleaved logs from all tasks
 taskmux logs <task>              # Recent logs for a task
 taskmux logs -f [task]           # Follow logs live (colored prefixes)
 taskmux logs -n 200 <task>       # Last N lines
 taskmux logs -g "error"          # Grep all tasks
 taskmux logs <task> -g "err" -C 5  # Grep one task with context
+taskmux logs --since 5m          # Logs from last 5 minutes
+taskmux logs --since "2024-01-01T14:00"  # Logs since timestamp
+taskmux logs-clean               # Delete all log files for this session
+taskmux logs-clean <task>        # Delete logs for a specific task
+
+# Event history (stored at ~/.taskmux/events.jsonl)
+taskmux events                   # Recent lifecycle events (last 50)
+taskmux events --task server     # Filter by task
+taskmux events --since 1h        # Events from last hour
+taskmux events -n 100            # Show more events
 
 # Setup & monitoring
 taskmux init                     # Interactive project setup + agent context injection
@@ -246,6 +260,9 @@ restart_policy = "no"
 | `tasks.<name>.restart_policy` | `"on-failure"` | When to auto-restart: `"no"`, `"on-failure"`, or `"always"` (see below) |
 | `tasks.<name>.max_restarts` | `5` | Max auto-restarts before giving up (resets after 60s healthy) |
 | `tasks.<name>.restart_backoff` | `2.0` | Exponential backoff base for restart delay (1s, 2s, 4s… capped at 60s) |
+| `tasks.<name>.log_file` | — | Override log file path (default: `~/.taskmux/logs/{session}/{task}.log`) |
+| `tasks.<name>.log_max_size` | `"10MB"` | Max log file size before rotation (e.g. `"500KB"`, `"1GB"`) |
+| `tasks.<name>.log_max_files` | `3` | Number of rotated log files to keep |
 | `tasks.<name>.depends_on` | `[]` | Task names that must be healthy before this task starts |
 | `tasks.<name>.hooks.*` | — | Per-task lifecycle hooks (same fields as global) |
 
@@ -337,6 +354,7 @@ Use `--defaults` to skip prompts (CI/automation).
   "command": "python manage.py runserver 0.0.0.0:8000",
   "auto_start": true,
   "restart_policy": "on-failure",
+  "log_file": "/home/user/.taskmux/logs/myproject/api.log",
   "cwd": "apps/api",
   "health_check": "curl -sf http://localhost:8000/health",
   "depends_on": ["db"],
@@ -349,6 +367,136 @@ Use `--defaults` to skip prompts (CI/automation).
   "pane_id": "%1"
 }
 ```
+
+### Persistent Logs
+
+Task output is automatically piped to timestamped log files at `~/.taskmux/logs/{session}/{task}.log` using tmux's `pipe-pane`. Logs persist after session kill, survive tmux scrollback overflow, and include UTC timestamps on every line:
+
+```
+2024-01-01T14:00:00.123 Server started on port 3000
+2024-01-01T14:00:01.456 GET /health 200 2ms
+2024-01-01T14:00:05.789 Connected to database
+```
+
+**Time-based filtering** with `--since`:
+
+```bash
+taskmux logs server --since 5m       # last 5 minutes
+taskmux logs --since 1h              # all tasks, last hour
+taskmux logs api --since "2024-01-01T14:00"  # since ISO timestamp
+```
+
+**Log rotation:** When a log file exceeds `log_max_size` (default 10MB), it rotates: `task.log` → `task.log.1` → `task.log.2`, keeping up to `log_max_files` (default 3) rotated files.
+
+**Cleanup:**
+
+```bash
+taskmux logs-clean               # delete all logs for this session
+taskmux logs-clean server        # delete only server's logs
+```
+
+When log files exist, `taskmux logs` reads from them (full history with timestamps). Falls back to tmux scrollback for tasks started before log persistence was enabled.
+
+### JSON Output
+
+Every command supports `--json` for machine-readable output. This makes taskmux fully programmable by coding agents and scripts.
+
+```bash
+taskmux status --json
+taskmux health --json
+taskmux start server --json
+taskmux logs server --json
+taskmux events --json
+```
+
+**Status:**
+
+```json
+{
+  "session": "myproject",
+  "running": true,
+  "active_tasks": 3,
+  "tasks": [
+    {
+      "name": "server",
+      "running": true,
+      "healthy": true,
+      "command": "npm run dev",
+      "port": 3000,
+      "restart_policy": "on-failure"
+    }
+  ]
+}
+```
+
+**Health:**
+
+```json
+{
+  "healthy_count": 2,
+  "total_count": 3,
+  "tasks": [
+    {"name": "server", "healthy": true},
+    {"name": "worker", "healthy": false}
+  ]
+}
+```
+
+**Action commands** (`start`, `stop`, `restart`, `kill`, `add`, `remove`):
+
+```json
+{"ok": true, "task": "server", "action": "started"}
+```
+
+**Logs** (non-follow):
+
+```json
+{"task": "server", "lines": ["2024-01-01T14:00:00.123 Listening on :3000"]}
+```
+
+**Errors:**
+
+```json
+{"ok": false, "error": "Task 'ghost' not found in config"}
+```
+
+### Event History
+
+Taskmux records lifecycle events to `~/.taskmux/events.jsonl`:
+
+```bash
+taskmux events                    # recent events
+taskmux events --task server      # filter by task
+taskmux events --since 10m        # last 10 minutes
+taskmux events -n 100 --json      # last 100 as JSON
+```
+
+**Recorded events:**
+
+| Event | Trigger |
+|-------|---------|
+| `task_started` | `start` command |
+| `task_stopped` | `stop` command |
+| `task_restarted` | `restart` command |
+| `task_killed` | `kill` command |
+| `session_started` | `start` (all tasks) |
+| `session_stopped` | `stop` (all tasks) |
+| `health_check_failed` | Health check fails (includes attempt count) |
+| `auto_restart` | Auto-restart triggered (includes reason) |
+| `max_restarts_reached` | Task hit max_restarts limit |
+| `config_reloaded` | Config file changed (daemon/watch mode) |
+
+**Example output:**
+
+```
+2024-01-01T14:00:00 [server] task_started
+2024-01-01T14:05:00 [server] health_check_failed (attempt=1)
+2024-01-01T14:05:30 [server] health_check_failed (attempt=2)
+2024-01-01T14:06:00 [server] health_check_failed (attempt=3)
+2024-01-01T14:06:00 [server] auto_restart (reason=health_retries_exceeded)
+```
+
+The events file auto-rotates, trimming to 10,000 lines when it exceeds 15,000.
 
 ## Monitoring & Auto-restart
 
