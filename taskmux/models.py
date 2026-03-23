@@ -1,9 +1,12 @@
 """Pydantic models for Taskmux configuration."""
 
+import re
 import warnings
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
 
 class RestartPolicy(StrEnum):
@@ -55,8 +58,25 @@ class TaskConfig(_StrictConfig):
     max_restarts: int = 5
     restart_backoff: float = 2.0
     restart_policy: RestartPolicy = RestartPolicy.ON_FAILURE
+    log_file: str | None = None
+    log_max_size: str = "10MB"
+    log_max_files: int = 3
     depends_on: list[str] = []
     hooks: HookConfig = HookConfig()
+
+    @field_validator("log_max_size")
+    @classmethod
+    def _validate_log_max_size(cls, v: str) -> str:
+        upper = v.strip().upper()
+        for suffix in sorted(_SIZE_UNITS, key=len, reverse=True):
+            if upper.endswith(suffix):
+                num = upper[: -len(suffix)].strip()
+                if num and re.match(r"^\d+(\.\d+)?$", num):
+                    return v
+                break
+        if re.match(r"^\d+$", upper):
+            return v
+        raise ValueError(f"Invalid size format: {v!r}. Use e.g. '10MB', '500KB', '1GB'")
 
 
 class TaskmuxConfig(_StrictConfig):

@@ -4,18 +4,60 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
+import shlex
 import signal as sig
 import subprocess
 import time
 from collections import deque
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import libtmux
 from rich.console import Console
 from rich.markup import escape
 
+from .events import recordEvent
 from .hooks import runHook
-from .models import RestartPolicy, TaskmuxConfig
+from .models import RestartPolicy, TaskConfig, TaskmuxConfig
+
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
+
+
+def _parseSize(size_str: str) -> int:
+    """Parse human-readable size string to bytes. E.g. '10MB' -> 10485760."""
+    upper = size_str.strip().upper()
+    for suffix in sorted(_SIZE_UNITS, key=len, reverse=True):
+        if upper.endswith(suffix):
+            num = upper[: -len(suffix)].strip()
+            return int(float(num) * _SIZE_UNITS[suffix])
+    return int(upper)
+
+
+def _logPath(session_name: str, task_name: str, task_cfg: TaskConfig) -> Path:
+    """Resolve log file path for a task."""
+    if task_cfg.log_file:
+        return Path(task_cfg.log_file).expanduser()
+    return Path.home() / ".taskmux" / "logs" / session_name / f"{task_name}.log"
+
+
+def _parseSince(since_str: str) -> datetime:
+    """Parse --since value: ISO timestamp or duration like '5m', '1h', '2d'."""
+    try:
+        dt = datetime.fromisoformat(since_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except ValueError:
+        pass
+    total_seconds = 0
+    for match in re.finditer(r"(\d+)([dhms])", since_str.lower()):
+        val, unit = int(match.group(1)), match.group(2)
+        total_seconds += val * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
+    if total_seconds == 0:
+        raise ValueError(f"Cannot parse --since value: {since_str}")
+    return datetime.now(UTC) - timedelta(seconds=total_seconds)
+
 
 SHELL_NAMES = frozenset(("bash", "zsh", "sh", "fish"))
 
@@ -101,6 +143,26 @@ class TmuxManager:
         """Get session, raising if it doesn't exist."""
         assert self.session is not None
         return self.session
+
+    def _attach_log_pipe(self, pane: libtmux.Pane, task_name: str) -> None:
+        """Attach pipe-pane to mirror pane output to a timestamped log file."""
+        task_cfg = self.config.tasks[task_name]
+        log_path = _logPath(self.config.name, task_name, task_cfg)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        max_bytes = _parseSize(task_cfg.log_max_size)
+        max_files = task_cfg.log_max_files
+        cmd_str = (
+            f"exec python3 -u -m taskmux._log_pipe "
+            f"{shlex.quote(str(log_path))} {max_bytes} {max_files}"
+        )
+        pane.cmd("pipe-pane", cmd_str)
+
+    def getLogPath(self, task_name: str) -> Path | None:
+        """Return log file path if it exists on disk."""
+        if task_name not in self.config.tasks:
+            return None
+        path = _logPath(self.config.name, task_name, self.config.tasks[task_name])
+        return path if path.exists() else None
 
     def list_windows(self) -> list[str]:
         """List all windows in the session"""
@@ -227,6 +289,7 @@ class TmuxManager:
         pane = window.active_pane
         if pane:
             pane.send_keys(command, enter=True)
+            self._attach_log_pipe(pane, task_name)
         return window
 
     def _toposort_tasks(self, task_names: list[str]) -> list[str]:
@@ -270,12 +333,11 @@ class TmuxManager:
             elapsed += interval
         return self.is_task_healthy(task_name)
 
-    def start_task(self, task_name: str) -> None:
+    def start_task(self, task_name: str) -> dict:
         """Start a single task (create window + send command)."""
         self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
-            print(f"Task '{task_name}' not found in config")
-            return
+            return {"ok": False, "error": f"Task '{task_name}' not found in config"}
 
         if not self.session_exists():
             # Create empty session first
@@ -291,19 +353,19 @@ class TmuxManager:
         # Check if already running
         existing = sess.windows.get(window_name=task_name, default=None)
         if existing:
-            print(f"Task '{task_name}' already running")
-            return
+            return {"ok": False, "error": f"Task '{task_name}' already running"}
 
         # Warn if deps aren't running
+        warnings: list[str] = []
         for dep in task_cfg.depends_on:
             if dep not in self.list_windows():
-                print(f"Warning: dependency '{dep}' is not running")
+                warnings.append(f"Dependency '{dep}' is not running")
 
         # Hooks: global before_start, then task before_start
         if not runHook(self.config.hooks.before_start, task_name):
-            return
+            return {"ok": False, "error": "Global before_start hook failed"}
         if not runHook(task_cfg.hooks.before_start, task_name):
-            return
+            return {"ok": False, "error": f"Task '{task_name}' before_start hook failed"}
 
         # If session was just created, rename default window instead of creating new
         if len(sess.windows) == 1 and sess.windows[0].window_name != task_name:
@@ -316,6 +378,7 @@ class TmuxManager:
                     if task_cfg.cwd:
                         pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
                     pane.send_keys(task_cfg.command, enter=True)
+                    self._attach_log_pipe(pane, task_name)
             else:
                 self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
         else:
@@ -323,24 +386,26 @@ class TmuxManager:
 
         runHook(task_cfg.hooks.after_start, task_name)
         runHook(self.config.hooks.after_start, task_name)
-        print(f"Started task '{task_name}'")
 
-    def stop_task(self, task_name: str) -> None:
+        recordEvent("task_started", session=self.config.name, task=task_name)
+        result: dict = {"ok": True, "task": task_name, "action": "started"}
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def stop_task(self, task_name: str) -> dict:
         """Graceful stop with signal escalation: C-c → SIGTERM → SIGKILL."""
         self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
-            print(f"Session '{self.config.name}' doesn't exist")
-            return
+            return {"ok": False, "error": f"Session '{self.config.name}' doesn't exist"}
 
         if task_name not in self.config.tasks:
-            print(f"Task '{task_name}' not found in config")
-            return
+            return {"ok": False, "error": f"Task '{task_name}' not found in config"}
 
         sess = self._get_session()
         window = sess.windows.get(window_name=task_name, default=None)
         if not window:
-            print(f"Task '{task_name}' not running")
-            return
+            return {"ok": False, "error": f"Task '{task_name}' not running"}
 
         task_cfg = self.config.tasks[task_name]
 
@@ -369,35 +434,41 @@ class TmuxManager:
         # Hooks: task after_stop, then global after_stop
         runHook(task_cfg.hooks.after_stop, task_name)
         runHook(self.config.hooks.after_stop, task_name)
-        print(f"Stopped task '{task_name}'")
+        recordEvent("task_stopped", session=self.config.name, task=task_name, reason="manual")
+        return {"ok": True, "task": task_name, "action": "stopped"}
 
-    def start_all(self) -> None:
+    def start_all(self) -> dict:
         """Start all auto_start tasks in dependency order."""
         if self.session_exists():
-            print(f"Session '{self.config.name}' already exists")
-            return
+            return {"ok": False, "error": f"Session '{self.config.name}' already exists"}
 
         if not self.config.auto_start:
             # Create empty session, no tasks
             self.session = self.server.new_session(session_name=self.config.name, attach=False)
-            print(f"Created session '{self.config.name}' (auto_start disabled, no tasks launched)")
-            return
+            return {
+                "ok": True,
+                "session": self.config.name,
+                "action": "started",
+                "tasks": [],
+                "warnings": ["auto_start disabled, no tasks launched"],
+            }
 
         auto_tasks = {name: cfg for name, cfg in self.config.tasks.items() if cfg.auto_start}
         if not auto_tasks:
-            print("No auto-start tasks defined in config")
-            return
+            return {"ok": False, "error": "No auto-start tasks defined in config"}
 
         # Topological sort for dependency ordering
         sorted_names = self._toposort_tasks(list(auto_tasks.keys()))
 
         # Global before_start
         if not runHook(self.config.hooks.before_start):
-            return
+            return {"ok": False, "error": "Global before_start hook failed"}
 
         self.session = self.server.new_session(session_name=self.config.name, attach=False)
         sess = self._get_session()
 
+        started: list[str] = []
+        warnings: list[str] = []
         first = True
         for task_name in sorted_names:
             task_cfg = auto_tasks[task_name]
@@ -409,7 +480,7 @@ class TmuxManager:
                     dep_cfg = auto_tasks[dep]
                     timeout = dep_cfg.health_retries * dep_cfg.health_interval
                     if not self._wait_for_healthy(dep, timeout):
-                        print(f"Warning: dependency '{dep}' not healthy, skipping '{task_name}'")
+                        warnings.append(f"Dependency '{dep}' not healthy, skipping '{task_name}'")
                         skip = True
                         break
             if skip:
@@ -426,24 +497,35 @@ class TmuxManager:
                     if task_cfg.cwd:
                         pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
                     pane.send_keys(task_cfg.command, enter=True)
+                    self._attach_log_pipe(pane, task_name)
                 first = False
             else:
                 self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
 
             runHook(task_cfg.hooks.after_start, task_name)
+            started.append(task_name)
 
         # Global after_start
         runHook(self.config.hooks.after_start)
-        print(f"Started session '{self.config.name}' with {len(auto_tasks)} tasks")
+        recordEvent("session_started", session=self.config.name, tasks=started)
 
-    def stop_all(self) -> None:
+        result: dict = {
+            "ok": True,
+            "session": self.config.name,
+            "action": "started",
+            "tasks": started,
+        }
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def stop_all(self) -> dict:
         """Stop all tasks with signal escalation then kill session."""
         for task_name in self.config.tasks:
             self.restart_tracker.mark_manually_stopped(task_name)
 
         if not self.session_exists():
-            print("No session running")
-            return
+            return {"ok": False, "error": "No session running"}
 
         # Global before_stop
         runHook(self.config.hooks.before_stop)
@@ -483,32 +565,35 @@ class TmuxManager:
             task_cfg = self.config.tasks[task_name]
             runHook(task_cfg.hooks.after_stop, task_name)
 
+        session_name = self.config.name
         sess.kill()
 
         # Global after_stop
         runHook(self.config.hooks.after_stop)
-        print(f"Stopped session '{self.config.name}'")
+        recordEvent("session_stopped", session=session_name)
+        return {"ok": True, "session": session_name, "action": "stopped"}
 
-    def restart_all(self) -> None:
+    def restart_all(self) -> dict:
         """Stop all then start all."""
         self.stop_all()
         self._refresh_session()
-        self.start_all()
+        return self.start_all()
 
-    def create_session(self) -> None:
+    def create_session(self) -> dict:
         """Create new tmux session with auto_start tasks only (legacy, wraps start_all)."""
-        self.start_all()
+        return self.start_all()
 
-    def restart_task(self, task_name: str) -> None:
+    def restart_task(self, task_name: str) -> dict:
         """Restart a specific task with full stop escalation."""
         self.restart_tracker.clear_manually_stopped(task_name)
         if not self.session_exists():
-            print(f"Session '{self.config.name}' doesn't exist. Run 'taskmux start' first.")
-            return
+            return {
+                "ok": False,
+                "error": f"Session '{self.config.name}' doesn't exist. Run 'taskmux start' first.",
+            }
 
         if task_name not in self.config.tasks:
-            print(f"Task '{task_name}' not found in config")
-            return
+            return {"ok": False, "error": f"Task '{task_name}' not found in config"}
 
         sess = self._get_session()
         task_cfg = self.config.tasks[task_name]
@@ -541,6 +626,7 @@ class TmuxManager:
                 if task_cfg.cwd:
                     pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
                 pane.send_keys(command, enter=True)
+                self._attach_log_pipe(pane, task_name)
             runHook(task_cfg.hooks.after_start, task_name)
         else:
             # Port cleanup before start
@@ -550,26 +636,27 @@ class TmuxManager:
             self._send_command_to_window(sess, task_name, command, task_cfg.cwd)
             runHook(task_cfg.hooks.after_start, task_name)
 
-        print(f"Restarted task '{task_name}'")
+        recordEvent("task_restarted", session=self.config.name, task=task_name)
+        return {"ok": True, "task": task_name, "action": "restarted"}
 
-    def kill_task(self, task_name: str) -> None:
+    def kill_task(self, task_name: str) -> dict:
         """Kill a specific task (process group + window)."""
         self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
-            print(f"Session '{self.config.name}' doesn't exist")
-            return
+            return {"ok": False, "error": f"Session '{self.config.name}' doesn't exist"}
 
         window = self._get_session().windows.get(window_name=task_name, default=None)
-        if window:
-            pane = window.active_pane
-            if pane:
-                pid = self._get_pane_child_pid(pane)
-                if pid:
-                    self._kill_process_tree(pid)
-            window.kill()
-            print(f"Killed task '{task_name}'")
-        else:
-            print(f"Task '{task_name}' not found")
+        if not window:
+            return {"ok": False, "error": f"Task '{task_name}' not found"}
+
+        pane = window.active_pane
+        if pane:
+            pid = self._get_pane_child_pid(pane)
+            if pid:
+                self._kill_process_tree(pid)
+        window.kill()
+        recordEvent("task_killed", session=self.config.name, task=task_name)
+        return {"ok": True, "task": task_name, "action": "killed"}
 
     def inspect_task(self, task_name: str) -> dict:
         """Return JSON-serializable dict with detailed task state."""
@@ -582,6 +669,7 @@ class TmuxManager:
             "command": task_cfg.command,
             "auto_start": task_cfg.auto_start,
             "restart_policy": str(task_cfg.restart_policy),
+            "log_file": str(_logPath(self.config.name, task_name, task_cfg)),
             "cwd": task_cfg.cwd,
             "health_check": task_cfg.health_check,
             "depends_on": task_cfg.depends_on,
@@ -663,6 +751,84 @@ class TmuxManager:
                 result.append((name, pane, color))
         return result
 
+    def _read_log_file(
+        self, log_path: Path, lines: int, grep: str | None, since: str | None
+    ) -> list[str]:
+        """Read lines from a persistent log file with optional filtering."""
+        try:
+            all_lines = log_path.read_text().splitlines()
+        except OSError:
+            return []
+
+        if since:
+            since_dt = _parseSince(since)
+            filtered = []
+            for line in all_lines:
+                # Timestamp is first 23 chars: 2024-01-01T14:00:00.123
+                if len(line) >= 23:
+                    try:
+                        line_dt = datetime.fromisoformat(line[:23]).replace(tzinfo=UTC)
+                        if line_dt < since_dt:
+                            continue
+                    except ValueError:
+                        pass
+                filtered.append(line)
+            all_lines = filtered
+
+        if grep:
+            all_lines = [ln for ln in all_lines if grep.lower() in ln.lower()]
+
+        return all_lines[-lines:]
+
+    def _tail_log_file(self, task_name: str, log_path: Path, grep: str | None, color: str) -> None:
+        """Follow a log file (tail -f style)."""
+        console = Console()
+        try:
+            with open(log_path) as f:
+                f.seek(0, 2)  # seek to end
+                while True:
+                    line = f.readline()
+                    if line:
+                        line = line.rstrip("\n")
+                        if grep and grep.lower() not in line.lower():
+                            continue
+                        prefix = escape(f"[{task_name}]")
+                        console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
+                    else:
+                        time.sleep(0.1)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Stopped following logs[/dim]")
+
+    def _tail_log_files(
+        self, task_log_paths: list[tuple[str, Path, str]], grep: str | None
+    ) -> None:
+        """Follow multiple log files, interleaving output."""
+        console = Console()
+        handles: list[tuple[str, object, str]] = []
+        for task_name, log_path, color in task_log_paths:
+            f = open(log_path)  # noqa: SIM115
+            f.seek(0, 2)
+            handles.append((task_name, f, color))
+        try:
+            while True:
+                any_output = False
+                for task_name, f, color in handles:
+                    line = f.readline()  # type: ignore[union-attr]
+                    if line:
+                        any_output = True
+                        line = line.rstrip("\n")
+                        if grep and grep.lower() not in line.lower():
+                            continue
+                        prefix = escape(f"[{task_name}]")
+                        console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
+                if not any_output:
+                    time.sleep(0.1)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Stopped following logs[/dim]")
+        finally:
+            for _, f, _ in handles:
+                f.close()  # type: ignore[union-attr]
+
     def show_logs(
         self,
         task_name: str | None,
@@ -670,18 +836,32 @@ class TmuxManager:
         lines: int = 100,
         grep: str | None = None,
         context: int = 3,
+        since: str | None = None,
     ) -> None:
         """Show logs for a task or all tasks."""
-        if not self.session_exists():
-            print(f"Session '{self.config.name}' doesn't exist")
-            return
-
         if task_name is None:
-            self.show_all_logs(follow=follow, lines=lines, grep=grep, context=context)
+            self.show_all_logs(follow=follow, lines=lines, grep=grep, context=context, since=since)
             return
 
         if task_name not in self.config.tasks:
             print(f"Task '{task_name}' not found in config")
+            return
+
+        # Prefer persistent log file
+        log_path = self.getLogPath(task_name)
+        if log_path:
+            if follow:
+                color = TASK_COLORS[0]
+                self._tail_log_file(task_name, log_path, grep, color)
+            else:
+                output = self._read_log_file(log_path, lines, grep, since)
+                for line in output:
+                    print(line)
+            return
+
+        # Fallback to capture-pane
+        if not self.session_exists():
+            print(f"Session '{self.config.name}' doesn't exist")
             return
 
         sess = self._get_session()
@@ -710,26 +890,49 @@ class TmuxManager:
         lines: int = 100,
         grep: str | None = None,
         context: int = 3,
+        since: str | None = None,
     ) -> None:
         """Show logs from all running tasks."""
-        sess = self._get_session()
         console = Console()
         task_names = list(self.config.tasks.keys())
 
+        # Try log files first
         if follow:
-            panes = self._collect_panes(task_names)
-            if panes:
-                self._tail_panes(panes, lines=lines, grep=grep)
+            log_files: list[tuple[str, Path, str]] = []
+            for i, name in enumerate(task_names):
+                lp = self.getLogPath(name)
+                if lp:
+                    log_files.append((name, lp, TASK_COLORS[i % len(TASK_COLORS)]))
+            if log_files:
+                self._tail_log_files(log_files, grep)
+                return
+            # Fallback to capture-pane
+            if self.session_exists():
+                panes = self._collect_panes(task_names)
+                if panes:
+                    self._tail_panes(panes, lines=lines, grep=grep)
             return
 
+        # Non-follow: prefer log files, fallback to capture-pane per task
         for i, task_name in enumerate(task_names):
+            color = TASK_COLORS[i % len(TASK_COLORS)]
+            log_path = self.getLogPath(task_name)
+            if log_path:
+                output = self._read_log_file(log_path, lines, grep, since)
+                for line in output:
+                    prefix = escape(f"[{task_name}]")
+                    console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
+                continue
+
+            if not self.session_exists():
+                continue
+            sess = self._get_session()
             window = sess.windows.get(window_name=task_name, default=None)
             if not window:
                 continue
             pane = window.active_pane
             if not pane:
                 continue
-            color = TASK_COLORS[i % len(TASK_COLORS)]
             output = pane.cmd("capture-pane", "-p", "-S", f"-{lines}").stdout
             if grep:
                 matching = [line for line in output if grep.lower() in line.lower()]
@@ -741,36 +944,34 @@ class TmuxManager:
                     prefix = escape(f"[{task_name}]")
                     console.print(f"[{color}]{prefix}[/{color}] {escape(line)}")
 
-    def list_tasks(self) -> None:
+    def list_tasks(self) -> dict:
         """List all tasks and their status."""
         exists = self.session_exists()
-        print(f"Session '{self.config.name}': {'Running' if exists else 'Stopped'}")
-        if exists:
-            windows = self.list_windows()
-            print(f"Active tasks: {len(windows)}")
-        print("-" * 70)
+        windows = self.list_windows() if exists else []
 
-        if not self.config.tasks:
-            print("No tasks configured")
-            return
-
+        tasks = []
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
-            health_icon = "G" if status["healthy"] else "R" if status["running"] else "o"
-            status_text = (
-                "Healthy" if status["healthy"] else "Running" if status["running"] else "Stopped"
+            tasks.append(
+                {
+                    "name": task_name,
+                    "running": status["running"],
+                    "healthy": status["healthy"],
+                    "command": task_cfg.command,
+                    "auto_start": task_cfg.auto_start,
+                    "port": task_cfg.port,
+                    "restart_policy": str(task_cfg.restart_policy),
+                    "cwd": task_cfg.cwd,
+                    "depends_on": task_cfg.depends_on,
+                }
             )
-            auto = "" if task_cfg.auto_start else " [manual]"
-            port = f" :{task_cfg.port}" if task_cfg.port else ""
-            extras = ""
-            if task_cfg.cwd:
-                extras += f" cwd={task_cfg.cwd}"
-            if task_cfg.restart_policy != RestartPolicy.ON_FAILURE:
-                extras += f" restart={task_cfg.restart_policy}"
-            if task_cfg.depends_on:
-                extras += f" deps=[{','.join(task_cfg.depends_on)}]"
-            line = f"{health_icon} {status_text:8} {task_name:15}{port:7} {task_cfg.command}"
-            print(f"{line}{auto}{extras}")
+
+        return {
+            "session": self.config.name,
+            "running": exists,
+            "active_tasks": len(windows),
+            "tasks": tasks,
+        }
 
     def check_task_health(self, task_name: str) -> bool:
         """Check if a task is healthy"""
@@ -819,10 +1020,22 @@ class TmuxManager:
             elif task_cfg.restart_policy == RestartPolicy.ON_FAILURE:
                 # Pane alive but health check failing — count consecutive failures
                 failures = self.restart_tracker.record_health_failure(task_name)
+                recordEvent(
+                    "health_check_failed",
+                    session=self.config.name,
+                    task=task_name,
+                    attempt=failures,
+                )
                 if failures >= task_cfg.health_retries:
                     should_restart = True
             elif task_cfg.restart_policy == RestartPolicy.ALWAYS:
                 failures = self.restart_tracker.record_health_failure(task_name)
+                recordEvent(
+                    "health_check_failed",
+                    session=self.config.name,
+                    task=task_name,
+                    attempt=failures,
+                )
                 if failures >= task_cfg.health_retries:
                     should_restart = True
 
@@ -832,6 +1045,12 @@ class TmuxManager:
             # Check max_restarts limit
             info = self.restart_tracker.get(task_name)
             if task_cfg.max_restarts and info["count"] >= task_cfg.max_restarts:
+                recordEvent(
+                    "max_restarts_reached",
+                    session=self.config.name,
+                    task=task_name,
+                    count=int(info["count"]),
+                )
                 continue
 
             # Check backoff delay
@@ -839,6 +1058,8 @@ class TmuxManager:
             if info["last"] and now - info["last"] < delay:
                 continue
 
+            reason = "process_exited" if not pane_alive else "health_retries_exceeded"
+            recordEvent("auto_restart", session=self.config.name, task=task_name, reason=reason)
             print(f"Auto-restarting task: {task_name}")
             self.restart_task(task_name)
             self.restart_tracker.record(task_name)
@@ -848,9 +1069,9 @@ class TmuxManager:
         """Deprecated: use auto_restart_tasks() instead."""
         self.auto_restart_tasks()
 
-    def stop_session(self) -> None:
+    def stop_session(self) -> dict:
         """Stop the entire tmux session (legacy, wraps stop_all)."""
-        self.stop_all()
+        return self.stop_all()
 
 
 def _print_grep_results(output: list[str], pattern: str, context: int) -> None:

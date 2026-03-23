@@ -52,15 +52,16 @@ class TestCreateSession:
 
 class TestStartTask:
     @patch("taskmux.tmux_manager.libtmux.Server")
-    def test_unknown_task(self, mock_server_cls, capsys):
+    def test_unknown_task(self, mock_server_cls):
         mock_server = MagicMock()
         mock_server_cls.return_value = mock_server
         mock_server.sessions.get.side_effect = Exception("not found")
 
         cfg = _make_config(tasks={"server": "echo hi"})
         mgr = TmuxManager(cfg)
-        mgr.start_task("ghost")
-        assert "not found" in capsys.readouterr().out
+        result = mgr.start_task("ghost")
+        assert result["ok"] is False
+        assert "not found" in result["error"]
 
     @patch("taskmux.tmux_manager.libtmux.Server")
     def test_creates_session_if_missing(self, mock_server_cls):
@@ -108,7 +109,7 @@ class TestStopTask:
         mock_pane.send_keys.assert_called_with("C-c")
 
     @patch("taskmux.tmux_manager.libtmux.Server")
-    def test_not_running(self, mock_server_cls, capsys):
+    def test_not_running(self, mock_server_cls):
         mock_server = MagicMock()
         mock_server_cls.return_value = mock_server
         mock_session = MagicMock()
@@ -117,8 +118,9 @@ class TestStopTask:
 
         cfg = _make_config(tasks={"server": "echo hi"})
         mgr = TmuxManager(cfg)
-        mgr.stop_task("server")
-        assert "not running" in capsys.readouterr().out
+        result = mgr.stop_task("server")
+        assert result["ok"] is False
+        assert "not running" in result["error"]
 
     @patch("taskmux.tmux_manager.os.killpg")
     @patch("taskmux.tmux_manager.os.getpgid", return_value=999)
@@ -173,7 +175,7 @@ class TestStopAll:
 
 class TestStartAll:
     @patch("taskmux.tmux_manager.libtmux.Server")
-    def test_global_auto_start_false(self, mock_server_cls, capsys):
+    def test_global_auto_start_false(self, mock_server_cls):
         mock_server = MagicMock()
         mock_server_cls.return_value = mock_server
         mock_server.sessions.get.side_effect = Exception("not found")
@@ -182,9 +184,9 @@ class TestStartAll:
 
         cfg = _make_config(auto_start=False, tasks={"server": "echo hi"})
         mgr = TmuxManager(cfg)
-        mgr.start_all()
-        output = capsys.readouterr().out
-        assert "auto_start disabled" in output
+        result = mgr.start_all()
+        assert result["ok"] is True
+        assert any("auto_start disabled" in w for w in result.get("warnings", []))
         mock_server.new_session.assert_called_once()
 
 

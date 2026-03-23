@@ -124,6 +124,12 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("restart_backoff", task_cfg.restart_backoff)
         if task_cfg.restart_policy != RestartPolicy.ON_FAILURE:
             inner.add("restart_policy", str(task_cfg.restart_policy))
+        if task_cfg.log_file is not None:
+            inner.add("log_file", task_cfg.log_file)
+        if task_cfg.log_max_size != "10MB":
+            inner.add("log_max_size", task_cfg.log_max_size)
+        if task_cfg.log_max_files != 3:
+            inner.add("log_max_files", task_cfg.log_max_files)
         if task_cfg.depends_on:
             inner.add("depends_on", task_cfg.depends_on)
         # Task-level hooks

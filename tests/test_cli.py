@@ -159,7 +159,7 @@ class TestLogsCommand:
         result = runner.invoke(app, ["logs", "server", "--grep", "error", "-C", "2"])
         assert result.exit_code == 0
         mock_tmux.return_value.show_logs.assert_called_once_with(
-            "server", False, 100, grep="error", context=2
+            "server", False, 100, grep="error", context=2, since=None
         )
 
     @patch("taskmux.cli.TmuxManager")
@@ -171,7 +171,7 @@ class TestLogsCommand:
         result = runner.invoke(app, ["logs"])
         assert result.exit_code == 0
         mock_tmux.return_value.show_logs.assert_called_once_with(
-            None, False, 100, grep=None, context=3
+            None, False, 100, grep=None, context=3, since=None
         )
 
 
