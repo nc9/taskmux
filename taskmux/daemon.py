@@ -17,6 +17,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .config import loadConfig
+from .events import recordEvent
 
 if TYPE_CHECKING:
     from .cli import TaskmuxCLI
@@ -34,6 +35,7 @@ class ConfigWatcher(FileSystemEventHandler):
             print("\nConfig file changed, reloading...")
             self.taskmux_cli.config = loadConfig()
             self.taskmux_cli.tmux.config = self.taskmux_cli.config
+            recordEvent("config_reloaded", session=self.taskmux_cli.config.name)
 
             if self.daemon_mode:
                 self.taskmux_cli.handle_config_reload()
