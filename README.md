@@ -1,77 +1,105 @@
 # Taskmux
 
-A modern tmux session manager for LLM development tools with persistent logs, JSON output, health monitoring, restart policies, event history, and WebSocket API.
+Tmux session manager for development environments. Define tasks in `taskmux.toml`, start them in dependency order, monitor health, auto-restart on failure, read persistent timestamped logs. Every command supports `--json` for agents and scripts.
 
-## Why Taskmux?
+## Features
 
-LLM coding tools like Claude Code and Cursor struggle with background tasks. Taskmux provides an LLM-friendly CLI for managing multiple background processes — restarting, checking status, reading logs — all from within your AI coding environment. Every command supports `--json` for programmatic consumption, logs persist to disk with timestamps, and all lifecycle events are recorded for debugging.
+- **Task orchestration** — start/stop/restart tasks with dependency ordering and signal escalation
+- **Persistent logs** — timestamped, rotated, survives session kill (`~/.taskmux/logs/`)
+- **Health checks** — custom commands with retries, used for dependency gating and auto-restart
+- **Restart policies** — `no`, `on-failure` (default), `always` with exponential backoff
+- **JSON output** — `--json` on every command for programmatic consumption
+- **Event history** — lifecycle events recorded to `~/.taskmux/events.jsonl`
+- **Lifecycle hooks** — before/after start/stop at global and per-task level
+- **Port cleanup** — kills orphaned listeners before starting
+- **Agent context** — `taskmux init` injects usage instructions into Claude/Codex/OpenCode context files
+- **Daemon mode** — WebSocket API + config watching + health monitoring
+- **Tmux native** — `tmux attach` to see live output, interact with tasks
 
-## Installation
+## Install
 
-### Prerequisites
-
-- [tmux](https://github.com/tmux/tmux)
-- [uv](https://docs.astral.sh/uv/) (Python 3.11+)
-
-### Install
+Requires [tmux](https://github.com/tmux/tmux) and Python 3.11+.
 
 ```bash
-# Recommended (global install)
 uv tool install taskmux
-
-# From source
-git clone https://github.com/nc9/taskmux
-cd taskmux
-uv tool install .
 ```
 
-## Quick Start
+## Commands
+
+All commands support `--json` for machine-readable output.
 
 ```bash
-# Initialize in your project (creates taskmux.toml, injects agent context)
-taskmux init
+# Lifecycle
+taskmux start                    # start all auto_start tasks in dependency order
+taskmux start <task> [task2...]  # start specific tasks
+taskmux start -m                 # start + monitor health + auto-restart
+taskmux stop                     # graceful stop all (C-c → SIGTERM → SIGKILL)
+taskmux stop <task> [task2...]   # stop specific tasks
+taskmux restart                  # restart all
+taskmux restart <task>           # restart specific tasks
+taskmux kill <task>              # hard-kill (SIGKILL + destroy window)
 
-# Add tasks
-taskmux add server "npm run dev"
-taskmux add build "npm run build:watch"
-taskmux add db "docker compose up postgres"
+# Info
+taskmux status                   # task overview (aliases: list, ls)
+taskmux health                   # health check table
+taskmux inspect <task>           # full task state as JSON
+taskmux events                   # recent lifecycle events
+taskmux events --task server     # filter by task
+taskmux events --since 1h        # filter by time
 
-# Start all auto_start tasks
-taskmux start
+# Logs — persistent, timestamped, stored at ~/.taskmux/logs/
+taskmux logs                     # interleaved logs from all tasks
+taskmux logs <task>              # logs for one task
+taskmux logs -f [task]           # follow live
+taskmux logs -n 200 <task>       # last N lines
+taskmux logs -g "error"          # grep all tasks
+taskmux logs -g "err" -C 5      # grep with context
+taskmux logs --since 5m          # last 5 minutes
+taskmux logs --since "2024-01-01T14:00"
+taskmux logs-clean [task]        # delete log files
 
-# Check status
-taskmux status
+# Config
+taskmux add <task> "<command>"   # add task to taskmux.toml
+taskmux remove <task>            # remove task (kills if running)
+taskmux init                     # create taskmux.toml + inject agent context
+taskmux init --defaults          # non-interactive
+
+# Monitoring
+taskmux watch                    # watch config, reload on change
+taskmux daemon --port 8765       # daemon: WebSocket API + health + config watch
 ```
 
-Or create a `taskmux.toml` manually:
+### stop vs kill vs restart
+
+| Command | Signal | Window | Auto-restart |
+|---------|--------|--------|--------------|
+| `stop` | C-c → SIGTERM → SIGKILL | Stays alive | Blocked |
+| `kill` | SIGKILL | Destroyed | Blocked |
+| `restart` | Full stop + restart | Reused | Re-enabled |
+
+`stop` and `kill` mark tasks as manually stopped — no auto-restart even with `restart_policy = "always"`. `restart` or `start` clears this flag.
+
+## Configuration
+
+Config file: `taskmux.toml` in the current directory.
+
+### Minimal
 
 ```toml
 name = "myproject"
 
-[hooks]
-before_start = "echo starting stack"
-after_stop = "echo stack stopped"
-
 [tasks.server]
 command = "npm run dev"
 
-[tasks.server.hooks]
-before_start = "npm run build"
-
 [tasks.build]
 command = "npm run build:watch"
-
-[tasks.test]
-command = "npm run test:watch"
 
 [tasks.db]
 command = "docker compose up postgres"
 auto_start = false
 ```
 
-## Full Example
-
-A full-stack app with a database, API server, and frontend — using health checks to ensure each service is ready before starting its dependents:
+### Full-stack example
 
 ```toml
 name = "fullstack-app"
@@ -82,7 +110,7 @@ health_check = "pg_isready -h localhost -p 5432"
 health_interval = 3
 
 [tasks.migrate]
-command = "python manage.py migrate && echo 'done' && sleep infinity"
+command = "python manage.py migrate && echo done && sleep infinity"
 cwd = "apps/api"
 depends_on = ["db"]
 health_check = "test -f .migrate-complete"
@@ -116,430 +144,142 @@ cwd = "apps/web"
 auto_start = false
 ```
 
-What happens on `taskmux start`:
-
-1. **db** starts first (no dependencies)
-2. **migrate** and **worker** wait for db's health check (`pg_isready`) to pass
-3. **api** waits for migrate's health check
-4. **web** waits for api's health check (`curl localhost:8000/health`)
-5. **storybook** is skipped (`auto_start = false`) — start it manually with `taskmux start storybook`
-
-```bash
-taskmux start                    # Starts everything in dependency order
-taskmux logs                     # Interleaved logs from all tasks (persistent, timestamped)
-taskmux logs -g "ERROR"          # Grep all tasks for errors
-taskmux logs api --since 5m      # API logs from last 5 minutes
-taskmux logs -f api              # Follow API logs live
-taskmux status --json            # Machine-readable status for agents
-taskmux health --json            # Health check as JSON
-taskmux events --task worker     # Lifecycle events for the worker
-taskmux inspect api              # JSON state for a single task
-taskmux restart worker           # Restart just the worker
-taskmux start storybook          # Start a manual task
-```
-
-## Commands
-
-All commands support `--json` for machine-readable output (see [JSON Output](#json-output)).
-
-```bash
-# Session lifecycle
-taskmux start                    # Start all auto_start tasks in dependency order
-taskmux start <task> [task2...]  # Start specific tasks
-taskmux start -m                 # Start + stay in foreground monitoring health/restarting
-taskmux stop                     # Stop all (C-c → SIGTERM → SIGKILL), prevents auto-restart
-taskmux stop <task> [task2...]   # Stop specific tasks
-taskmux restart                  # Restart all tasks
-taskmux restart <task> [task2...] # Restart specific tasks, re-enables auto-restart
-
-# Task management
-taskmux kill <task>              # Hard-kill (SIGKILL + destroy window), prevents auto-restart
-taskmux add <task> "<command>"   # Add task to taskmux.toml
-taskmux remove <task>            # Remove task (kills if running)
-taskmux inspect <task>           # JSON state: pid, health, restart_policy, pane info
-
-# Status & health
-taskmux status                   # Session + task overview (aliases: list, ls)
-taskmux health                   # Health check table for all tasks
-
-# Logs (persistent, timestamped — stored at ~/.taskmux/logs/)
-taskmux logs                     # Interleaved logs from all tasks
-taskmux logs <task>              # Recent logs for a task
-taskmux logs -f [task]           # Follow logs live (colored prefixes)
-taskmux logs -n 200 <task>       # Last N lines
-taskmux logs -g "error"          # Grep all tasks
-taskmux logs <task> -g "err" -C 5  # Grep one task with context
-taskmux logs --since 5m          # Logs from last 5 minutes
-taskmux logs --since "2024-01-01T14:00"  # Logs since timestamp
-taskmux logs-clean               # Delete all log files for this session
-taskmux logs-clean <task>        # Delete logs for a specific task
-
-# Event history (stored at ~/.taskmux/events.jsonl)
-taskmux events                   # Recent lifecycle events (last 50)
-taskmux events --task server     # Filter by task
-taskmux events --since 1h        # Events from last hour
-taskmux events -n 100            # Show more events
-
-# Setup & monitoring
-taskmux init                     # Interactive project setup + agent context injection
-taskmux init --defaults          # Non-interactive setup
-taskmux watch                    # Watch taskmux.toml, reload on change
-taskmux daemon --port 8765       # Daemon mode: WebSocket API + health monitoring
-```
-
-### stop vs kill vs restart
-
-| Command | Signal | Window | Auto-restart |
-|---------|--------|--------|--------------|
-| `stop` | C-c → SIGTERM → SIGKILL (graceful) | Stays alive | Blocked (manually stopped) |
-| `kill` | SIGKILL (immediate) | Destroyed | Blocked (manually stopped) |
-| `restart` | Full stop + restart | Reused | Re-enabled |
-
-Both `stop` and `kill` mark the task as **manually stopped**, preventing auto-restart even with `restart_policy = "always"`. Use `restart` or `start` to clear this flag and re-enable auto-restart.
-
-## Configuration
-
-### Format
-
-Config file is `taskmux.toml` in the current directory:
-
-```toml
-name = "session-name"
-auto_start = true       # global toggle, default true
-
-[hooks]
-before_start = "echo starting"
-after_stop = "echo done"
-
-[tasks.server]
-command = "python manage.py runserver"
-cwd = "apps/api"
-port = 8000
-health_check = "curl -sf http://localhost:8000/health"
-stop_grace_period = 10
-depends_on = ["db"]
-
-[tasks.server.hooks]
-before_start = "python manage.py migrate"
-
-[tasks.db]
-command = "docker compose up postgres"
-health_check = "pg_isready -h localhost"
-
-[tasks.worker]
-command = "celery worker -A myapp"
-depends_on = ["db"]
-restart_policy = "always"
-max_restarts = 10
-
-[tasks.tailwind]
-command = "npx tailwindcss -w"
-auto_start = false
-restart_policy = "no"
-```
+On `taskmux start`: db starts first → migrate + worker wait for db health → api waits for migrate → web waits for api → storybook skipped (manual).
 
 ### Fields
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `name` | `"taskmux"` | tmux session name |
-| `auto_start` | `true` | Global toggle — if false, `start` creates session but launches nothing |
-| `hooks.before_start` | — | Run before starting tasks |
-| `hooks.after_start` | — | Run after starting tasks |
-| `hooks.before_stop` | — | Run before stopping tasks |
-| `hooks.after_stop` | — | Run after stopping tasks |
-| `tasks.<name>.command` | — | Shell command to run |
-| `tasks.<name>.auto_start` | `true` | Start with `taskmux start` |
-| `tasks.<name>.cwd` | — | Working directory for the task |
-| `tasks.<name>.port` | — | Port to clean up before starting (kills orphaned listeners) |
-| `tasks.<name>.health_check` | — | Shell command to check health (exit 0 = healthy) |
-| `tasks.<name>.health_interval` | `10` | Seconds between health checks |
-| `tasks.<name>.health_timeout` | `5` | Seconds before health check times out |
-| `tasks.<name>.health_retries` | `3` | Consecutive health failures before triggering a restart |
-| `tasks.<name>.stop_grace_period` | `5` | Seconds to wait after C-c before escalating to SIGTERM |
-| `tasks.<name>.restart_policy` | `"on-failure"` | When to auto-restart: `"no"`, `"on-failure"`, or `"always"` (see below) |
-| `tasks.<name>.max_restarts` | `5` | Max auto-restarts before giving up (resets after 60s healthy) |
-| `tasks.<name>.restart_backoff` | `2.0` | Exponential backoff base for restart delay (1s, 2s, 4s… capped at 60s) |
-| `tasks.<name>.log_file` | — | Override log file path (default: `~/.taskmux/logs/{session}/{task}.log`) |
-| `tasks.<name>.log_max_size` | `"10MB"` | Max log file size before rotation (e.g. `"500KB"`, `"1GB"`) |
-| `tasks.<name>.log_max_files` | `3` | Number of rotated log files to keep |
-| `tasks.<name>.depends_on` | `[]` | Task names that must be healthy before this task starts |
-| `tasks.<name>.hooks.*` | — | Per-task lifecycle hooks (same fields as global) |
+| `auto_start` | `true` | global toggle — `false` creates session but launches nothing |
+| `hooks.*` | — | `before_start`, `after_start`, `before_stop`, `after_stop` |
+| **Task fields** | | |
+| `command` | required | shell command to run |
+| `auto_start` | `true` | include in `taskmux start` |
+| `cwd` | — | working directory |
+| `port` | — | port to clean up before starting |
+| `health_check` | — | shell command (exit 0 = healthy) |
+| `health_interval` | `10` | seconds between checks |
+| `health_timeout` | `5` | seconds before check times out |
+| `health_retries` | `3` | consecutive failures before restart |
+| `stop_grace_period` | `5` | seconds after C-c before SIGTERM |
+| `restart_policy` | `"on-failure"` | `"no"`, `"on-failure"`, `"always"` |
+| `max_restarts` | `5` | max restarts before giving up (resets after 60s healthy) |
+| `restart_backoff` | `2.0` | exponential backoff base (capped 60s) |
+| `log_file` | — | override log path (default: `~/.taskmux/logs/{session}/{task}.log`) |
+| `log_max_size` | `"10MB"` | max size before rotation |
+| `log_max_files` | `3` | rotated files to keep |
+| `depends_on` | `[]` | tasks that must be healthy first |
+| `hooks.*` | — | per-task lifecycle hooks |
 
-### Dependency Ordering
+## JSON Output
 
-Tasks with `depends_on` are started in topological order. Before starting a task, taskmux waits for each dependency's health check to pass (up to `health_retries * health_interval` seconds). If a dependency never becomes healthy, the dependent task is skipped with a warning.
+Every command supports `--json`. Key schemas:
 
-Circular dependencies and references to nonexistent tasks are rejected at config load time.
+```bash
+taskmux status --json            # {"session": "x", "running": true, "tasks": [...]}
+taskmux health --json            # {"healthy_count": 2, "total_count": 3, "tasks": [...]}
+taskmux start server --json      # {"ok": true, "task": "server", "action": "started"}
+taskmux logs server --json       # {"task": "server", "lines": ["2024-01-01T14:00:00 ..."]}
+taskmux events --json            # {"events": [...], "count": 10}
+```
 
-When starting a single task with `taskmux start <task>`, dependencies are not auto-started — you get a warning if they aren't running.
+Error: `{"ok": false, "error": "Task 'ghost' not found in config"}`
 
-### Restart Policies
+## Restart Policies
 
-Each task has a `restart_policy` that controls automatic restart behavior. Restart policies are enforced by `taskmux start --monitor` and `taskmux daemon`.
+Enforced by `start --monitor` and `daemon`.
 
 | Policy | Behavior |
 |--------|----------|
-| `"no"` | Never auto-restart. Task stays stopped after crash or health failure. |
-| `"on-failure"` | **(default)** Restart on crash (process exits) or after `health_retries` consecutive health check failures. |
-| `"always"` | Restart whenever the task stops, including clean exits. |
+| `"no"` | Never auto-restart |
+| `"on-failure"` | **(default)** Restart on crash or after `health_retries` consecutive failures |
+| `"always"` | Restart on any exit (including clean) |
 
-**Manual stops override all policies.** Running `taskmux stop` or `taskmux kill` marks the task as manually stopped — it will not auto-restart even with `restart_policy = "always"`. Use `taskmux restart` or `taskmux start` to clear this flag.
+`restart_policy` and `auto_start` are orthogonal — `auto_start` controls initial launch, `restart_policy` controls what happens after exit.
 
-**`restart_policy` vs `auto_start`** — these are orthogonal. `auto_start` controls whether a task launches on `taskmux start`. `restart_policy` controls what happens after a running task exits or fails. A task with `auto_start = false` and `restart_policy = "always"` won't start automatically, but once started manually, it will auto-restart on exit.
+Backoff: `restart_backoff ^ attempt` seconds (capped 60s). Resets after 60s healthy. Stops after `max_restarts`.
 
-| `restart_policy` | `auto_start` | Behavior |
-|---|---|---|
-| `"no"` | `true` | Starts with session, never auto-restarts |
-| `"no"` | `false` | Manual start only, never auto-restarts |
-| `"on-failure"` | `true` | Starts with session, restarts on crash/health failure |
-| `"on-failure"` | `false` | Manual start, restarts on crash/health failure once running |
-| `"always"` | `true` | Starts with session, restarts on any exit |
-| `"always"` | `false` | Manual start, restarts on any exit once running |
+## Health Checks
 
-**Backoff & limits:** When a task keeps failing, restart delays increase exponentially: `restart_backoff ^ attempt` seconds (capped at 60s). After `max_restarts` consecutive restarts, the task is left stopped. The restart counter resets after 60 seconds of healthy uptime.
+If `health_check` is set, taskmux runs it as a shell command (exit 0 = healthy). Falls back to checking if the pane has a running process. Must fail `health_retries` consecutive times before triggering restart.
 
-### Health Checks
+Used by:
+- `taskmux health` — status table
+- `taskmux start` — dependency gating
+- `start --monitor` / `daemon` — auto-restart trigger
 
-If `health_check` is set, taskmux runs it as a shell command. Exit code 0 means healthy. If not set, taskmux falls back to checking if the tmux pane has a running process (not just a shell prompt).
+## Persistent Logs
 
-A task must fail `health_retries` consecutive health checks (default 3) before being considered unhealthy and triggering a restart. If the task becomes healthy again, the failure counter resets.
-
-Health checks are used by:
-- `taskmux health` — shows a table of all task health
-- `taskmux start` — waits for dependencies to be healthy before starting dependents
-- `taskmux start --monitor` — continuously monitors and auto-restarts per restart_policy
-- `taskmux daemon` — same as --monitor, plus WebSocket API and config watching
-
-### Hook Cascade
-
-Hooks fire in this order:
-1. **Start**: global `before_start` → task `before_start` → _run command_ → task `after_start` → global `after_start`
-2. **Stop**: global `before_stop` → task `before_stop` → _send C-c_ → task `after_stop` → global `after_stop`
-
-If a `before_*` hook fails (non-zero exit), the action is aborted.
-
-### Process Lifecycle
-
-Taskmux ensures processes are fully stopped before restarting and that orphaned port listeners don't block new starts.
-
-**Stop escalation** (`stop`, `restart`):
-
-1. **C-c** (SIGINT) — waits `stop_grace_period` seconds (default 5)
-2. **SIGTERM** to process group — waits 3 seconds
-3. **SIGKILL** to process group — force kill
-
-**Port cleanup** (`start`, `restart`): If `port` is configured, taskmux kills any process listening on that port before starting. This handles orphaned processes from crashed sessions.
-
-**Auto-restart** (`start --monitor`, `daemon`): Tasks with `restart_policy = "on-failure"` or `"always"` are automatically restarted. Health checks must fail `health_retries` times before triggering a restart. Restart delays increase exponentially (`restart_backoff` base, capped at 60s). After `max_restarts` failures, the task is left stopped. The counter resets after 60 seconds of healthy uptime.
-
-### Init & Agent Context
-
-`taskmux init` bootstraps your project:
-1. Creates `taskmux.toml` with session name (defaults to directory name)
-2. Detects installed AI coding agents (Claude, Codex, OpenCode)
-3. Injects taskmux usage instructions into agent context files:
-   - Claude: `.claude/rules/taskmux.md`
-   - Codex/OpenCode: `AGENTS.md`
-
-Use `--defaults` to skip prompts (CI/automation).
-
-### Inspect
-
-`taskmux inspect <task>` returns JSON with task state:
-
-```json
-{
-  "name": "api",
-  "command": "python manage.py runserver 0.0.0.0:8000",
-  "auto_start": true,
-  "restart_policy": "on-failure",
-  "log_file": "/home/user/.taskmux/logs/myproject/api.log",
-  "cwd": "apps/api",
-  "health_check": "curl -sf http://localhost:8000/health",
-  "depends_on": ["db"],
-  "running": true,
-  "healthy": true,
-  "pid": "12345",
-  "pane_current_command": "python",
-  "pane_current_path": "/home/user/project/apps/api",
-  "window_id": "@1",
-  "pane_id": "%1"
-}
-```
-
-### Persistent Logs
-
-Task output is automatically piped to timestamped log files at `~/.taskmux/logs/{session}/{task}.log` using tmux's `pipe-pane`. Logs persist after session kill, survive tmux scrollback overflow, and include UTC timestamps on every line:
+Task output is piped to `~/.taskmux/logs/{session}/{task}.log` with UTC timestamps:
 
 ```
 2024-01-01T14:00:00.123 Server started on port 3000
 2024-01-01T14:00:01.456 GET /health 200 2ms
-2024-01-01T14:00:05.789 Connected to database
 ```
 
-**Time-based filtering** with `--since`:
+Logs survive session kill. Rotated at `log_max_size` (default 10MB), keeping `log_max_files` (default 3). Filter with `--since`:
 
 ```bash
-taskmux logs server --since 5m       # last 5 minutes
-taskmux logs --since 1h              # all tasks, last hour
-taskmux logs api --since "2024-01-01T14:00"  # since ISO timestamp
+taskmux logs server --since 5m
+taskmux logs --since 1h
 ```
 
-**Log rotation:** When a log file exceeds `log_max_size` (default 10MB), it rotates: `task.log` → `task.log.1` → `task.log.2`, keeping up to `log_max_files` (default 3) rotated files.
+## Event History
 
-**Cleanup:**
-
-```bash
-taskmux logs-clean               # delete all logs for this session
-taskmux logs-clean server        # delete only server's logs
-```
-
-When log files exist, `taskmux logs` reads from them (full history with timestamps). Falls back to tmux scrollback for tasks started before log persistence was enabled.
-
-### JSON Output
-
-Every command supports `--json` for machine-readable output. This makes taskmux fully programmable by coding agents and scripts.
-
-```bash
-taskmux status --json
-taskmux health --json
-taskmux start server --json
-taskmux logs server --json
-taskmux events --json
-```
-
-**Status:**
-
-```json
-{
-  "session": "myproject",
-  "running": true,
-  "active_tasks": 3,
-  "tasks": [
-    {
-      "name": "server",
-      "running": true,
-      "healthy": true,
-      "command": "npm run dev",
-      "port": 3000,
-      "restart_policy": "on-failure"
-    }
-  ]
-}
-```
-
-**Health:**
-
-```json
-{
-  "healthy_count": 2,
-  "total_count": 3,
-  "tasks": [
-    {"name": "server", "healthy": true},
-    {"name": "worker", "healthy": false}
-  ]
-}
-```
-
-**Action commands** (`start`, `stop`, `restart`, `kill`, `add`, `remove`):
-
-```json
-{"ok": true, "task": "server", "action": "started"}
-```
-
-**Logs** (non-follow):
-
-```json
-{"task": "server", "lines": ["2024-01-01T14:00:00.123 Listening on :3000"]}
-```
-
-**Errors:**
-
-```json
-{"ok": false, "error": "Task 'ghost' not found in config"}
-```
-
-### Event History
-
-Taskmux records lifecycle events to `~/.taskmux/events.jsonl`:
-
-```bash
-taskmux events                    # recent events
-taskmux events --task server      # filter by task
-taskmux events --since 10m        # last 10 minutes
-taskmux events -n 100 --json      # last 100 as JSON
-```
-
-**Recorded events:**
+Lifecycle events at `~/.taskmux/events.jsonl`:
 
 | Event | Trigger |
 |-------|---------|
-| `task_started` | `start` command |
-| `task_stopped` | `stop` command |
-| `task_restarted` | `restart` command |
-| `task_killed` | `kill` command |
-| `session_started` | `start` (all tasks) |
-| `session_stopped` | `stop` (all tasks) |
-| `health_check_failed` | Health check fails (includes attempt count) |
-| `auto_restart` | Auto-restart triggered (includes reason) |
-| `max_restarts_reached` | Task hit max_restarts limit |
-| `config_reloaded` | Config file changed (daemon/watch mode) |
+| `task_started` / `task_stopped` / `task_restarted` / `task_killed` | CLI commands |
+| `session_started` / `session_stopped` | start/stop all |
+| `health_check_failed` | health check fails (includes attempt count) |
+| `auto_restart` | restart triggered (includes reason) |
+| `max_restarts_reached` | hit limit |
+| `config_reloaded` | config file changed |
 
-**Example output:**
+Auto-trims to 10K lines at 15K.
 
+## Hooks
+
+Fire order: global `before_start` → task `before_start` → run → task `after_start` → global `after_start`. Same for stop. `before_*` failure aborts the action.
+
+```toml
+[hooks]
+before_start = "echo starting"
+
+[tasks.api.hooks]
+before_start = "python manage.py migrate"
+after_stop = "echo api stopped"
 ```
-2024-01-01T14:00:00 [server] task_started
-2024-01-01T14:05:00 [server] health_check_failed (attempt=1)
-2024-01-01T14:05:30 [server] health_check_failed (attempt=2)
-2024-01-01T14:06:00 [server] health_check_failed (attempt=3)
-2024-01-01T14:06:00 [server] auto_restart (reason=health_retries_exceeded)
-```
 
-The events file auto-rotates, trimming to 10,000 lines when it exceeds 15,000.
-
-## Monitoring & Auto-restart
-
-### start --monitor (lightweight)
-
-Start tasks and stay in the foreground monitoring health:
+## Daemon & WebSocket API
 
 ```bash
-taskmux start --monitor     # or: taskmux start -m
+taskmux daemon --port 8765
 ```
 
-Checks health every 30 seconds and auto-restarts tasks according to their `restart_policy`. No WebSocket API — just monitoring and restart. Press Ctrl+C to stop monitoring (tasks keep running).
-
-### Daemon Mode (full)
-
-Run as a background daemon with WebSocket API, config watching, and auto-restart:
-
-```bash
-taskmux daemon              # Default port 8765
-taskmux daemon --port 9000  # Custom port
-```
-
-The daemon monitors task health every 30 seconds. Tasks are restarted per their `restart_policy` with exponential backoff (controlled by `restart_backoff` and `max_restarts`). Tasks that stay healthy for 60+ seconds have their restart counter reset. Config file changes are detected and applied automatically.
-
-WebSocket API:
+Health monitoring every 30s, auto-restart per policy, config file watching. WebSocket API:
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8765');
-
 ws.send(JSON.stringify({ command: "status" }));
 ws.send(JSON.stringify({ command: "restart", params: { task: "server" } }));
 ws.send(JSON.stringify({ command: "logs", params: { task: "server", lines: 50 } }));
 ```
 
-## Tmux Integration
+## Tmux
 
-Taskmux creates standard tmux sessions — all tmux commands work:
+Taskmux creates standard tmux sessions:
 
 ```bash
-tmux attach-session -t myproject   # Attach to session
-tmux list-sessions                 # List all sessions
-# Ctrl+b 1/2/3 to switch windows, Ctrl+b d to detach
+tmux attach-session -t myproject   # attach to see live output
+# Ctrl+b 1/2/3 switch windows, Ctrl+b d detach
 ```
+
+## Links
+
+- [PyPI](https://pypi.org/project/taskmux/)
+- [GitHub](https://github.com/nc9/taskmux)
 
 ## License
 
