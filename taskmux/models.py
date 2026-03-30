@@ -1,10 +1,11 @@
 """Pydantic models for Taskmux configuration."""
 
 import re
-import warnings
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+from .errors import ErrorCode, TaskmuxError
 
 _SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
@@ -18,19 +19,22 @@ class RestartPolicy(StrEnum):
 
 
 class _StrictConfig(BaseModel):
-    """Base config: frozen, warns on unknown keys."""
+    """Base config: frozen, rejects unknown keys."""
 
     model_config = ConfigDict(frozen=True)
 
     @model_validator(mode="before")
     @classmethod
-    def _warn_unknown_keys(cls, values: dict) -> dict:
+    def _reject_unknown_keys(cls, values: dict) -> dict:
         if not isinstance(values, dict):
             return values
         known = set(cls.model_fields.keys())
-        unknown = set(values.keys()) - known
-        for key in sorted(unknown):
-            warnings.warn(f"Unknown config key: {key!r}", UserWarning, stacklevel=2)
+        unknown = sorted(set(values.keys()) - known)
+        if unknown:
+            raise TaskmuxError(
+                ErrorCode.CONFIG_UNKNOWN_KEYS,
+                keys=", ".join(repr(k) for k in unknown),
+            )
         return values
 
 
@@ -76,7 +80,10 @@ class TaskConfig(_StrictConfig):
                 break
         if re.match(r"^\d+$", upper):
             return v
-        raise ValueError(f"Invalid size format: {v!r}. Use e.g. '10MB', '500KB', '1GB'")
+        raise TaskmuxError(
+            ErrorCode.CONFIG_VALIDATION,
+            detail=f"Invalid size format: {v!r}. Use e.g. '10MB', '500KB', '1GB'",
+        )
 
 
 class TaskmuxConfig(_StrictConfig):
@@ -94,9 +101,9 @@ class TaskmuxConfig(_StrictConfig):
         for name, cfg in self.tasks.items():
             for dep in cfg.depends_on:
                 if dep not in task_names:
-                    raise ValueError(f"Task '{name}' depends on unknown task '{dep}'")
+                    raise TaskmuxError(ErrorCode.TASK_DEPENDENCY_MISSING, task=name, dep=dep)
                 if dep == name:
-                    raise ValueError(f"Task '{name}' depends on itself")
+                    raise TaskmuxError(ErrorCode.TASK_DEPENDENCY_SELF, task=name)
 
         # Cycle detection via DFS
         WHITE, GRAY, BLACK = 0, 1, 2
@@ -106,7 +113,7 @@ class TaskmuxConfig(_StrictConfig):
             color[node] = GRAY
             for dep in self.tasks[node].depends_on:
                 if color[dep] == GRAY:
-                    raise ValueError(f"Dependency cycle detected involving '{dep}'")
+                    raise TaskmuxError(ErrorCode.TASK_DEPENDENCY_CYCLE, dep=dep)
                 if color[dep] == WHITE:
                     dfs(dep)
             color[node] = BLACK

@@ -17,6 +17,7 @@ import libtmux
 from rich.console import Console
 from rich.markup import escape
 
+from .errors import ErrorCode, TaskmuxError
 from .events import recordEvent
 from .hooks import runHook
 from .models import RestartPolicy, TaskConfig, TaskmuxConfig
@@ -55,7 +56,10 @@ def _parseSince(since_str: str) -> datetime:
         val, unit = int(match.group(1)), match.group(2)
         total_seconds += val * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
     if total_seconds == 0:
-        raise ValueError(f"Cannot parse --since value: {since_str}")
+        raise TaskmuxError(
+            ErrorCode.INVALID_ARGUMENT,
+            detail=f"Cannot parse --since value: {since_str!r}. Use e.g. '5m', '1h', '2d'.",
+        )
     return datetime.now(UTC) - timedelta(seconds=total_seconds)
 
 
@@ -317,7 +321,8 @@ class TmuxManager:
                     queue.append(dep)
 
         if len(result) != len(task_names):
-            raise ValueError("Dependency cycle detected in tasks")
+            remaining = set(task_names) - set(result)
+            raise TaskmuxError(ErrorCode.TASK_DEPENDENCY_CYCLE, dep=", ".join(sorted(remaining)))
 
         return result
 
@@ -333,11 +338,16 @@ class TmuxManager:
             elapsed += interval
         return self.is_task_healthy(task_name)
 
+    def _err(self, code: ErrorCode, **kwargs: str | int) -> dict:
+        """Build an error result dict with code and formatted message."""
+        err = TaskmuxError(code, **kwargs)
+        return {"ok": False, "error_code": code.value, "error": err.message}
+
     def start_task(self, task_name: str) -> dict:
         """Start a single task (create window + send command)."""
         self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
-            return {"ok": False, "error": f"Task '{task_name}' not found in config"}
+            return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         if not self.session_exists():
             # Create empty session first
@@ -353,7 +363,7 @@ class TmuxManager:
         # Check if already running
         existing = sess.windows.get(window_name=task_name, default=None)
         if existing:
-            return {"ok": False, "error": f"Task '{task_name}' already running"}
+            return self._err(ErrorCode.TASK_ALREADY_RUNNING, task=task_name)
 
         # Warn if deps aren't running
         warnings: list[str] = []
@@ -363,9 +373,11 @@ class TmuxManager:
 
         # Hooks: global before_start, then task before_start
         if not runHook(self.config.hooks.before_start, task_name):
-            return {"ok": False, "error": "Global before_start hook failed"}
+            return self._err(ErrorCode.HOOK_FAILED, exit_code="n/a", command="global before_start")
         if not runHook(task_cfg.hooks.before_start, task_name):
-            return {"ok": False, "error": f"Task '{task_name}' before_start hook failed"}
+            return self._err(
+                ErrorCode.HOOK_FAILED, exit_code="n/a", command=f"{task_name} before_start"
+            )
 
         # If session was just created, rename default window instead of creating new
         if len(sess.windows) == 1 and sess.windows[0].window_name != task_name:
@@ -397,15 +409,15 @@ class TmuxManager:
         """Graceful stop with signal escalation: C-c → SIGTERM → SIGKILL."""
         self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
-            return {"ok": False, "error": f"Session '{self.config.name}' doesn't exist"}
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
 
         if task_name not in self.config.tasks:
-            return {"ok": False, "error": f"Task '{task_name}' not found in config"}
+            return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         sess = self._get_session()
         window = sess.windows.get(window_name=task_name, default=None)
         if not window:
-            return {"ok": False, "error": f"Task '{task_name}' not running"}
+            return self._err(ErrorCode.TASK_NOT_RUNNING, task=task_name)
 
         task_cfg = self.config.tasks[task_name]
 
@@ -440,7 +452,7 @@ class TmuxManager:
     def start_all(self) -> dict:
         """Start all auto_start tasks in dependency order."""
         if self.session_exists():
-            return {"ok": False, "error": f"Session '{self.config.name}' already exists"}
+            return self._err(ErrorCode.SESSION_EXISTS, session=self.config.name)
 
         if not self.config.auto_start:
             # Create empty session, no tasks
@@ -455,14 +467,16 @@ class TmuxManager:
 
         auto_tasks = {name: cfg for name, cfg in self.config.tasks.items() if cfg.auto_start}
         if not auto_tasks:
-            return {"ok": False, "error": "No auto-start tasks defined in config"}
+            return self._err(
+                ErrorCode.CONFIG_VALIDATION, detail="No auto-start tasks defined in config"
+            )
 
         # Topological sort for dependency ordering
         sorted_names = self._toposort_tasks(list(auto_tasks.keys()))
 
         # Global before_start
         if not runHook(self.config.hooks.before_start):
-            return {"ok": False, "error": "Global before_start hook failed"}
+            return self._err(ErrorCode.HOOK_FAILED, exit_code="n/a", command="global before_start")
 
         self.session = self.server.new_session(session_name=self.config.name, attach=False)
         sess = self._get_session()
@@ -525,7 +539,7 @@ class TmuxManager:
             self.restart_tracker.mark_manually_stopped(task_name)
 
         if not self.session_exists():
-            return {"ok": False, "error": "No session running"}
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
 
         # Global before_stop
         runHook(self.config.hooks.before_stop)
@@ -587,13 +601,10 @@ class TmuxManager:
         """Restart a specific task with full stop escalation."""
         self.restart_tracker.clear_manually_stopped(task_name)
         if not self.session_exists():
-            return {
-                "ok": False,
-                "error": f"Session '{self.config.name}' doesn't exist. Run 'taskmux start' first.",
-            }
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
 
         if task_name not in self.config.tasks:
-            return {"ok": False, "error": f"Task '{task_name}' not found in config"}
+            return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         sess = self._get_session()
         task_cfg = self.config.tasks[task_name]
@@ -643,11 +654,11 @@ class TmuxManager:
         """Kill a specific task (process group + window)."""
         self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
-            return {"ok": False, "error": f"Session '{self.config.name}' doesn't exist"}
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
 
         window = self._get_session().windows.get(window_name=task_name, default=None)
         if not window:
-            return {"ok": False, "error": f"Task '{task_name}' not found"}
+            return self._err(ErrorCode.TASK_NOT_RUNNING, task=task_name)
 
         pane = window.active_pane
         if pane:
@@ -661,7 +672,7 @@ class TmuxManager:
     def inspect_task(self, task_name: str) -> dict:
         """Return JSON-serializable dict with detailed task state."""
         if task_name not in self.config.tasks:
-            return {"error": f"Task '{task_name}' not found in config"}
+            return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         task_cfg = self.config.tasks[task_name]
         info: dict = {
@@ -844,8 +855,7 @@ class TmuxManager:
             return
 
         if task_name not in self.config.tasks:
-            print(f"Task '{task_name}' not found in config")
-            return
+            raise TaskmuxError(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         # Prefer persistent log file
         log_path = self.getLogPath(task_name)
@@ -861,14 +871,12 @@ class TmuxManager:
 
         # Fallback to capture-pane
         if not self.session_exists():
-            print(f"Session '{self.config.name}' doesn't exist")
-            return
+            raise TaskmuxError(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
 
         sess = self._get_session()
         window = sess.windows.get(window_name=task_name, default=None)
         if not window:
-            print(f"Task '{task_name}' not found")
-            return
+            raise TaskmuxError(ErrorCode.TASK_NOT_RUNNING, task=task_name)
 
         if follow:
             panes = self._collect_panes([task_name])

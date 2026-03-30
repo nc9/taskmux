@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from typing import List, Optional  # noqa: UP035
 
 import typer
@@ -10,9 +11,10 @@ from rich.table import Table
 
 from .config import addTask, loadConfig, removeTask
 from .daemon import SimpleConfigWatcher, TaskmuxDaemon
+from .errors import TaskmuxError
 from .init import initProject
 from .models import TaskmuxConfig
-from .output import is_json_mode, print_result, set_json_mode
+from .output import is_json_mode, print_error, print_result, set_json_mode
 from .tmux_manager import TmuxManager
 
 app = typer.Typer(
@@ -26,6 +28,7 @@ app = typer.Typer(
     ),
     epilog="Docs: https://github.com/nc9/taskmux",
     rich_markup_mode="rich",
+    no_args_is_help=True,
 )
 
 console = Console()
@@ -34,7 +37,10 @@ console = Console()
 def _print_result_human(result: dict) -> None:
     """Print a TmuxManager result dict in human-readable format."""
     if not result.get("ok"):
-        console.print(result.get("error", "Unknown error"), style="red")
+        code = result.get("error_code", "")
+        msg = result.get("error", "Unknown error")
+        prefix = f"[{code}] " if code else ""
+        console.print(f"Error: {prefix}{msg}", style="red")
         return
     action = result.get("action", "")
     if "task" in result:
@@ -85,10 +91,26 @@ class TaskmuxCLI:
                     self.tmux.restart_task(task_name)
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        from importlib.metadata import version
+
+        typer.echo(f"taskmux {version('taskmux')}")
+        raise typer.Exit()
+
+
 @app.callback()
 def main_callback(
     json_output: bool = typer.Option(  # noqa: B008
         False, "--json", help="Output as JSON for programmatic use"
+    ),
+    version: bool = typer.Option(  # noqa: B008
+        False,
+        "--version",
+        "-V",
+        help="Show version and exit",
+        callback=_version_callback,
+        is_eager=True,
     ),
 ):
     """Taskmux CLI."""
@@ -497,8 +519,20 @@ def daemon(
 
 
 def main():
-    """Main entry point for the CLI."""
-    app()
+    """Main entry point for the CLI — global exception boundary."""
+    try:
+        app()
+    except TaskmuxError as e:
+        print_error(e)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        from .errors import ErrorCode
+
+        err = TaskmuxError(ErrorCode.INTERNAL, detail=str(e))
+        print_error(err)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

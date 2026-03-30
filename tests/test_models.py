@@ -1,10 +1,9 @@
 """Tests for pydantic models."""
 
-import warnings
-
 import pytest
 from pydantic import ValidationError
 
+from taskmux.errors import ErrorCode, TaskmuxError
 from taskmux.models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
 
 
@@ -27,11 +26,10 @@ class TestHookConfig:
         with pytest.raises(ValidationError):
             h.before_start = "echo bye"
 
-    def test_unknown_key_warns(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            HookConfig(bogus="val")
-            assert any("bogus" in str(warning.message) for warning in w)
+    def test_unknown_key_raises(self):
+        with pytest.raises(TaskmuxError, match="bogus") as exc_info:
+            HookConfig(bogus="val")  # type: ignore[call-arg]
+        assert exc_info.value.code == ErrorCode.CONFIG_UNKNOWN_KEYS
 
 
 class TestRestartPolicy:
@@ -120,11 +118,10 @@ class TestTaskConfig:
         with pytest.raises(ValidationError):
             t.command = "echo bye"
 
-    def test_unknown_key_warns(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            TaskConfig(command="echo hi", bogus="val")
-            assert any("bogus" in str(warning.message) for warning in w)
+    def test_unknown_key_raises(self):
+        with pytest.raises(TaskmuxError, match="bogus") as exc_info:
+            TaskConfig(command="echo hi", bogus="val")  # type: ignore[call-arg]
+        assert exc_info.value.code == ErrorCode.CONFIG_UNKNOWN_KEYS
 
 
 class TestTaskmuxConfig:
@@ -157,28 +154,30 @@ class TestTaskmuxConfig:
         with pytest.raises(ValidationError):
             c.name = "changed"
 
-    def test_unknown_key_warns(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            TaskmuxConfig(name="x", mystery=42)
-            assert any("mystery" in str(warning.message) for warning in w)
+    def test_unknown_key_raises(self):
+        with pytest.raises(TaskmuxError, match="mystery") as exc_info:
+            TaskmuxConfig(name="x", mystery=42)  # type: ignore[call-arg]
+        assert exc_info.value.code == ErrorCode.CONFIG_UNKNOWN_KEYS
 
     def test_depends_on_unknown_task(self):
-        with pytest.raises(ValidationError, match="unknown task"):
+        with pytest.raises(TaskmuxError) as exc_info:
             TaskmuxConfig(tasks={"a": TaskConfig(command="echo a", depends_on=["nonexistent"])})
+        assert exc_info.value.code == ErrorCode.TASK_DEPENDENCY_MISSING
 
     def test_depends_on_self(self):
-        with pytest.raises(ValidationError, match="depends on itself"):
+        with pytest.raises(TaskmuxError) as exc_info:
             TaskmuxConfig(tasks={"a": TaskConfig(command="echo a", depends_on=["a"])})
+        assert exc_info.value.code == ErrorCode.TASK_DEPENDENCY_SELF
 
     def test_depends_on_cycle(self):
-        with pytest.raises(ValidationError, match="cycle"):
+        with pytest.raises(TaskmuxError) as exc_info:
             TaskmuxConfig(
                 tasks={
                     "a": TaskConfig(command="echo a", depends_on=["b"]),
                     "b": TaskConfig(command="echo b", depends_on=["a"]),
                 }
             )
+        assert exc_info.value.code == ErrorCode.TASK_DEPENDENCY_CYCLE
 
     def test_depends_on_valid(self):
         c = TaskmuxConfig(
@@ -192,7 +191,7 @@ class TestTaskmuxConfig:
         assert c.tasks["web"].depends_on == ["api"]
 
     def test_depends_on_three_node_cycle(self):
-        with pytest.raises(ValidationError, match="cycle"):
+        with pytest.raises(TaskmuxError) as exc_info:
             TaskmuxConfig(
                 tasks={
                     "a": TaskConfig(command="echo a", depends_on=["c"]),
@@ -200,3 +199,4 @@ class TestTaskmuxConfig:
                     "c": TaskConfig(command="echo c", depends_on=["b"]),
                 }
             )
+        assert exc_info.value.code == ErrorCode.TASK_DEPENDENCY_CYCLE

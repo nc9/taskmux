@@ -1,11 +1,12 @@
 """Functional TOML configuration management for Taskmux."""
 
-import sys
 import tomllib
 from pathlib import Path
 
 import tomlkit
+from pydantic import ValidationError
 
+from .errors import ErrorCode, TaskmuxError
 from .models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
 
 CONFIG_FILENAME = "taskmux.toml"
@@ -33,8 +34,7 @@ def loadConfig(path: Path | None = None) -> TaskmuxConfig:
         with open(p, "rb") as f:
             raw = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
-        print(f"Error: Invalid TOML in {p}: {e}")
-        sys.exit(1)
+        raise TaskmuxError(ErrorCode.CONFIG_PARSE_ERROR, path=str(p), detail=str(e)) from e
 
     # Parse global hooks
     global_hooks = raw.pop("hooks", {})
@@ -53,14 +53,24 @@ def loadConfig(path: Path | None = None) -> TaskmuxConfig:
                 task_dict["hooks"] = _parseHooks(task_hooks)
             tasks[name] = task_dict
         else:
-            print(f"Error: invalid task definition for '{name}'")
-            sys.exit(1)
+            raise TaskmuxError(
+                ErrorCode.CONFIG_INVALID_TASK,
+                task=name,
+                detail=f"expected string or table, got {type(val).__name__}",
+            )
     raw["tasks"] = tasks
 
     if global_hooks:
         raw["hooks"] = _parseHooks(global_hooks)
 
-    return TaskmuxConfig(**raw)
+    try:
+        return TaskmuxConfig(**raw)
+    except TaskmuxError:
+        raise
+    except ValidationError as e:
+        # Convert pydantic errors to friendly message
+        msgs = "; ".join(err["msg"] for err in e.errors())
+        raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=msgs) from e
 
 
 def _writeHooksTable(hooks: HookConfig) -> tomlkit.items.Table | None:  # type: ignore[name-defined]
