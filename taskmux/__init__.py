@@ -1,6 +1,6 @@
 """Taskmux - Modern tmux development environment manager."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0.dev0"
 __author__ = "Taskmux Contributors"
 
 from .config import addTask, loadConfig, removeTask, writeConfig
