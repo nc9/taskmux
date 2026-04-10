@@ -588,56 +588,160 @@ def watch():
     watcher.watch_config()
 
 
-@app.command()
+daemon_app = typer.Typer(
+    name="daemon",
+    help=(
+        "Daemon lifecycle: start, stop, status, restart.\n\n"
+        "Bare 'taskmux daemon' runs a foreground daemon (WS API + health monitor + "
+        "config watcher). Use 'daemon start' to spawn detached."
+    ),
+    no_args_is_help=False,
+    invoke_without_command=True,
+)
+
+
+@daemon_app.callback()
 def daemon(
+    ctx: typer.Context,
     port: int = typer.Option(8765, "--port", help="WebSocket API port"),
-    stop: bool = typer.Option(False, "--stop", help="Stop a running daemon"),  # noqa: B008
-    status: bool = typer.Option(False, "--status", help="Print daemon status"),  # noqa: B008
 ):
-    """Run in daemon mode with WebSocket API and health monitoring.
+    """Run a foreground daemon when no subcommand is given.
 
     Monitors task health every 30s and auto-restarts per restart_policy with
     exponential backoff. Watches config for changes. Exposes a WebSocket API
-    for status, restart, kill, and logs commands. Use --stop to terminate a
-    running daemon, --status to query without starting one.
+    for status, restart, kill, and logs commands.
     """
+    if ctx.invoked_subcommand is not None:
+        return
+    d = TaskmuxDaemon(api_port=port)
+    asyncio.run(d.start())
+
+
+def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until pid is no longer running or timeout elapses. Returns True if exited."""
+    import os
+    import time as _t
+
+    deadline = _t.monotonic() + timeout
+    while _t.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        _t.sleep(0.1)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return False
+
+
+@daemon_app.command("start")
+def daemon_start(
+    port: int = typer.Option(8765, "--port", help="WebSocket API port"),  # noqa: ARG001
+):
+    """Spawn a detached background daemon.
+
+    No-op if a daemon is already running. Logs go to ~/.taskmux/daemon.log.
+    """
+    existing = get_daemon_pid()
+    if existing is not None:
+        if is_json_mode():
+            print_result({"ok": True, "pid": existing, "action": "already_running"})
+        else:
+            console.print(f"Daemon already running (pid {existing})")
+        return
+    pid = _spawn_detached_daemon()
+    if pid is None:
+        if is_json_mode():
+            print_result({"ok": False, "error": "failed to start daemon"})
+        else:
+            console.print("Daemon failed to start", style="red")
+        return
+    if is_json_mode():
+        print_result({"ok": True, "pid": pid, "action": "started"})
+    else:
+        console.print(f"Daemon started (pid {pid})")
+
+
+@daemon_app.command("stop")
+def daemon_stop():
+    """Send SIGTERM to a running daemon."""
     import os
     import signal as _sig
 
-    if status or stop:
-        pid = get_daemon_pid()
-        if stop:
-            if pid is None:
-                if is_json_mode():
-                    print_result({"ok": False, "error": "daemon not running"})
-                else:
-                    console.print("Daemon not running")
-                return
-            try:
-                os.kill(pid, _sig.SIGTERM)
-            except OSError as e:
-                if is_json_mode():
-                    print_result({"ok": False, "error": str(e)})
-                else:
-                    console.print(f"Failed to signal daemon: {e}", style="red")
-                return
-            if is_json_mode():
-                print_result({"ok": True, "pid": pid, "action": "stopped"})
-            else:
-                console.print(f"Sent SIGTERM to daemon (pid {pid})")
-            return
-        # status branch
+    pid = get_daemon_pid()
+    if pid is None:
         if is_json_mode():
-            print_result({"running": pid is not None, "pid": pid})
+            print_result({"ok": False, "error": "daemon not running"})
         else:
-            if pid is not None:
-                console.print(f"Daemon running (pid {pid})")
-            else:
-                console.print("Daemon not running")
+            console.print("Daemon not running")
         return
+    try:
+        os.kill(pid, _sig.SIGTERM)
+    except OSError as e:
+        if is_json_mode():
+            print_result({"ok": False, "error": str(e)})
+        else:
+            console.print(f"Failed to signal daemon: {e}", style="red")
+        return
+    if is_json_mode():
+        print_result({"ok": True, "pid": pid, "action": "stopped"})
+    else:
+        console.print(f"Sent SIGTERM to daemon (pid {pid})")
 
-    d = TaskmuxDaemon(api_port=port)
-    asyncio.run(d.start())
+
+@daemon_app.command("status")
+def daemon_status():
+    """Print daemon status (running + pid)."""
+    pid = get_daemon_pid()
+    if is_json_mode():
+        print_result({"running": pid is not None, "pid": pid})
+    else:
+        if pid is not None:
+            console.print(f"Daemon running (pid {pid})")
+        else:
+            console.print("Daemon not running")
+
+
+@daemon_app.command("restart")
+def daemon_restart(
+    port: int = typer.Option(8765, "--port", help="WebSocket API port"),  # noqa: ARG001
+):
+    """Stop the running daemon (if any) and start a fresh detached one."""
+    import os
+    import signal as _sig
+
+    pid = get_daemon_pid()
+    if pid is not None:
+        try:
+            os.kill(pid, _sig.SIGTERM)
+        except OSError as e:
+            if is_json_mode():
+                print_result({"ok": False, "error": f"failed to stop: {e}"})
+            else:
+                console.print(f"Failed to stop daemon: {e}", style="red")
+            return
+        if not _wait_for_pid_exit(pid, timeout=5.0):
+            if is_json_mode():
+                print_result({"ok": False, "error": f"daemon pid {pid} did not exit"})
+            else:
+                console.print(f"Daemon pid {pid} did not exit within 5s", style="red")
+            return
+    new_pid = _spawn_detached_daemon()
+    if new_pid is None:
+        if is_json_mode():
+            print_result({"ok": False, "error": "failed to start daemon"})
+        else:
+            console.print("Daemon failed to start", style="red")
+        return
+    if is_json_mode():
+        print_result({"ok": True, "pid": new_pid, "action": "restarted", "old_pid": pid})
+    else:
+        console.print(f"Daemon restarted (pid {new_pid})")
+
+
+app.add_typer(daemon_app)
 
 
 def main():
