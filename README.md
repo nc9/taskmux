@@ -240,9 +240,18 @@ Auto-restart only fires when a daemon (or `start --monitor`) is running.
 ```bash
 taskmux start -d        # start tasks AND spawn detached daemon
 taskmux daemon          # foreground daemon (Ctrl+C to stop)
-taskmux daemon --status # is one running?
-taskmux daemon --stop   # SIGTERM the running daemon
 ```
+
+### Lifecycle
+
+```bash
+taskmux daemon start     # spawn detached daemon (no-op if running)
+taskmux daemon stop      # SIGTERM the running daemon
+taskmux daemon status    # running + pid
+taskmux daemon restart   # stop, wait for exit, respawn
+```
+
+All four accept `--json` (global flag) for scripting. `start` and `restart` take `--port`. Logs go to `~/.taskmux/daemon.log`.
 
 `taskmux status` shows `Auto-restart: active (pid …)` when a daemon is detected, otherwise `Auto-restart: inactive` so you don't silently miss restarts. Set `auto_daemon = true` at the top of `taskmux.toml` to spawn one on every `taskmux start`.
 
