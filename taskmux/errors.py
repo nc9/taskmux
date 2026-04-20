@@ -27,6 +27,8 @@ class ErrorCode(StrEnum):
     # Session errors (E3xx)
     SESSION_NOT_FOUND = "E300"
     SESSION_EXISTS = "E301"
+    SESSION_ALREADY_REGISTERED = "E302"
+    SESSION_NOT_REGISTERED = "E303"
 
     # Hook errors (E4xx)
     HOOK_FAILED = "E400"
@@ -56,6 +58,11 @@ MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.TASK_DEPENDENCY_CYCLE: "Dependency cycle detected involving '{dep}'",
     ErrorCode.SESSION_NOT_FOUND: "Session '{session}' doesn't exist. Run 'taskmux start' first.",
     ErrorCode.SESSION_EXISTS: "Session '{session}' already exists",
+    ErrorCode.SESSION_ALREADY_REGISTERED: (
+        "Session '{session}' already registered from {existing_path}; "
+        "refusing to bind to {new_path}"
+    ),
+    ErrorCode.SESSION_NOT_REGISTERED: "Session '{session}' is not registered with the daemon",
     ErrorCode.HOOK_FAILED: "Hook failed (exit {exit_code}): {command}",
     ErrorCode.HOOK_TIMEOUT: "Hook timed out ({timeout}s): {command}",
     ErrorCode.INVALID_ARGUMENT: "Invalid argument: {detail}",
