@@ -1,8 +1,10 @@
 """Typer-based CLI interface for Taskmux."""
 
 import asyncio
+import contextlib
 import json
 import sys
+from pathlib import Path
 from typing import List, Optional  # noqa: UP035
 
 import typer
@@ -11,7 +13,6 @@ from rich.table import Table
 
 from .config import addTask, loadConfig, removeTask
 from .daemon import (
-    DAEMON_PID_PATH,
     SimpleConfigWatcher,
     TaskmuxDaemon,
     get_daemon_pid,
@@ -20,6 +21,13 @@ from .errors import TaskmuxError
 from .init import initProject
 from .models import TaskmuxConfig
 from .output import is_json_mode, print_error, print_result, set_json_mode
+from .paths import ensureTaskmuxDir, globalDaemonLogPath
+from .paths import migrate as migrateLayout
+from .registry import (
+    listRegistered,
+    registerProject,
+    unregisterProject,
+)
 from .tmux_manager import TmuxManager
 
 app = typer.Typer(
@@ -78,11 +86,17 @@ def _handle_results(results: list[dict]) -> None:
 
 
 class TaskmuxCLI:
-    """Main CLI application class."""
+    """Main CLI application class. Optionally bound to a specific config path."""
 
-    def __init__(self):
-        self.config: TaskmuxConfig = loadConfig()
+    def __init__(self, config_path: Path | None = None):
+        self.config_path: Path = (config_path or Path("taskmux.toml")).expanduser().resolve()
+        self.config: TaskmuxConfig = loadConfig(self.config_path)
         self.tmux = TmuxManager(self.config)
+
+    def reload_config(self) -> None:
+        """Reload config from self.config_path and rebind tmux manager."""
+        self.config = loadConfig(self.config_path)
+        self.tmux.config = self.config
 
     def handle_config_reload(self):
         """Handle config file reload in daemon mode"""
@@ -144,25 +158,31 @@ def init(
         )
 
 
-def _spawn_detached_daemon() -> int | None:
-    """Fork taskmux daemon as a detached background process. Returns child pid."""
+def _spawn_detached_daemon(port: int | None = None) -> int | None:
+    """Fork the global taskmux daemon as a detached background process.
+
+    When `port` is given, it's forwarded as `--port <port>` so the spawned
+    process binds the requested port; otherwise the daemon resolves it from
+    `~/.taskmux/config.toml`.
+    """
     import subprocess
 
     existing = get_daemon_pid()
     if existing is not None:
         return existing
-    log_path = DAEMON_PID_PATH.parent / "daemon.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(log_path, "ab")  # noqa: SIM115
+    ensureTaskmuxDir()
+    log_fh = open(globalDaemonLogPath(), "ab")  # noqa: SIM115
+    cmd = [sys.executable, "-m", "taskmux", "daemon"]
+    if port is not None:
+        cmd += ["--port", str(port)]
     proc = subprocess.Popen(
-        [sys.executable, "-m", "taskmux", "daemon"],
+        cmd,
         stdout=log_fh,
         stderr=log_fh,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
     )
-    # Give the daemon a moment to write its pid file
     for _ in range(20):
         if get_daemon_pid() is not None:
             break
@@ -170,6 +190,22 @@ def _spawn_detached_daemon() -> int | None:
 
         _t.sleep(0.1)
     return proc.pid
+
+
+def _autoRegisterCwd() -> None:
+    """Best-effort auto-register of the cwd's project. Swallows collisions."""
+    cfg_path = Path("taskmux.toml")
+    if not cfg_path.exists():
+        return
+    try:
+        cli_local = TaskmuxCLI(config_path=cfg_path)
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        registerProject(cli_local.config.name, cli_local.config_path)
+    except TaskmuxError as e:
+        if not is_json_mode():
+            console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
 
 
 @app.command()
@@ -199,6 +235,13 @@ def start(
     else:
         result = cli.tmux.start_all()
         _handle_result(result)
+
+    # Auto-register cwd project with the registry (idempotent, swallows collisions).
+    try:
+        registerProject(cli.config.name, cli.config_path)
+    except TaskmuxError as e:
+        if not is_json_mode():
+            console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
 
     if daemon or cli.config.auto_daemon:
         pid = _spawn_detached_daemon()
@@ -315,13 +358,14 @@ def logs_clean(
 ):
     """Delete persistent log files.
 
-    Removes log files from ~/.taskmux/logs/. Specify a task name to clean only
-    that task's logs, or omit to clean all logs for the current session.
+    Removes log files from ~/.taskmux/projects/{session}/logs/. Specify a task
+    name to clean only that task's logs, or omit to clean all logs for the
+    current session.
     """
-    from pathlib import Path
+    from .paths import projectLogsDir
 
     cli = TaskmuxCLI()
-    log_dir = Path.home() / ".taskmux" / "logs" / cli.config.name
+    log_dir = projectLogsDir(cli.config.name)
 
     if not log_dir.exists():
         if is_json_mode():
@@ -603,13 +647,14 @@ daemon_app = typer.Typer(
 @daemon_app.callback()
 def daemon(
     ctx: typer.Context,
-    port: int = typer.Option(8765, "--port", help="WebSocket API port"),
+    port: int | None = typer.Option(  # noqa: B008
+        None, "--port", help="WebSocket API port (overrides ~/.taskmux/config.toml)"
+    ),
 ):
     """Run a foreground daemon when no subcommand is given.
 
-    Monitors task health every 30s and auto-restarts per restart_policy with
-    exponential backoff. Watches config for changes. Exposes a WebSocket API
-    for status, restart, kill, and logs commands.
+    Health-check cadence and default API port come from ~/.taskmux/config.toml
+    (see `taskmux config show`). `--port` overrides the config value.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -638,20 +683,25 @@ def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
 
 @daemon_app.command("start")
 def daemon_start(
-    port: int = typer.Option(8765, "--port", help="WebSocket API port"),  # noqa: ARG001
+    port: int | None = typer.Option(  # noqa: B008
+        None, "--port", help="WebSocket API port (overrides ~/.taskmux/config.toml)"
+    ),
 ):
-    """Spawn a detached background daemon.
+    """Spawn the global detached daemon (idempotent).
 
-    No-op if a daemon is already running. Logs go to ~/.taskmux/daemon.log.
+    Auto-registers cwd's project if a `taskmux.toml` is present. Logs go to
+    `~/.taskmux/daemon.log`.
     """
     existing = get_daemon_pid()
     if existing is not None:
+        _autoRegisterCwd()
         if is_json_mode():
             print_result({"ok": True, "pid": existing, "action": "already_running"})
         else:
             console.print(f"Daemon already running (pid {existing})")
         return
-    pid = _spawn_detached_daemon()
+    _autoRegisterCwd()
+    pid = _spawn_detached_daemon(port=port)
     if pid is None:
         if is_json_mode():
             print_result({"ok": False, "error": "failed to start daemon"})
@@ -666,7 +716,7 @@ def daemon_start(
 
 @daemon_app.command("stop")
 def daemon_stop():
-    """Send SIGTERM to a running daemon."""
+    """SIGTERM the global daemon."""
     import os
     import signal as _sig
 
@@ -675,7 +725,7 @@ def daemon_stop():
         if is_json_mode():
             print_result({"ok": False, "error": "daemon not running"})
         else:
-            console.print("Daemon not running")
+            console.print("No daemon running")
         return
     try:
         os.kill(pid, _sig.SIGTERM)
@@ -693,22 +743,27 @@ def daemon_stop():
 
 @daemon_app.command("status")
 def daemon_status():
-    """Print daemon status (running + pid)."""
+    """Show daemon status + count of registered projects."""
     pid = get_daemon_pid()
+    entries = listRegistered()
     if is_json_mode():
-        print_result({"running": pid is not None, "pid": pid})
+        print_result(
+            {"running": pid is not None, "pid": pid, "registered_projects": len(entries)}
+        )
+        return
+    if pid is not None:
+        console.print(f"Daemon running (pid {pid}) — {len(entries)} project(s) registered")
     else:
-        if pid is not None:
-            console.print(f"Daemon running (pid {pid})")
-        else:
-            console.print("Daemon not running")
+        console.print(f"No daemon running — {len(entries)} project(s) registered")
 
 
 @daemon_app.command("restart")
 def daemon_restart(
-    port: int = typer.Option(8765, "--port", help="WebSocket API port"),  # noqa: ARG001
+    port: int | None = typer.Option(  # noqa: B008
+        None, "--port", help="WebSocket API port (overrides ~/.taskmux/config.toml)"
+    ),
 ):
-    """Stop the running daemon (if any) and start a fresh detached one."""
+    """Stop the global daemon (if any) and spawn a fresh one."""
     import os
     import signal as _sig
 
@@ -728,7 +783,7 @@ def daemon_restart(
             else:
                 console.print(f"Daemon pid {pid} did not exit within 5s", style="red")
             return
-    new_pid = _spawn_detached_daemon()
+    new_pid = _spawn_detached_daemon(port=port)
     if new_pid is None:
         if is_json_mode():
             print_result({"ok": False, "error": "failed to start daemon"})
@@ -741,11 +796,219 @@ def daemon_restart(
         console.print(f"Daemon restarted (pid {new_pid})")
 
 
+@daemon_app.command("list")
+def daemon_list(
+    port: int | None = typer.Option(  # noqa: B008
+        None, "--port", help="Daemon WS port (default: ~/.taskmux/config.toml)"
+    ),
+):
+    """List all registered projects + live daemon view (if running)."""
+    from .global_config import loadGlobalConfig
+
+    pid = get_daemon_pid()
+    registered = listRegistered()
+    live: dict[str, dict] = {}
+
+    if pid is not None and registered:
+        live_port = port if port is not None else loadGlobalConfig().api_port
+        live = _query_live_projects(port=live_port)
+
+    if is_json_mode():
+        out = []
+        for entry in registered:
+            row = {
+                "session": entry["session"],
+                "config_path": entry["config_path"],
+                "registered_at": entry["registered_at"],
+            }
+            row.update(live.get(entry["session"], {}))
+            out.append(row)
+        print_result({"projects": out, "daemon_pid": pid, "count": len(out)})
+        return
+
+    if not registered:
+        console.print("No projects registered. Run `taskmux start` in a project to auto-register.")
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Session")
+    table.add_column("State", justify="left")
+    table.add_column("Tmux", justify="left")
+    table.add_column("Tasks", justify="right")
+    table.add_column("Config")
+    for entry in registered:
+        info = live.get(entry["session"], {})
+        state = info.get("state", "[dim]unmanaged[/dim]" if pid is None else "ok")
+        tmux_state = (
+            "[green]up[/green]" if info.get("session_exists") else "[dim]down[/dim]"
+        )
+        task_count = info.get("task_count", "?")
+        table.add_row(
+            entry["session"],
+            str(state),
+            tmux_state,
+            str(task_count),
+            entry["config_path"],
+        )
+    console.print(table)
+    if pid is None:
+        console.print(
+            "[yellow]Daemon not running. Start with `taskmux daemon start` for live state.[/yellow]"
+        )
+
+
+@daemon_app.command("register")
+def daemon_register(
+    config: str | None = typer.Option(  # noqa: B008
+        None, "--config", "-c", help="Path to taskmux.toml (default: cwd)"
+    ),
+):
+    """Add a project to the registry. Daemon (if running) picks it up live."""
+    cfg_path = Path(config).expanduser() if config else Path("taskmux.toml")
+    if not cfg_path.exists():
+        if is_json_mode():
+            print_result({"ok": False, "error": f"config not found: {cfg_path}"})
+        else:
+            console.print(f"Config not found: {cfg_path}", style="red")
+        sys.exit(1)
+    cli_local = TaskmuxCLI(config_path=cfg_path)
+    entry = registerProject(cli_local.config.name, cli_local.config_path)
+    if is_json_mode():
+        print_result({"ok": True, "action": "registered", "entry": dict(entry)})
+    else:
+        console.print(
+            f"Registered '{entry['session']}' → {entry['config_path']}", style="green"
+        )
+
+
+@daemon_app.command("unregister")
+def daemon_unregister(
+    session: str = typer.Argument(..., help="Session name to remove"),
+):
+    """Remove a project from the registry. Daemon picks it up live."""
+    removed = unregisterProject(session)
+    if not removed:
+        if is_json_mode():
+            print_result({"ok": False, "error": "session_not_registered", "session": session})
+        else:
+            console.print(f"Session '{session}' not in registry", style="yellow")
+        sys.exit(1)
+    if is_json_mode():
+        print_result({"ok": True, "action": "unregistered", "session": session})
+    else:
+        console.print(f"Unregistered '{session}'", style="green")
+
+
+def _query_live_projects(port: int = 8765, timeout: float = 1.0) -> dict[str, dict]:
+    """Best-effort WS query of the live daemon. Returns {} on any failure."""
+    try:
+        import websockets
+    except ImportError:
+        return {}
+
+    async def _go() -> dict[str, dict]:
+        try:
+            async with websockets.connect(
+                f"ws://localhost:{port}", open_timeout=timeout, close_timeout=timeout
+            ) as ws:
+                await ws.send(json.dumps({"command": "list_projects"}))
+                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                resp = json.loads(raw)
+                projects = resp.get("projects", [])
+                return {p["session"]: p for p in projects}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    try:
+        return asyncio.run(_go())
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 app.add_typer(daemon_app)
+
+
+# ---------------------------------------------------------------------------
+# Global config sub-app
+# ---------------------------------------------------------------------------
+
+config_app = typer.Typer(
+    name="config",
+    help="Inspect and edit ~/.taskmux/config.toml (host-wide settings).",
+    no_args_is_help=True,
+)
+
+
+@config_app.command("show")
+def config_show():
+    """Print the resolved global config (defaults + overrides)."""
+    from .global_config import loadGlobalConfig
+    from .paths import globalConfigPath
+
+    cfg = loadGlobalConfig()
+    path = globalConfigPath()
+    data = cfg.model_dump()
+    if is_json_mode():
+        print_result({"path": str(path), "exists": path.exists(), "config": data})
+        return
+    suffix = "" if path.exists() else " [dim](does not exist — using defaults)[/dim]"
+    console.print(f"Config: {path}{suffix}")
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Key")
+    table.add_column("Value", justify="right")
+    for k, v in data.items():
+        table.add_row(k, str(v))
+    console.print(table)
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Config key, e.g. health_check_interval"),
+    value: str = typer.Argument(..., help="New value (parsed as int/bool/string)"),
+):
+    """Set a global config key. Coerces value to int/bool when possible."""
+    from .errors import ErrorCode
+    from .global_config import GlobalConfig, updateGlobalConfig
+
+    if key not in GlobalConfig.model_fields:
+        valid = ", ".join(sorted(GlobalConfig.model_fields))
+        raise TaskmuxError(
+            ErrorCode.CONFIG_VALIDATION,
+            detail=f"unknown config key '{key}' (valid: {valid})",
+        )
+
+    parsed: object = value
+    if value.lower() in {"true", "false"}:
+        parsed = value.lower() == "true"
+    else:
+        with contextlib.suppress(ValueError):
+            parsed = int(value)
+    new = updateGlobalConfig({key: parsed})
+    if is_json_mode():
+        print_result({"ok": True, "key": key, "value": getattr(new, key, parsed)})
+    else:
+        console.print(f"Set {key} = {getattr(new, key, parsed)}", style="green")
+
+
+@config_app.command("path")
+def config_path():
+    """Print the path to the global config file."""
+    from .paths import globalConfigPath
+
+    p = globalConfigPath()
+    if is_json_mode():
+        print_result({"path": str(p), "exists": p.exists()})
+    else:
+        console.print(str(p))
+
+
+app.add_typer(config_app)
 
 
 def main():
     """Main entry point for the CLI — global exception boundary."""
+    with contextlib.suppress(Exception):
+        migrateLayout()
     try:
         app()
     except TaskmuxError as e:
