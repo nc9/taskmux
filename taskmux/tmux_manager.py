@@ -43,7 +43,9 @@ def _logPath(session_name: str, task_name: str, task_cfg: TaskConfig) -> Path:
     """Resolve log file path for a task."""
     if task_cfg.log_file:
         return Path(task_cfg.log_file).expanduser()
-    return Path.home() / ".taskmux" / "logs" / session_name / f"{task_name}.log"
+    from .paths import taskLogPath
+
+    return taskLogPath(session_name, task_name)
 
 
 def _parseSince(since_str: str) -> datetime:
