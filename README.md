@@ -2,6 +2,8 @@
 
 Tmux session manager for development environments. Define tasks in `taskmux.toml`, start them in dependency order, monitor health, auto-restart on failure, read persistent timestamped logs. Every command supports `--json` for agents and scripts.
 
+Designed to pair well with coding agents like Claude Code, Codex, and OpenCode — `taskmux init` injects usage instructions into their context files, and the JSON output + WebSocket API give agents a clean, machine-readable surface for managing dev environments.
+
 ## Features
 
 - **Task orchestration** — start/stop/restart tasks with dependency ordering and signal escalation
@@ -254,7 +256,9 @@ taskmux daemon register [-c PATH] # add cwd's (or PATH's) project to the registr
 taskmux daemon unregister NAME    # remove a project from the registry
 ```
 
-`start`/`restart` take `--port`. All commands accept `--json` (global flag). Daemon log: `~/.taskmux/daemon.log`.
+`start`, `restart`, and `list` take `--port` to override the configured `api_port`; when omitted they fall back to `~/.taskmux/config.toml`. All commands accept `--json` (global flag). Daemon log: `~/.taskmux/daemon.log`.
+
+Each project carries a `state`: `ok` while loaded, `config_missing` if its `taskmux.toml` is absent or was deleted (entry stays in the registry, health checks pause), `error` if loading the config raised. Surfaced in `daemon list` and the `list_projects` WS command.
 
 ### WebSocket API
 
@@ -283,11 +287,11 @@ api_port              = 8765 # WebSocket API port
 
 ```bash
 taskmux config show              # resolved view (defaults + overrides)
-taskmux config set <key> <value> # writes the file (creates if absent)
+taskmux config set <key> <value> # writes the file (creates if absent); rejects unknown keys
 taskmux config path              # print path
 ```
 
-Daemon reads the file at startup. To pick up changes, `taskmux daemon restart`.
+`config set` validates keys against the schema and rejects unknown ones with `E104` rather than silently dropping them. Daemon reads the file at startup. To pick up changes, `taskmux daemon restart`.
 
 ### Filesystem layout
 
