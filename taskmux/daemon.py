@@ -210,7 +210,7 @@ class TaskmuxDaemon:
         self.observers: dict[str, Observer] = {}  # type: ignore[reportInvalidTypeForm]
         self.registry_observer: Observer | None = None  # type: ignore[reportInvalidTypeForm]
         self.project_states: dict[str, str] = {}  # session -> "ok" | "config_missing" | "error"
-        self.project_paths: dict[str, str] = {}   # session -> abs config_path
+        self.project_paths: dict[str, str] = {}  # session -> abs config_path
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self.logger = self._setup_logging()
@@ -275,9 +275,7 @@ class TaskmuxDaemon:
         self.health_check_task = asyncio.create_task(self._health_check_loop())
         api_task = asyncio.create_task(self._start_api_server())
 
-        self.logger.info(
-            f"Daemon ready on port {self.api_port} ({len(self.projects)} project(s))"
-        )
+        self.logger.info(f"Daemon ready on port {self.api_port} ({len(self.projects)} project(s))")
 
         try:
             await asyncio.gather(self.health_check_task, api_task)
@@ -344,9 +342,7 @@ class TaskmuxDaemon:
         if session in self.projects:
             return
         if not config_path.exists():
-            self.logger.warning(
-                f"Registry entry for '{session}' points to missing {config_path}"
-            )
+            self.logger.warning(f"Registry entry for '{session}' points to missing {config_path}")
             self.project_states[session] = "config_missing"
             return
         try:
@@ -402,9 +398,7 @@ class TaskmuxDaemon:
                     observer.join(timeout=2)
             self.projects.pop(session, None)
             self.project_states[session] = "config_missing"
-            self.logger.info(
-                f"Project '{session}' marked config_missing — health checks paused"
-            )
+            self.logger.info(f"Project '{session}' marked config_missing — health checks paused")
 
     # ---- health loop ----
 
@@ -454,9 +448,7 @@ class TaskmuxDaemon:
         async with websockets.serve(handle_client, "localhost", self.api_port):  # type: ignore[arg-type]
             await asyncio.Future()
 
-    KNOWN_COMMANDS = frozenset(
-        {"list_projects", "status_all", "status", "restart", "kill", "logs"}
-    )
+    KNOWN_COMMANDS = frozenset({"list_projects", "status_all", "status", "restart", "kill", "logs"})
 
     async def _handle_api_request(self, data: dict) -> dict:
         command = data.get("command")
@@ -507,9 +499,7 @@ class TaskmuxDaemon:
                 sess = cli.tmux._get_session()
                 window = sess.windows.get(window_name=task_name, default=None)
                 if window and window.active_pane:
-                    output = window.active_pane.cmd(
-                        "capture-pane", "-p", "-S", f"-{lines}"
-                    ).stdout
+                    output = window.active_pane.cmd("capture-pane", "-p", "-S", f"-{lines}").stdout
                     return {"command": command, "session": session, "logs": output}
             except Exception as e:  # noqa: BLE001
                 return {"error": str(e), "session": session}
@@ -652,11 +642,13 @@ def list_running_projects() -> list[dict]:
 
     out: list[dict] = []
     for entry in listRegistered():
-        out.append({
-            "session": entry["session"],
-            "config_path": entry["config_path"],
-            "registered_at": entry["registered_at"],
-        })
+        out.append(
+            {
+                "session": entry["session"],
+                "config_path": entry["config_path"],
+                "registered_at": entry["registered_at"],
+            }
+        )
     return out
 
 

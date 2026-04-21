@@ -747,9 +747,7 @@ def daemon_status():
     pid = get_daemon_pid()
     entries = listRegistered()
     if is_json_mode():
-        print_result(
-            {"running": pid is not None, "pid": pid, "registered_projects": len(entries)}
-        )
+        print_result({"running": pid is not None, "pid": pid, "registered_projects": len(entries)})
         return
     if pid is not None:
         console.print(f"Daemon running (pid {pid}) — {len(entries)} project(s) registered")
@@ -839,9 +837,7 @@ def daemon_list(
     for entry in registered:
         info = live.get(entry["session"], {})
         state = info.get("state", "[dim]unmanaged[/dim]" if pid is None else "ok")
-        tmux_state = (
-            "[green]up[/green]" if info.get("session_exists") else "[dim]down[/dim]"
-        )
+        tmux_state = "[green]up[/green]" if info.get("session_exists") else "[dim]down[/dim]"
         task_count = info.get("task_count", "?")
         table.add_row(
             entry["session"],
@@ -876,9 +872,7 @@ def daemon_register(
     if is_json_mode():
         print_result({"ok": True, "action": "registered", "entry": dict(entry)})
     else:
-        console.print(
-            f"Registered '{entry['session']}' → {entry['config_path']}", style="green"
-        )
+        console.print(f"Registered '{entry['session']}' → {entry['config_path']}", style="green")
 
 
 @daemon_app.command("unregister")

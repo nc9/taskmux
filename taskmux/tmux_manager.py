@@ -279,9 +279,7 @@ class TmuxManager:
             with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
                 status = resp.status
                 if status != expected_status:
-                    return HealthResult(
-                        False, "http", f"status {status} != {expected_status}", now
-                    )
+                    return HealthResult(False, "http", f"status {status} != {expected_status}", now)
                 if expected_body:
                     body = resp.read(64 * 1024).decode("utf-8", errors="replace")
                     if not re.search(expected_body, body):
@@ -346,9 +344,7 @@ class TmuxManager:
             result = self._probe_tcp(task_cfg.port, timeout)
         else:
             ok = self._is_pane_alive(task_name)
-            result = HealthResult(
-                ok, "pane", None if ok else "pane shell-only or missing", now
-            )
+            result = HealthResult(ok, "pane", None if ok else "pane shell-only or missing", now)
 
         self.restart_tracker.record_health_result(task_name, result)
         return result

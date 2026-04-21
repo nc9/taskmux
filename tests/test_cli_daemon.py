@@ -32,8 +32,9 @@ def isolated(tmp_path, monkeypatch):
 def test_spawn_detached_omits_port_when_unset(isolated):
     """No port arg → bare `python -m taskmux daemon` (daemon resolves from config)."""
     fake_proc = MagicMock(pid=12345)
-    with patch("subprocess.Popen", return_value=fake_proc) as popen, patch.object(
-        cli_mod, "get_daemon_pid", return_value=None
+    with (
+        patch("subprocess.Popen", return_value=fake_proc) as popen,
+        patch.object(cli_mod, "get_daemon_pid", return_value=None),
     ):
         cli_mod._spawn_detached_daemon(port=None)
     cmd = popen.call_args.args[0]
@@ -44,8 +45,9 @@ def test_spawn_detached_omits_port_when_unset(isolated):
 def test_spawn_detached_forwards_port(isolated):
     """Explicit port → appended as `--port <port>` to the spawn command."""
     fake_proc = MagicMock(pid=12345)
-    with patch("subprocess.Popen", return_value=fake_proc) as popen, patch.object(
-        cli_mod, "get_daemon_pid", return_value=None
+    with (
+        patch("subprocess.Popen", return_value=fake_proc) as popen,
+        patch.object(cli_mod, "get_daemon_pid", return_value=None),
     ):
         cli_mod._spawn_detached_daemon(port=9999)
     cmd = popen.call_args.args[0]
@@ -57,9 +59,10 @@ def test_daemon_list_uses_configured_port(isolated):
     """daemon list with no --port reads api_port from global config."""
     (isolated / "config.toml").write_text("api_port = 9876\n")
     runner = CliRunner()
-    with patch.object(cli_mod, "get_daemon_pid", return_value=42), patch.object(
-        cli_mod, "_query_live_projects", return_value={}
-    ) as q:
+    with (
+        patch.object(cli_mod, "get_daemon_pid", return_value=42),
+        patch.object(cli_mod, "_query_live_projects", return_value={}) as q,
+    ):
         # Need at least one registered project so the query is invoked
         from taskmux import registry as reg
 
@@ -78,9 +81,10 @@ def test_daemon_list_explicit_port_wins(isolated):
     """--port on `daemon list` overrides the configured api_port."""
     (isolated / "config.toml").write_text("api_port = 9876\n")
     runner = CliRunner()
-    with patch.object(cli_mod, "get_daemon_pid", return_value=42), patch.object(
-        cli_mod, "_query_live_projects", return_value={}
-    ) as q:
+    with (
+        patch.object(cli_mod, "get_daemon_pid", return_value=42),
+        patch.object(cli_mod, "_query_live_projects", return_value={}) as q,
+    ):
         from taskmux import registry as reg
 
         cfg = isolated / "alpha" / "taskmux.toml"

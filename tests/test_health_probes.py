@@ -31,7 +31,7 @@ def _make_manager(config: TaskmuxConfig) -> TmuxManager:
 
 
 class _SilentHandler(BaseHTTPRequestHandler):
-    body = b"<html><body><div id=\"__next\">app</div></body></html>"
+    body = b'<html><body><div id="__next">app</div></body></html>'
     status = 200
 
     def do_GET(self):  # noqa: N802

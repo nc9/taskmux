@@ -54,9 +54,7 @@ def loadGlobalConfig(path: Path | None = None) -> GlobalConfig:
     try:
         raw = tomllib.loads(p.read_text())
     except tomllib.TOMLDecodeError as e:
-        raise TaskmuxError(
-            ErrorCode.CONFIG_PARSE_ERROR, path=str(p), detail=str(e)
-        ) from e
+        raise TaskmuxError(ErrorCode.CONFIG_PARSE_ERROR, path=str(p), detail=str(e)) from e
 
     known = set(GlobalConfig.model_fields.keys())
     unknown = set(raw.keys()) - known

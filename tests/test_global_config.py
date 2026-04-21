@@ -32,18 +32,14 @@ def test_partial_override(isolated):
 
 
 def test_full_override(isolated):
-    (isolated / "config.toml").write_text(
-        "health_check_interval = 60\napi_port = 9999\n"
-    )
+    (isolated / "config.toml").write_text("health_check_interval = 60\napi_port = 9999\n")
     cfg = gc.loadGlobalConfig()
     assert cfg.health_check_interval == 60
     assert cfg.api_port == 9999
 
 
 def test_unknown_key_warns_and_drops(isolated):
-    (isolated / "config.toml").write_text(
-        "health_check_interval = 5\nspeculative_setting = true\n"
-    )
+    (isolated / "config.toml").write_text("health_check_interval = 5\nspeculative_setting = true\n")
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         cfg = gc.loadGlobalConfig()
