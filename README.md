@@ -5,7 +5,7 @@ Tmux session manager for development environments. Define tasks in `taskmux.toml
 ## Features
 
 - **Task orchestration** — start/stop/restart tasks with dependency ordering and signal escalation
-- **Persistent logs** — timestamped, rotated, survives session kill (`~/.taskmux/logs/`)
+- **Persistent logs** — timestamped, rotated, survives session kill (`~/.taskmux/projects/{session}/logs/`)
 - **Health checks** — custom commands with retries, used for dependency gating and auto-restart
 - **Restart policies** — `no`, `on-failure` (default), `always` with exponential backoff
 - **JSON output** — `--json` on every command for programmatic consumption
@@ -47,7 +47,7 @@ taskmux events                   # recent lifecycle events
 taskmux events --task server     # filter by task
 taskmux events --since 1h        # filter by time
 
-# Logs — persistent, timestamped, stored at ~/.taskmux/logs/
+# Logs — persistent, timestamped, stored at ~/.taskmux/projects/{session}/logs/
 taskmux logs                     # interleaved logs from all tasks
 taskmux logs <task>              # logs for one task
 taskmux logs -f [task]           # follow live
@@ -170,7 +170,7 @@ On `taskmux start`: db starts first → migrate + worker wait for db health → 
 | `restart_policy` | `"on-failure"` | `"no"`, `"on-failure"`, `"always"` |
 | `max_restarts` | `5` | max restarts before giving up (resets after 60s healthy) |
 | `restart_backoff` | `2.0` | exponential backoff base (capped 60s) |
-| `log_file` | — | override log path (default: `~/.taskmux/logs/{session}/{task}.log`) |
+| `log_file` | — | override log path (default: `~/.taskmux/projects/{session}/logs/{task}.log`) |
 | `log_max_size` | `"10MB"` | max size before rotation |
 | `log_max_files` | `3` | rotated files to keep |
 | `depends_on` | `[]` | tasks that must be healthy first |
@@ -235,29 +235,78 @@ Used by:
 
 ## Daemon
 
-Auto-restart only fires when a daemon (or `start --monitor`) is running.
+A single global daemon manages every registered project on the host. Projects auto-register on `taskmux start`, and the daemon picks them up live via a registry watcher. Auto-restart only fires when the daemon (or `start --monitor`) is running.
 
 ```bash
-taskmux start -d        # start tasks AND spawn detached daemon
-taskmux daemon          # foreground daemon (Ctrl+C to stop)
+taskmux start -d        # start tasks AND spawn the global daemon (auto-registers cwd)
+taskmux daemon          # run foreground daemon (Ctrl+C to stop)
 ```
 
 ### Lifecycle
 
 ```bash
-taskmux daemon start     # spawn detached daemon (no-op if running)
-taskmux daemon stop      # SIGTERM the running daemon
-taskmux daemon status    # running + pid
-taskmux daemon restart   # stop, wait for exit, respawn
+taskmux daemon start              # spawn detached global daemon (no-op if running)
+taskmux daemon stop               # SIGTERM the daemon
+taskmux daemon status             # running + pid + registered project count
+taskmux daemon restart            # stop, wait for exit, respawn
+taskmux daemon list               # all registered projects + live state
+taskmux daemon register [-c PATH] # add cwd's (or PATH's) project to the registry
+taskmux daemon unregister NAME    # remove a project from the registry
 ```
 
-All four accept `--json` (global flag) for scripting. `start` and `restart` take `--port`. Logs go to `~/.taskmux/daemon.log`.
+`start`/`restart` take `--port`. All commands accept `--json` (global flag). Daemon log: `~/.taskmux/daemon.log`.
+
+### WebSocket API
+
+One port (default 8765). Messages carry a `session` field for per-project commands:
+
+```json
+{"command": "list_projects"}                                          // → {projects: [...]}
+{"command": "status_all"}                                             // → aggregated
+{"command": "status",  "params": {"session": "myapp"}}
+{"command": "restart", "params": {"session": "myapp", "task": "web"}}
+{"command": "kill",    "params": {"session": "myapp", "task": "web"}}
+{"command": "logs",    "params": {"session": "myapp", "task": "web", "lines": 100}}
+```
+
+Unknown sessions return `{error: "unknown_session", session: "..."}`. Unknown commands return `{error: "unknown_command", command: "..."}`.
+
+### Global config
+
+Host-wide settings live at `~/.taskmux/config.toml`. Optional — every key has a default.
+
+```toml
+# ~/.taskmux/config.toml
+health_check_interval = 30   # seconds; daemon health-check cadence
+api_port              = 8765 # WebSocket API port
+```
+
+```bash
+taskmux config show              # resolved view (defaults + overrides)
+taskmux config set <key> <value> # writes the file (creates if absent)
+taskmux config path              # print path
+```
+
+Daemon reads the file at startup. To pick up changes, `taskmux daemon restart`.
+
+### Filesystem layout
+
+```
+~/.taskmux/
+  config.toml                         # global host config (optional)
+  daemon.pid                          # GLOBAL — single multi-project daemon
+  daemon.log
+  events.jsonl                        # global, cross-project event log
+  registry.json                       # registered projects {session → config_path}
+  projects/{session}/
+    logs/{task}.log[.N]               # per-task output
+```
 
 `taskmux status` shows `Auto-restart: active (pid …)` when a daemon is detected, otherwise `Auto-restart: inactive` so you don't silently miss restarts. Set `auto_daemon = true` at the top of `taskmux.toml` to spawn one on every `taskmux start`.
 
 ## Persistent Logs
 
-Task output is piped to `~/.taskmux/logs/{session}/{task}.log` with UTC timestamps:
+Task output is piped to `~/.taskmux/projects/{session}/logs/{task}.log` with UTC timestamps:
 
 ```
 2024-01-01T14:00:00.123 Server started on port 3000
