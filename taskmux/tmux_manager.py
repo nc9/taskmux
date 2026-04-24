@@ -683,10 +683,15 @@ class TmuxManager:
         return {"ok": True, "session": session_name, "action": "stopped"}
 
     def restart_all(self) -> dict:
-        """Stop all then start all."""
+        """Stop all then start all. Clears manually-stopped flags so auto-restart resumes."""
         self.stop_all()
+        for task_name in self.config.tasks:
+            self.restart_tracker.clear_manually_stopped(task_name)
         self._refresh_session()
-        return self.start_all()
+        result = self.start_all()
+        if result.get("ok"):
+            result["action"] = "restarted"
+        return result
 
     def create_session(self) -> dict:
         """Create new tmux session with auto_start tasks only (legacy, wraps start_all)."""
