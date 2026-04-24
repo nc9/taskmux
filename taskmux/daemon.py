@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -21,6 +23,40 @@ from .events import recordEvent
 
 if TYPE_CHECKING:
     from .cli import TaskmuxCLI
+
+
+DAEMON_PID_PATH = Path.home() / ".taskmux" / "daemon.pid"
+
+
+def get_daemon_pid() -> int | None:
+    """Return live daemon PID, else None. Cleans up stale pid file."""
+    if not DAEMON_PID_PATH.exists():
+        return None
+    try:
+        pid = int(DAEMON_PID_PATH.read_text().strip())
+    except (ValueError, OSError):
+        return None
+    try:
+        os.kill(pid, 0)
+        return pid
+    except ProcessLookupError:
+        with contextlib.suppress(OSError):
+            DAEMON_PID_PATH.unlink()
+        return None
+    except OSError:
+        # PermissionError etc. — pid exists but not ours, treat as live
+        return pid
+
+
+def _write_daemon_pid() -> None:
+    DAEMON_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DAEMON_PID_PATH.write_text(str(os.getpid()))
+
+
+def _clear_daemon_pid() -> None:
+    with contextlib.suppress(OSError):
+        if DAEMON_PID_PATH.exists() and DAEMON_PID_PATH.read_text().strip() == str(os.getpid()):
+            DAEMON_PID_PATH.unlink()
 
 
 class ConfigWatcher(FileSystemEventHandler):
@@ -86,6 +122,12 @@ class TaskmuxDaemon:
 
     async def start(self) -> None:
         """Start daemon mode with monitoring and API"""
+        existing = get_daemon_pid()
+        if existing is not None and existing != os.getpid():
+            self.logger.error(f"Daemon already running (pid {existing})")
+            sys.exit(1)
+
+        _write_daemon_pid()
         self.running = True
 
         from .cli import TaskmuxCLI
@@ -123,6 +165,7 @@ class TaskmuxDaemon:
         if self.health_check_task and not self.health_check_task.done():
             self.health_check_task.cancel()
 
+        _clear_daemon_pid()
         self.logger.info("Taskmux daemon stopped")
 
     async def _health_check_loop(self) -> None:

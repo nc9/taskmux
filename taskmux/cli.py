@@ -10,7 +10,12 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import addTask, loadConfig, removeTask
-from .daemon import SimpleConfigWatcher, TaskmuxDaemon
+from .daemon import (
+    DAEMON_PID_PATH,
+    SimpleConfigWatcher,
+    TaskmuxDaemon,
+    get_daemon_pid,
+)
 from .errors import TaskmuxError
 from .init import initProject
 from .models import TaskmuxConfig
@@ -139,11 +144,42 @@ def init(
         )
 
 
+def _spawn_detached_daemon() -> int | None:
+    """Fork taskmux daemon as a detached background process. Returns child pid."""
+    import subprocess
+
+    existing = get_daemon_pid()
+    if existing is not None:
+        return existing
+    log_path = DAEMON_PID_PATH.parent / "daemon.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(log_path, "ab")  # noqa: SIM115
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "taskmux", "daemon"],
+        stdout=log_fh,
+        stderr=log_fh,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    # Give the daemon a moment to write its pid file
+    for _ in range(20):
+        if get_daemon_pid() is not None:
+            break
+        import time as _t
+
+        _t.sleep(0.1)
+    return proc.pid
+
+
 @app.command()
 def start(
     tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
     monitor: bool = typer.Option(  # noqa: B008
         False, "-m", "--monitor", help="Stay running, auto-restart per restart_policy"
+    ),
+    daemon: bool = typer.Option(  # noqa: B008
+        False, "-d", "--daemon", help="Spawn detached daemon for auto-restart + WS API"
     ),
 ):
     """Start tasks (all auto_start tasks if none specified).
@@ -151,7 +187,8 @@ def start(
     Starts tasks in dependency order, waiting for each dependency's health check
     to pass before starting dependents. With --monitor, stays in the foreground
     and auto-restarts tasks according to their restart_policy (no/on-failure/always),
-    respecting health_retries, max_restarts, and exponential backoff.
+    respecting health_retries, max_restarts, and exponential backoff. With --daemon,
+    spawns a detached background daemon that does the same plus a WebSocket API.
     """
     import time
 
@@ -162,6 +199,14 @@ def start(
     else:
         result = cli.tmux.start_all()
         _handle_result(result)
+
+    if daemon or cli.config.auto_daemon:
+        pid = _spawn_detached_daemon()
+        if not is_json_mode():
+            if pid:
+                console.print(f"Daemon started (pid {pid})")
+            else:
+                console.print("Daemon failed to start", style="red")
 
     if monitor:
         if not is_json_mode():
@@ -367,6 +412,8 @@ def _status():
     """
     cli = TaskmuxCLI()
     data = cli.tmux.list_tasks()
+    daemon_pid = get_daemon_pid()
+    data["daemon_pid"] = daemon_pid
     if is_json_mode():
         print_result(data)
         return
@@ -377,13 +424,27 @@ def _status():
     console.print(f"Session '{session}': {'Running' if running else 'Stopped'}")
     if running:
         console.print(f"Active tasks: {data['active_tasks']}")
+
+    from .models import RestartPolicy
+
+    if daemon_pid:
+        console.print(f"Auto-restart: active (pid {daemon_pid})", style="green")
+    else:
+        any_restart = any(
+            t.get("restart_policy") and t["restart_policy"] != str(RestartPolicy.NO)
+            for t in data["tasks"]
+        )
+        if any_restart:
+            console.print(
+                "Auto-restart: inactive — run 'taskmux daemon' or 'taskmux start -d' to enable",
+                style="yellow",
+            )
+
     console.print("-" * 70)
 
     if not data["tasks"]:
         console.print("No tasks configured")
         return
-
-    from .models import RestartPolicy
 
     for t in data["tasks"]:
         health_icon = "G" if t["healthy"] else "R" if t["running"] else "o"
@@ -399,6 +460,12 @@ def _status():
             extras += f" deps=[{','.join(t['depends_on'])}]"
         line = f"{health_icon} {status_text:8} {t['name']:15}{port:7} {t['command']}"
         console.print(f"{line}{auto}{extras}")
+        last = t.get("last_health")
+        if last and not last.get("ok") and last.get("reason"):
+            console.print(
+                f"    fail: {last['method']} — {last['reason']}",
+                style="red",
+            )
 
 
 app.command(name="status")(_status)
@@ -407,10 +474,14 @@ app.command(name="ls", hidden=True)(_status)
 
 
 @app.command()
-def health():
+def health(
+    verbose: bool = typer.Option(  # noqa: B008
+        False, "-v", "--verbose", help="Show probe method and failure reasons"
+    ),
+):
     """Check health of all tasks.
 
-    Runs each task's health_check command (or falls back to pane-alive check).
+    Runs each task's probe (health_url → health_check → tcp(port) → pane-alive).
     Displays a table with health status for every configured task.
     """
     cli = TaskmuxCLI()
@@ -427,9 +498,16 @@ def health():
     tasks_health: list[dict] = []
 
     for task_name in cli.config.tasks:
-        is_healthy = cli.tmux.check_task_health(task_name)
-        tasks_health.append({"name": task_name, "healthy": is_healthy})
-        if is_healthy:
+        result = cli.tmux.check_health(task_name)
+        tasks_health.append(
+            {
+                "name": task_name,
+                "healthy": result.ok,
+                "method": result.method,
+                "reason": result.reason,
+            }
+        )
+        if result.ok:
             healthy_count += 1
 
     if is_json_mode():
@@ -446,11 +524,17 @@ def health():
     table.add_column("Status", style="cyan")
     table.add_column("Task", style="magenta")
     table.add_column("Health", style="green")
+    if verbose:
+        table.add_column("Method")
+        table.add_column("Reason")
 
     for t in tasks_health:
         icon = "G" if t["healthy"] else "R"
         text = "Healthy" if t["healthy"] else "Unhealthy"
-        table.add_row(icon, t["name"], text)
+        if verbose:
+            table.add_row(icon, t["name"], text, t["method"], t["reason"] or "")
+        else:
+            table.add_row(icon, t["name"], text)
 
     console.print(table)
     console.print(f"Health: {healthy_count}/{total_count} tasks healthy")
@@ -507,13 +591,51 @@ def watch():
 @app.command()
 def daemon(
     port: int = typer.Option(8765, "--port", help="WebSocket API port"),
+    stop: bool = typer.Option(False, "--stop", help="Stop a running daemon"),  # noqa: B008
+    status: bool = typer.Option(False, "--status", help="Print daemon status"),  # noqa: B008
 ):
     """Run in daemon mode with WebSocket API and health monitoring.
 
     Monitors task health every 30s and auto-restarts per restart_policy with
     exponential backoff. Watches config for changes. Exposes a WebSocket API
-    for status, restart, kill, and logs commands.
+    for status, restart, kill, and logs commands. Use --stop to terminate a
+    running daemon, --status to query without starting one.
     """
+    import os
+    import signal as _sig
+
+    if status or stop:
+        pid = get_daemon_pid()
+        if stop:
+            if pid is None:
+                if is_json_mode():
+                    print_result({"ok": False, "error": "daemon not running"})
+                else:
+                    console.print("Daemon not running")
+                return
+            try:
+                os.kill(pid, _sig.SIGTERM)
+            except OSError as e:
+                if is_json_mode():
+                    print_result({"ok": False, "error": str(e)})
+                else:
+                    console.print(f"Failed to signal daemon: {e}", style="red")
+                return
+            if is_json_mode():
+                print_result({"ok": True, "pid": pid, "action": "stopped"})
+            else:
+                console.print(f"Sent SIGTERM to daemon (pid {pid})")
+            return
+        # status branch
+        if is_json_mode():
+            print_result({"running": pid is not None, "pid": pid})
+        else:
+            if pid is not None:
+                console.print(f"Daemon running (pid {pid})")
+            else:
+                console.print("Daemon not running")
+        return
+
     d = TaskmuxDaemon(api_port=port)
     asyncio.run(d.start())
 

@@ -99,6 +99,8 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
 
     if not config.auto_start:
         doc.add("auto_start", tomlkit.item(False))
+    if config.auto_daemon:
+        doc.add("auto_daemon", tomlkit.item(True))
 
     doc.add(tomlkit.nl())
 
@@ -120,6 +122,12 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("port", task_cfg.port)
         if task_cfg.health_check is not None:
             inner.add("health_check", task_cfg.health_check)
+        if task_cfg.health_url is not None:
+            inner.add("health_url", task_cfg.health_url)
+        if task_cfg.health_expected_status != 200:
+            inner.add("health_expected_status", task_cfg.health_expected_status)
+        if task_cfg.health_expected_body is not None:
+            inner.add("health_expected_body", task_cfg.health_expected_body)
         if task_cfg.health_interval != 10:
             inner.add("health_interval", task_cfg.health_interval)
         if task_cfg.health_timeout != 5:

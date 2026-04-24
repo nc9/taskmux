@@ -55,6 +55,9 @@ class TaskConfig(_StrictConfig):
     cwd: str | None = None
     port: int | None = None
     health_check: str | None = None
+    health_url: str | None = None
+    health_expected_status: int = 200
+    health_expected_body: str | None = None
     health_interval: int = 10
     health_timeout: int = 5
     health_retries: int = 3
@@ -91,6 +94,7 @@ class TaskmuxConfig(_StrictConfig):
 
     name: str = "taskmux"
     auto_start: bool = True
+    auto_daemon: bool = False
     hooks: HookConfig = HookConfig()
     tasks: dict[str, TaskConfig] = {}
 

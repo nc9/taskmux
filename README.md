@@ -152,13 +152,17 @@ On `taskmux start`: db starts first → migrate + worker wait for db health → 
 |-------|---------|-------------|
 | `name` | `"taskmux"` | tmux session name |
 | `auto_start` | `true` | global toggle — `false` creates session but launches nothing |
+| `auto_daemon` | `false` | when `true`, `taskmux start` also spawns a detached daemon (auto-restart + WS API) |
 | `hooks.*` | — | `before_start`, `after_start`, `before_stop`, `after_stop` |
 | **Task fields** | | |
 | `command` | required | shell command to run |
 | `auto_start` | `true` | include in `taskmux start` |
 | `cwd` | — | working directory |
-| `port` | — | port to clean up before starting |
-| `health_check` | — | shell command (exit 0 = healthy) |
+| `port` | — | port to clean up before starting; also used as TCP probe target if no `health_url`/`health_check` |
+| `health_url` | — | HTTP URL to probe (e.g. `http://localhost:8000/health`) — uses stdlib, no curl needed |
+| `health_expected_status` | `200` | required HTTP status from `health_url` |
+| `health_expected_body` | — | regex/substring; if set, response body must match (catches dev-server 200-with-error pages) |
+| `health_check` | — | shell command (exit 0 = healthy) — used when `health_url` is unset |
 | `health_interval` | `10` | seconds between checks |
 | `health_timeout` | `5` | seconds before check times out |
 | `health_retries` | `3` | consecutive failures before restart |
@@ -202,12 +206,45 @@ Backoff: `restart_backoff ^ attempt` seconds (capped 60s). Resets after 60s heal
 
 ## Health Checks
 
-If `health_check` is set, taskmux runs it as a shell command (exit 0 = healthy). Falls back to checking if the pane has a running process. Must fail `health_retries` consecutive times before triggering restart.
+Probe precedence (first match wins):
+
+1. **`health_url`** — HTTP GET via stdlib. Pass when status matches `health_expected_status` (default 200) and, if set, body matches `health_expected_body` (regex). No curl dependency.
+2. **`health_check`** — arbitrary shell command, exit 0 = healthy.
+3. **`port`** — TCP probe to `localhost:port`. Pass when the port accepts a connection.
+4. **fallback** — pane-alive check (foreground command is not a shell).
+
+Must fail `health_retries` consecutive times before triggering restart.
+
+### Why the body check matters
+
+Many dev servers (Next.js, Vite, etc.) keep returning HTTP 200 even when the build is broken — they render the compile error as HTML. A `curl -sf` health check passes; the page is unusable. Pin a marker in `health_expected_body` to fail in that case:
+
+```toml
+[tasks.web]
+command = "next dev"
+port = 3000
+health_url = "http://localhost:3000"
+health_expected_body = "id=\"__next\""   # absent on the Next error overlay
+```
 
 Used by:
-- `taskmux health` — status table
+- `taskmux health` — status table (`-v` shows probe method + failure reason)
+- `taskmux status` — surfaces the last failure under each unhealthy task
 - `taskmux start` — dependency gating
 - `start --monitor` / `daemon` — auto-restart trigger
+
+## Daemon
+
+Auto-restart only fires when a daemon (or `start --monitor`) is running.
+
+```bash
+taskmux start -d        # start tasks AND spawn detached daemon
+taskmux daemon          # foreground daemon (Ctrl+C to stop)
+taskmux daemon --status # is one running?
+taskmux daemon --stop   # SIGTERM the running daemon
+```
+
+`taskmux status` shows `Auto-restart: active (pid …)` when a daemon is detected, otherwise `Auto-restart: inactive` so you don't silently miss restarts. Set `auto_daemon = true` at the top of `taskmux.toml` to spawn one on every `taskmux start`.
 
 ## Persistent Logs
 

@@ -7,9 +7,13 @@ import os
 import re
 import shlex
 import signal as sig
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -68,6 +72,19 @@ SHELL_NAMES = frozenset(("bash", "zsh", "sh", "fish"))
 TASK_COLORS = ["cyan", "green", "yellow", "magenta", "blue", "red"]
 
 
+@dataclass(frozen=True)
+class HealthResult:
+    """Outcome of a single health probe."""
+
+    ok: bool
+    method: str  # "http", "shell", "tcp", "pane", "none"
+    reason: str | None
+    at: float
+
+    def to_dict(self) -> dict:
+        return {"ok": self.ok, "method": self.method, "reason": self.reason, "at": self.at}
+
+
 class RestartTracker:
     """Tracks per-task restart counts, health failures, and manual-stop state."""
 
@@ -75,6 +92,7 @@ class RestartTracker:
         self._data: dict[str, dict[str, float]] = {}
         self._consecutive_failures: dict[str, int] = {}
         self._manually_stopped: set[str] = set()
+        self._last_health: dict[str, HealthResult] = {}
 
     def get(self, task_name: str) -> dict[str, float]:
         return self._data.get(task_name, {"count": 0, "last": 0.0})
@@ -105,6 +123,12 @@ class RestartTracker:
 
     def is_manually_stopped(self, task_name: str) -> bool:
         return task_name in self._manually_stopped
+
+    def record_health_result(self, task_name: str, result: HealthResult) -> None:
+        self._last_health[task_name] = result
+
+    def last_health(self, task_name: str) -> HealthResult | None:
+        return self._last_health.get(task_name)
 
 
 def _find_new_lines(current: list[str], prev_tail: list[str]) -> list[str]:
@@ -240,25 +264,96 @@ class TmuxManager:
         except OSError:
             pass
 
-    def is_task_healthy(self, task_name: str) -> bool:
-        """Check task health. Uses health_check command if configured, falls back to pane-alive."""
-        task_cfg = self.config.tasks.get(task_name)
-        if not task_cfg:
-            return False
+    def _probe_http(
+        self,
+        url: str,
+        timeout: float,
+        expected_status: int,
+        expected_body: str | None,
+    ) -> HealthResult:
+        """HTTP GET; pass if status matches and (if set) body contains expected_body."""
+        now = time.time()
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+                status = resp.status
+                if status != expected_status:
+                    return HealthResult(
+                        False, "http", f"status {status} != {expected_status}", now
+                    )
+                if expected_body:
+                    body = resp.read(64 * 1024).decode("utf-8", errors="replace")
+                    if not re.search(expected_body, body):
+                        return HealthResult(False, "http", "body mismatch", now)
+                return HealthResult(True, "http", None, now)
+        except urllib.error.HTTPError as e:
+            return HealthResult(False, "http", f"status {e.code} != {expected_status}", now)
+        except urllib.error.URLError as e:
+            return HealthResult(False, "http", f"url error: {e.reason}", now)
+        except TimeoutError:
+            return HealthResult(False, "http", f"timeout after {timeout}s", now)
+        except Exception as e:
+            return HealthResult(False, "http", f"{type(e).__name__}: {e}", now)
 
-        if not task_cfg.health_check:
-            return self._is_pane_alive(task_name)
+    def _probe_tcp(self, port: int, timeout: float) -> HealthResult:
+        """Open a TCP connection to localhost:port; pass if accepted within timeout."""
+        now = time.time()
+        try:
+            with socket.create_connection(("localhost", port), timeout=timeout):
+                return HealthResult(True, "tcp", None, now)
+        except (TimeoutError, OSError) as e:
+            return HealthResult(False, "tcp", f"connect refused: {e}", now)
 
+    def _probe_shell(self, command: str, timeout: float) -> HealthResult:
+        """Run shell command; exit 0 = healthy."""
+        now = time.time()
         try:
             result = subprocess.run(
-                task_cfg.health_check,
+                command,
                 shell=True,
                 capture_output=True,
-                timeout=task_cfg.health_timeout,
+                timeout=timeout,
             )
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, OSError):
-            return False
+            if result.returncode == 0:
+                return HealthResult(True, "shell", None, now)
+            return HealthResult(False, "shell", f"exit {result.returncode}", now)
+        except subprocess.TimeoutExpired:
+            return HealthResult(False, "shell", f"timeout after {timeout}s", now)
+        except OSError as e:
+            return HealthResult(False, "shell", f"OSError: {e}", now)
+
+    def check_health(self, task_name: str) -> HealthResult:
+        """Probe task health with precedence: health_url → health_check → tcp(port) → pane-alive."""
+        task_cfg = self.config.tasks.get(task_name)
+        now = time.time()
+        if not task_cfg:
+            result = HealthResult(False, "none", "task not in config", now)
+            self.restart_tracker.record_health_result(task_name, result)
+            return result
+
+        timeout = float(task_cfg.health_timeout)
+        if task_cfg.health_url:
+            result = self._probe_http(
+                task_cfg.health_url,
+                timeout,
+                task_cfg.health_expected_status,
+                task_cfg.health_expected_body,
+            )
+        elif task_cfg.health_check:
+            result = self._probe_shell(task_cfg.health_check, timeout)
+        elif task_cfg.port:
+            result = self._probe_tcp(task_cfg.port, timeout)
+        else:
+            ok = self._is_pane_alive(task_name)
+            result = HealthResult(
+                ok, "pane", None if ok else "pane shell-only or missing", now
+            )
+
+        self.restart_tracker.record_health_result(task_name, result)
+        return result
+
+    def is_task_healthy(self, task_name: str) -> bool:
+        """Check task health. Returns bool; see check_health() for full result."""
+        return self.check_health(task_name).ok
 
     def get_task_status(self, task_name: str) -> dict[str, str | bool]:
         """Get detailed status for a task"""
@@ -711,7 +806,9 @@ class TmuxManager:
             info["pane_current_command"] = getattr(pane, "pane_current_command", None)
             info["pane_current_path"] = getattr(pane, "pane_current_path", None)
 
-        info["healthy"] = self.is_task_healthy(task_name)
+        result = self.check_health(task_name)
+        info["healthy"] = result.ok
+        info["last_health"] = result.to_dict()
         return info
 
     def _tail_panes(
@@ -960,6 +1057,7 @@ class TmuxManager:
         tasks = []
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
+            last = self.restart_tracker.last_health(task_name)
             tasks.append(
                 {
                     "name": task_name,
@@ -971,6 +1069,7 @@ class TmuxManager:
                     "restart_policy": str(task_cfg.restart_policy),
                     "cwd": task_cfg.cwd,
                     "depends_on": task_cfg.depends_on,
+                    "last_health": last.to_dict() if last else None,
                 }
             )
 
