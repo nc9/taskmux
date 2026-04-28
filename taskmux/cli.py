@@ -54,6 +54,12 @@ def _print_result_human(result: dict) -> None:
         msg = result.get("error", "Unknown error")
         prefix = f"[{code}] " if code else ""
         console.print(f"Error: {prefix}{msg}", style="red")
+        if code == "E301":
+            console.print(
+                "  Hint: use `taskmux restart` to relaunch tasks against the "
+                "current config, or `taskmux stop` first.",
+                style="yellow",
+            )
         return
     action = result.get("action", "")
     if "task" in result:
