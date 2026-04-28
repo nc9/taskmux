@@ -60,6 +60,37 @@ def test_register_collision_rejected(isolated):
     assert excinfo.value.code is ErrorCode.SESSION_ALREADY_REGISTERED
 
 
+def test_register_auto_heals_when_old_path_missing(isolated):
+    """Move case: old config path no longer exists → re-register with new path."""
+    cfg_old = _seed_toml(isolated, "moved-old")
+    reg.registerProject("session", cfg_old)
+    cfg_old.unlink()  # user moved the file
+    cfg_new = _seed_toml(isolated, "moved-new")
+    entry = reg.registerProject("session", cfg_new)
+    assert entry["config_path"] == str(cfg_new.resolve())
+    # registered_at preserved on heal
+    assert entry["registered_at"] == reg.readRegistry()["session"]["registered_at"]
+
+
+def test_register_force_overrides_collision(isolated):
+    """Both paths exist; force=True wins."""
+    cfg_a = _seed_toml(isolated, "shared-a")
+    cfg_b = _seed_toml(isolated, "shared-b")
+    reg.registerProject("shared", cfg_a)
+    entry = reg.registerProject("shared", cfg_b, force=True)
+    assert entry["config_path"] == str(cfg_b.resolve())
+
+
+def test_register_collision_still_raised_when_both_exist(isolated):
+    """Without force and both paths on disk, raise as before."""
+    cfg_a = _seed_toml(isolated, "shared-a")
+    cfg_b = _seed_toml(isolated, "shared-b")
+    reg.registerProject("dup", cfg_a)
+    with pytest.raises(TaskmuxError) as excinfo:
+        reg.registerProject("dup", cfg_b)
+    assert excinfo.value.code is ErrorCode.SESSION_ALREADY_REGISTERED
+
+
 def test_unregister_removes_entry(isolated):
     cfg = _seed_toml(isolated, "alpha")
     reg.registerProject("alpha", cfg)

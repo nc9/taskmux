@@ -108,24 +108,46 @@ def writeRegistry(entries: dict[str, RegistryEntry]) -> None:
         os.replace(tmp_path, path)
 
 
-def registerProject(session: str, config_path: Path | str) -> RegistryEntry:
+def registerProject(
+    session: str,
+    config_path: Path | str,
+    *,
+    force: bool = False,
+) -> RegistryEntry:
     """Add (or refresh) a project in the registry.
 
     Idempotent on re-register of the same {session, config_path}.
-    Raises SESSION_ALREADY_REGISTERED if `session` is already taken by a
-    different config path.
+
+    When the slot is taken by a different `config_path`:
+      - If the old path no longer exists on disk, treat it as stale and
+        silently update to the new path (covers the "user moved the
+        config file" case).
+      - If `force=True`, overwrite the entry unconditionally.
+      - Otherwise raise SESSION_ALREADY_REGISTERED.
     """
     abs_path = str(Path(config_path).expanduser().resolve())
     with _withLock(write=True):
         entries = _readUnlocked()
         existing = entries.get(session)
         if existing and existing["config_path"] != abs_path:
-            raise TaskmuxError(
-                ErrorCode.SESSION_ALREADY_REGISTERED,
+            old_path_exists = Path(existing["config_path"]).exists()
+            if not (force or not old_path_exists):
+                raise TaskmuxError(
+                    ErrorCode.SESSION_ALREADY_REGISTERED,
+                    session=session,
+                    existing_path=existing["config_path"],
+                    new_path=abs_path,
+                )
+            # Stale (old path missing) or forced — replace, preserving
+            # the original registered_at so move history isn't lost.
+            entry = RegistryEntry(
                 session=session,
-                existing_path=existing["config_path"],
-                new_path=abs_path,
+                config_path=abs_path,
+                registered_at=existing.get("registered_at", datetime.now(UTC).isoformat()),
             )
+            entries[session] = entry
+            _writeUnlocked(entries)
+            return entry
         if existing:
             return existing
         entry = RegistryEntry(

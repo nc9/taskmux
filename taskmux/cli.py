@@ -990,8 +990,19 @@ def daemon_register(
     config: str | None = typer.Option(  # noqa: B008
         None, "--config", "-c", help="Path to taskmux.toml (default: cwd)"
     ),
+    force: bool = typer.Option(  # noqa: B008
+        False,
+        "--force",
+        "-f",
+        help="Overwrite an existing registration with a different config path.",
+    ),
 ):
-    """Add a project to the registry. Daemon (if running) picks it up live."""
+    """Add a project to the registry. Daemon (if running) picks it up live.
+
+    A registry slot bound to a path that no longer exists on disk is
+    auto-healed (no flag needed). Use --force when both paths still exist
+    and you want the new one to win.
+    """
     cfg_path = Path(config).expanduser() if config else Path("taskmux.toml")
     if not cfg_path.exists():
         if is_json_mode():
@@ -1000,7 +1011,7 @@ def daemon_register(
             console.print(f"Config not found: {cfg_path}", style="red")
         sys.exit(1)
     cli_local = TaskmuxCLI(config_path=cfg_path)
-    entry = registerProject(cli_local.config.name, cli_local.config_path)
+    entry = registerProject(cli_local.config.name, cli_local.config_path, force=force)
     if is_json_mode():
         print_result({"ok": True, "action": "registered", "entry": dict(entry)})
     else:
