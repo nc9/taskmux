@@ -1,14 +1,18 @@
-"""Tests for agent detection and context injection."""
+"""Tests for agent context-file detection and injection."""
 
 from pathlib import Path
 from unittest.mock import patch
 
 from taskmux.agent import (
+    AGENTS_FILE,
+    CLAUDE_FILE,
     CONTEXT_END,
     CONTEXT_START,
     buildContextBlock,
+    detectContextFiles,
     detectInstalledAgents,
-    injectAgentContext,
+    injectIntoFile,
+    skillInstalled,
 )
 from taskmux.models import TaskConfig, TaskmuxConfig
 
@@ -23,27 +27,87 @@ class TestDetectInstalledAgents:
 
     @patch("taskmux.agent.shutil.which", return_value=None)
     def test_none_installed(self, mock_which):
-        agents = detectInstalledAgents()
-        assert agents == []
+        assert detectInstalledAgents() == []
 
     @patch("taskmux.agent.shutil.which", return_value="/usr/bin/x")
     def test_all_installed(self, mock_which):
         agents = detectInstalledAgents()
-        assert "claude" in agents
-        assert "codex" in agents
-        assert "opencode" in agents
+        assert {"claude", "codex", "opencode"} <= set(agents)
+
+
+class TestDetectContextFiles:
+    def test_none_when_empty(self, tmp_path: Path):
+        assert detectContextFiles(tmp_path) == []
+
+    def test_finds_claude_md(self, tmp_path: Path):
+        (tmp_path / CLAUDE_FILE).write_text("hi\n")
+        assert detectContextFiles(tmp_path) == [tmp_path / CLAUDE_FILE]
+
+    def test_finds_agents_md(self, tmp_path: Path):
+        (tmp_path / AGENTS_FILE).write_text("hi\n")
+        assert detectContextFiles(tmp_path) == [tmp_path / AGENTS_FILE]
+
+    def test_finds_both(self, tmp_path: Path):
+        (tmp_path / CLAUDE_FILE).write_text("hi\n")
+        (tmp_path / AGENTS_FILE).write_text("hi\n")
+        names = sorted(p.name for p in detectContextFiles(tmp_path))
+        assert names == sorted([CLAUDE_FILE, AGENTS_FILE])
+
+
+class TestSkillInstalled:
+    def test_finds_user_claude_skill(self, tmp_path: Path, monkeypatch):
+        fake_home = tmp_path / "home"
+        (fake_home / ".claude" / "skills" / "taskmux").mkdir(parents=True)
+        (fake_home / ".claude" / "skills" / "taskmux" / "SKILL.md").write_text("x")
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        assert skillInstalled() is True
+
+    def test_finds_user_agents_skill(self, tmp_path: Path, monkeypatch):
+        fake_home = tmp_path / "home"
+        (fake_home / ".agents" / "skills" / "taskmux").mkdir(parents=True)
+        (fake_home / ".agents" / "skills" / "taskmux" / "SKILL.md").write_text("x")
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        assert skillInstalled() is True
+
+    def test_finds_project_claude_skill(self, tmp_path: Path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        (tmp_path / ".claude" / "skills" / "taskmux").mkdir(parents=True)
+        (tmp_path / ".claude" / "skills" / "taskmux" / "SKILL.md").write_text("x")
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        assert skillInstalled(tmp_path) is True
+
+    def test_finds_project_agents_skill(self, tmp_path: Path, monkeypatch):
+        """`.agents/skills/` is the shared cross-agent project-local convention."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        (tmp_path / ".agents" / "skills" / "taskmux").mkdir(parents=True)
+        (tmp_path / ".agents" / "skills" / "taskmux" / "SKILL.md").write_text("x")
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        assert skillInstalled(tmp_path) is True
+
+    def test_finds_global_opencode_skill(self, tmp_path: Path, monkeypatch):
+        fake_home = tmp_path / "home"
+        (fake_home / ".config" / "opencode" / "skills" / "taskmux").mkdir(parents=True)
+        (fake_home / ".config" / "opencode" / "skills" / "taskmux" / "SKILL.md").write_text("x")
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        assert skillInstalled() is True
+
+    def test_missing(self, tmp_path: Path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        assert skillInstalled(tmp_path) is False
 
 
 class TestBuildContextBlock:
     def test_contains_markers(self):
-        cfg = TaskmuxConfig(name="test")
-        block = buildContextBlock(cfg)
+        block = buildContextBlock(TaskmuxConfig(name="test"))
         assert CONTEXT_START in block
         assert CONTEXT_END in block
 
     def test_contains_project_name(self):
-        cfg = TaskmuxConfig(name="my-project")
-        block = buildContextBlock(cfg)
+        block = buildContextBlock(TaskmuxConfig(name="my-project"))
         assert "my-project" in block
 
     def test_lists_tasks(self):
@@ -60,70 +124,53 @@ class TestBuildContextBlock:
         assert "| no |" in block
 
     def test_table_includes_url(self):
-        cfg = TaskmuxConfig(
-            name="test",
-            tasks={"api": TaskConfig(command="bun dev", host="api")},
-        )
+        cfg = TaskmuxConfig(name="test", tasks={"api": TaskConfig(command="bun dev", host="api")})
         block = buildContextBlock(cfg)
         assert "https://api.test.localhost" in block
 
     def test_empty_tasks_message(self):
-        cfg = TaskmuxConfig(name="test")
-        block = buildContextBlock(cfg)
+        block = buildContextBlock(TaskmuxConfig(name="test"))
         assert "No tasks configured yet" in block
 
     def test_contains_skill_pointer(self):
-        cfg = TaskmuxConfig(name="test")
-        block = buildContextBlock(cfg)
+        block = buildContextBlock(TaskmuxConfig(name="test"))
         assert "taskmux` skill" in block
         assert "taskmux --help" in block
         assert "taskmux inspect" in block
 
-    def test_no_usage_block(self):
-        cfg = TaskmuxConfig(name="test")
-        block = buildContextBlock(cfg)
-        assert "## Usage" not in block
-        assert "taskmux stop <task>" not in block
 
-
-class TestInjectAgentContext:
+class TestInjectIntoFile:
     def test_creates_file(self, tmp_path: Path):
-        cfg = TaskmuxConfig(name="test")
-        result = injectAgentContext("claude", tmp_path, cfg)
-        assert result.exists()
-        content = result.read_text()
+        target = tmp_path / AGENTS_FILE
+        injectIntoFile(target, TaskmuxConfig(name="test"))
+        assert target.exists()
+        content = target.read_text()
         assert CONTEXT_START in content
         assert "test" in content
 
-    def test_creates_parent_dirs(self, tmp_path: Path):
-        cfg = TaskmuxConfig(name="test")
-        result = injectAgentContext("claude", tmp_path, cfg)
-        assert result.parent.exists()
-        assert ".claude/rules" in str(result)
-
     def test_replaces_existing_block(self, tmp_path: Path):
-        cfg = TaskmuxConfig(name="v1")
-        injectAgentContext("claude", tmp_path, cfg)
-
-        cfg2 = TaskmuxConfig(name="v2")
-        result = injectAgentContext("claude", tmp_path, cfg2)
-        content = result.read_text()
+        target = tmp_path / AGENTS_FILE
+        injectIntoFile(target, TaskmuxConfig(name="v1"))
+        injectIntoFile(target, TaskmuxConfig(name="v2"))
+        content = target.read_text()
         assert "v2" in content
         assert "v1" not in content
         assert content.count(CONTEXT_START) == 1
 
     def test_appends_if_no_existing_block(self, tmp_path: Path):
-        target = tmp_path / ".claude" / "rules" / "taskmux.md"
-        target.parent.mkdir(parents=True)
+        target = tmp_path / CLAUDE_FILE
         target.write_text("# Existing content\n")
-
-        cfg = TaskmuxConfig(name="test")
-        injectAgentContext("claude", tmp_path, cfg)
+        injectIntoFile(target, TaskmuxConfig(name="test"))
         content = target.read_text()
         assert "# Existing content" in content
         assert CONTEXT_START in content
 
-    def test_codex_uses_agents_md(self, tmp_path: Path):
-        cfg = TaskmuxConfig(name="test")
-        result = injectAgentContext("codex", tmp_path, cfg)
-        assert result.name == "AGENTS.md"
+    def test_writes_to_claude_md(self, tmp_path: Path):
+        target = tmp_path / CLAUDE_FILE
+        injectIntoFile(target, TaskmuxConfig(name="test"))
+        assert target.name == CLAUDE_FILE
+
+    def test_writes_to_agents_md(self, tmp_path: Path):
+        target = tmp_path / AGENTS_FILE
+        injectIntoFile(target, TaskmuxConfig(name="test"))
+        assert target.name == AGENTS_FILE

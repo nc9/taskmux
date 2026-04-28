@@ -1,8 +1,12 @@
-"""Agent detection and context injection for AI coding tools."""
+"""Agent context-file injection.
+
+Targets the universal `CLAUDE.md` (Claude Code) and `AGENTS.md` (Codex,
+OpenCode, and most other agent CLIs) at the project root. Idempotent —
+the marked block is replaced in place on subsequent `taskmux init` runs.
+"""
 
 import re
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
 
 from .models import TaskmuxConfig
@@ -10,27 +14,67 @@ from .models import TaskmuxConfig
 CONTEXT_START = "<!-- taskmux:start -->"
 CONTEXT_END = "<!-- taskmux:end -->"
 
+CLAUDE_FILE = "CLAUDE.md"
+AGENTS_FILE = "AGENTS.md"
+CONTEXT_FILES = (CLAUDE_FILE, AGENTS_FILE)
 
-@dataclass(frozen=True)
-class AgentDef:
-    binary: str
-    context_file: str
+# Soft signal — used only to phrase prompts ("we see you have claude").
+# Injection itself targets CLAUDE.md / AGENTS.md regardless.
+KNOWN_AGENT_BINARIES = ("claude", "codex", "opencode")
 
-
-KNOWN_AGENTS: dict[str, AgentDef] = {
-    "claude": AgentDef(binary="claude", context_file=".claude/rules/taskmux.md"),
-    "codex": AgentDef(binary="codex", context_file="AGENTS.md"),
-    "opencode": AgentDef(binary="opencode", context_file="AGENTS.md"),
-}
+SKILL_INSTALL_CMD = "npx skills add nc9/taskmux --skill taskmux -g"
 
 
 def detectInstalledAgents() -> list[str]:
-    """Return names of agents whose binaries are on PATH."""
-    return [name for name, defn in KNOWN_AGENTS.items() if shutil.which(defn.binary)]
+    """Return agent CLI binaries on PATH (soft signal for prompts)."""
+    return [b for b in KNOWN_AGENT_BINARIES if shutil.which(b)]
+
+
+def detectContextFiles(project_path: Path) -> list[Path]:
+    """Return existing CLAUDE.md / AGENTS.md at the project root."""
+    return [project_path / name for name in CONTEXT_FILES if (project_path / name).exists()]
+
+
+_SKILL_NAME = "taskmux"
+
+# Per-agent install paths used by `vercel-labs/skills` (`npx skills add`).
+# Project-local entries are joined to the project root; global entries are
+# joined to $HOME. `.agents/skills` is the shared convention used by Codex,
+# OpenCode, Cursor, Gemini CLI, Copilot, Cline, Warp, etc.
+_PROJECT_SKILL_DIRS = (
+    Path(".claude") / "skills",       # Claude Code
+    Path(".agents") / "skills",       # shared cross-agent
+    Path(".codex") / "skills",
+    Path(".opencode") / "skills",
+)
+_GLOBAL_SKILL_DIRS = (
+    Path(".claude") / "skills",
+    Path(".agents") / "skills",
+    Path(".codex") / "skills",
+    Path(".config") / "opencode" / "skills",
+    Path(".config") / "agents" / "skills",
+)
+
+
+def skillInstalled(project_path: Path | None = None) -> bool:
+    """True if the taskmux skill is reachable at any known agent skill path.
+
+    Checks `<project>/<dir>/taskmux/SKILL.md` for each dir in
+    `_PROJECT_SKILL_DIRS`, plus `~/<dir>/taskmux/SKILL.md` for each dir in
+    `_GLOBAL_SKILL_DIRS`. Covers the install targets advertised by
+    `npx skills add` (https://github.com/vercel-labs/skills).
+    """
+    home = Path.home()
+    candidates = [home / d / _SKILL_NAME / "SKILL.md" for d in _GLOBAL_SKILL_DIRS]
+    if project_path is not None:
+        candidates.extend(
+            project_path / d / _SKILL_NAME / "SKILL.md" for d in _PROJECT_SKILL_DIRS
+        )
+    return any(p.exists() for p in candidates)
 
 
 def buildContextBlock(config: TaskmuxConfig) -> str:
-    """Build a markdown context block describing the taskmux setup."""
+    """Render the markdown block describing the project's taskmux setup."""
     lines = [
         CONTEXT_START,
         f"# Taskmux — {config.name}",
@@ -63,30 +107,28 @@ def buildContextBlock(config: TaskmuxConfig) -> str:
     return "\n".join(lines) + "\n"
 
 
-def injectAgentContext(agent_name: str, project_path: Path, config: TaskmuxConfig) -> Path:
-    """Write or update context block in an agent's context file. Returns path written."""
-    defn = KNOWN_AGENTS[agent_name]
-    target = project_path / defn.context_file
-    target.parent.mkdir(parents=True, exist_ok=True)
+def injectIntoFile(target: Path, config: TaskmuxConfig) -> Path:
+    """Write or update the marked taskmux block in `target`. Creates parent dirs.
 
+    Returns the absolute path written.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
     block = buildContextBlock(config)
 
-    if target.exists():
-        content = target.read_text()
-        # Replace existing block
-        pattern = re.compile(
-            re.escape(CONTEXT_START) + r".*?" + re.escape(CONTEXT_END),
-            re.DOTALL,
-        )
-        if pattern.search(content):
-            content = pattern.sub(block.rstrip("\n"), content)
-        else:
-            # Append
-            if not content.endswith("\n"):
-                content += "\n"
-            content += "\n" + block
-        target.write_text(content)
-    else:
+    if not target.exists():
         target.write_text(block)
+        return target
 
+    content = target.read_text()
+    pattern = re.compile(
+        re.escape(CONTEXT_START) + r".*?" + re.escape(CONTEXT_END),
+        re.DOTALL,
+    )
+    if pattern.search(content):
+        content = pattern.sub(block.rstrip("\n"), content)
+    else:
+        if not content.endswith("\n"):
+            content += "\n"
+        content += "\n" + block
+    target.write_text(content)
     return target

@@ -1714,10 +1714,32 @@ def alias_remove(
 app.add_typer(alias_app)
 
 
+def _hoist_global_flags(argv: list[str]) -> list[str]:
+    """Move `--json` (and `-V`/`--version`) to before the first subcommand.
+
+    Typer only recognizes app-level options before the subcommand
+    (`taskmux --json daemon status`). Agents and humans naturally place flags
+    after the subcommand (`taskmux daemon status --json`); without this hoist,
+    Typer rejects them with `No such option`. Hoisting (rather than stripping)
+    means the existing `main_callback` still sees the flag and `set_json_mode`
+    runs through its single source of truth.
+    """
+    GLOBAL = {"--json", "-V", "--version"}
+    hoisted: list[str] = []
+    rest: list[str] = []
+    for arg in argv:
+        if arg in GLOBAL:
+            hoisted.append(arg)
+        else:
+            rest.append(arg)
+    return hoisted + rest
+
+
 def main():
     """Main entry point for the CLI — global exception boundary."""
     with contextlib.suppress(Exception):
         migrateLayout()
+    sys.argv = [sys.argv[0], *_hoist_global_flags(sys.argv[1:])]
     try:
         app()
     except TaskmuxError as e:

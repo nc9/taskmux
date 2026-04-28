@@ -48,6 +48,40 @@ def test_help():
     assert "taskmux" in result.output.lower()
 
 
+class TestJsonFlagHoist:
+    """`--json` must work at every position, not just before the subcommand."""
+
+    def test_hoists_post_subcommand(self):
+        from taskmux.cli import _hoist_global_flags
+
+        # After a subcommand:
+        assert _hoist_global_flags(["daemon", "status", "--json"]) == [
+            "--json",
+            "daemon",
+            "status",
+        ]
+        # In the middle:
+        assert _hoist_global_flags(["daemon", "--json", "status"]) == [
+            "--json",
+            "daemon",
+            "status",
+        ]
+        # Already in the right place — no-op:
+        assert _hoist_global_flags(["--json", "daemon", "status"]) == [
+            "--json",
+            "daemon",
+            "status",
+        ]
+        # No --json at all — no-op:
+        assert _hoist_global_flags(["daemon", "status"]) == ["daemon", "status"]
+        # --version is hoisted too:
+        assert _hoist_global_flags(["daemon", "status", "-V"]) == [
+            "-V",
+            "daemon",
+            "status",
+        ]
+
+
 class TestInitCommand:
     @patch("taskmux.cli.initProject")
     def test_init_defaults(self, mock_init):

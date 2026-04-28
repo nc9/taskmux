@@ -17,7 +17,7 @@ Designed to pair well with coding agents like Claude Code, Codex, and OpenCode �
 - **Dynamic DNS** — optional in-process DNS server resolves any `*.localhost` to `127.0.0.1` (no `/etc/hosts` churn, no daemon restart when adding hosts)
 - **Worktree-aware** — linked git worktrees auto-namespace their `project_id` (`myproject-feat-foo`) so logs, registry entries, and proxy URLs don't collide with the primary checkout
 - **Port cleanup** — kills orphaned listeners before starting
-- **Agent context** — `taskmux init` injects a thin pointer + project task table into Claude/Codex/OpenCode context files; install the [taskmux skill](#claude-code-skill) for richer Claude Code guidance loaded on demand
+- **Agent context** — `taskmux init` patches a thin pointer + project task table into the project's `CLAUDE.md` / `AGENTS.md` (whichever exists; prompts you to pick if neither does). Install the [taskmux skill](#agent-skill) for the richer cross-agent CLI cheat sheet
 - **Daemon-owned processes** — every task runs under the daemon as its own process group on a PTY (so colors + `isatty()` keep working). Daemon shutdown signal-cascades into every task; CLI commands are thin RPC over a local WebSocket.
 
 ## Install
@@ -28,16 +28,27 @@ Requires Python 3.11+. No tmux dependency.
 uv tool install taskmux
 ```
 
-### Claude Code skill
+### Agent skill
 
-Generic CLI guidance (when to invoke, JSON patterns, anti-patterns) lives in a Claude Code skill at [`skills/taskmux/`](skills/taskmux/SKILL.md). Project task tables still come from `taskmux init` injection. Install via [vercel-labs/skills](https://github.com/vercel-labs/skills):
+Generic CLI guidance (when to invoke, JSON patterns, anti-patterns) lives in a portable agent skill at [`skills/taskmux/`](skills/taskmux/SKILL.md). It works with Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Copilot, and any other agent that speaks the [`vercel-labs/skills`](https://github.com/vercel-labs/skills) convention. Project task tables still come from `taskmux init` patching `CLAUDE.md` / `AGENTS.md`.
+
+Install via:
 
 ```bash
-npx skills add nc9/taskmux --skill taskmux        # project: .claude/skills/
-npx skills add nc9/taskmux --skill taskmux -g     # global:  ~/.claude/skills/
+npx skills add nc9/taskmux --skill taskmux        # project-local (.claude/skills/ or .agents/skills/)
+npx skills add nc9/taskmux --skill taskmux -g     # global (~/.claude/skills/, ~/.agents/skills/, etc.)
 ```
 
-Codex/OpenCode users don't need the skill — `taskmux init` writes a self-contained `AGENTS.md` block.
+`taskmux init` checks for the skill at the common install paths and prints the install hint if it's missing — you only need to run it once per machine (or per project for project-local installs).
+
+### Agent context files (`taskmux init`)
+
+`taskmux init` patches a small marked block (`<!-- taskmux:start --> ... <!-- taskmux:end -->`) into the project's existing `CLAUDE.md` and/or `AGENTS.md`. The block lists current tasks + URLs and points the agent at `taskmux --json status` / `inspect` / `logs`.
+
+- Both files exist → patches both.
+- One file exists → patches that one.
+- Neither exists → interactive prompt asks which to create (default: `AGENTS.md`, the cross-agent convention). With `--defaults`, creates `AGENTS.md`.
+- Re-running `taskmux init` (after `taskmux add`/`remove`) replaces the marked block in place — your other notes in the file are untouched.
 
 ## Commands
 
