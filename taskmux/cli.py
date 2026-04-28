@@ -158,6 +158,41 @@ def init(
         )
 
 
+def _warn_unprivileged_daemon() -> None:
+    """Print a terminal warning before spawning/foregrounding the daemon when
+    it'll fail to bind :443 / write /etc/resolver. The daemon logs its own
+    warning too, but that goes to ~/.taskmux/daemon.log — easy to miss when
+    you ran `taskmux daemon` from a shell."""
+    import os as _os
+
+    from .global_config import loadGlobalConfig
+
+    cfg = loadGlobalConfig()
+    if _os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+        return
+    if not cfg.proxy_enabled:
+        return
+    if hasattr(_os, "geteuid") and _os.geteuid() == 0:
+        return
+    needs: list[str] = []
+    if cfg.proxy_https_port < 1024:
+        needs.append(f"bind :{cfg.proxy_https_port}")
+    if cfg.host_resolver in ("etc_hosts", "dns_server"):
+        target = (
+            "/etc/hosts"
+            if cfg.host_resolver == "etc_hosts"
+            else f"/etc/resolver/{cfg.dns_managed_tld}"
+        )
+        needs.append(f"write {target}")
+    if not needs:
+        return
+    if not is_json_mode():
+        console.print(
+            f"[yellow]Warning: starting daemon without root — these will fail: "
+            f"{', '.join(needs)}. Use `sudo taskmux daemon` for proxy + DNS to work.[/yellow]"
+        )
+
+
 def _spawn_detached_daemon(port: int | None = None) -> int | None:
     """Fork the global taskmux daemon as a detached background process.
 
@@ -735,6 +770,7 @@ def daemon(
     """
     if ctx.invoked_subcommand is not None:
         return
+    _warn_unprivileged_daemon()
     d = TaskmuxDaemon(api_port=port)
     asyncio.run(d.start())
 
@@ -778,6 +814,7 @@ def daemon_start(
             console.print(f"Daemon already running (pid {existing})")
         return
     _autoRegisterCwd()
+    _warn_unprivileged_daemon()
     pid = _spawn_detached_daemon(port=port)
     if pid is None:
         if is_json_mode():

@@ -282,6 +282,8 @@ class TaskmuxDaemon:
             self.logger.error(f"Global daemon already running (pid {existing})")
             sys.exit(1)
 
+        self._warn_if_unprivileged()
+
         # Step 1: while we may still have root, pre-bind the privileged proxy
         # socket. This must happen before _drop_privileges() since :443 needs
         # CAP_NET_BIND_SERVICE / root.
@@ -471,6 +473,42 @@ class TaskmuxDaemon:
         self.logger.info(f"Unregistered project '{session}'")
 
     # ---- privileged bootstrap ----
+
+    def _warn_if_unprivileged(self) -> None:
+        """Loudly warn at startup when the daemon won't be able to bind privileged
+        ports or write to system files (the actual failures still happen + log
+        their own errors, but they're scattered and easy to miss in a tail)."""
+        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+            return
+        if not self.global_config.proxy_enabled:
+            return
+        # POSIX: euid 0 means we have full privileges. Windows has no euid;
+        # we let the bind/write attempts surface their own messages there.
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if is_root:
+            return
+        needs_priv: list[str] = []
+        if self.global_config.proxy_https_port < 1024:
+            needs_priv.append(
+                f"binding the proxy on :{self.global_config.proxy_https_port}"
+            )
+        if self.global_config.host_resolver in ("etc_hosts", "dns_server"):
+            target = (
+                "/etc/hosts"
+                if self.global_config.host_resolver == "etc_hosts"
+                else f"/etc/resolver/{self.global_config.dns_managed_tld}"
+            )
+            needs_priv.append(f"writing {target}")
+        if not needs_priv:
+            return
+        self.logger.error(
+            "Daemon started WITHOUT root — the following will fail: "
+            + "; ".join(needs_priv)
+            + ". Run `sudo taskmux daemon` (the daemon binds privileged "
+            "resources as root, then drops to your user). To run unprivileged "
+            "anyway: set proxy_enabled = false (or proxy_https_port >= 1024 + "
+            'host_resolver = "noop") in ~/.taskmux/config.toml.'
+        )
 
     def _pre_bind_proxy_socket(self) -> socket.socket | None:
         """Open + listen on the proxy port while we still have root.
