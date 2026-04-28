@@ -594,9 +594,11 @@ class TaskmuxDaemon:
         for etc_hosts (no glob support); the `dns_server` resolver answers
         wildcards in code.
         """
+        from .aliases import loadAliases
         from .config import loadProjectIdentity
 
         mappings: list[tuple[str, str]] = []
+        wildcard_under_etc_hosts: list[str] = []
         tld = self.global_config.dns_managed_tld
         for session, entry in readRegistry().items():
             cfg_path = Path(entry["config_path"])
@@ -612,13 +614,24 @@ class TaskmuxDaemon:
                 if task_cfg.host is None:
                     continue
                 if task_cfg.host == "*":
-                    # Wildcard — only `dns_server` can answer; no static entry.
+                    wildcard_under_etc_hosts.append(project_id)
                     continue
                 if task_cfg.host == "":
                     fqdn = f"{project_id}.{tld}"
                 else:
                     fqdn = f"{task_cfg.host}.{project_id}.{tld}"
                 mappings.append((fqdn, "127.0.0.1"))
+            for alias_entry in loadAliases(identity.project, identity.worktree_id).values():
+                host = alias_entry["host"]
+                fqdn = f"{project_id}.{tld}" if host == "" else f"{host}.{project_id}.{tld}"
+                mappings.append((fqdn, "127.0.0.1"))
+        if wildcard_under_etc_hosts and self.global_config.host_resolver == "etc_hosts":
+            projects = ", ".join(sorted(set(wildcard_under_etc_hosts)))
+            self.logger.warning(
+                f"Wildcard hosts on {projects} won't resolve under host_resolver='etc_hosts' "
+                f"(no wildcard support in /etc/hosts). Switch to host_resolver='dns_server' "
+                f"in ~/.taskmux/config.toml so unmapped subdomains catch-all to 127.0.0.1."
+            )
         return mappings
 
     def _sync_hostnames(self) -> None:
@@ -752,6 +765,10 @@ class TaskmuxDaemon:
             port = sup.assigned_ports.get(task_name)
             if port is not None and task_name in running:
                 self.proxy.set_route(session, task_cfg.host, port)
+        from .aliases import loadAliases as _loadAliases
+
+        for alias_entry in _loadAliases(sup.config.name, sup.worktree_id).values():
+            self.proxy.set_route(session, alias_entry["host"], alias_entry["port"])
 
     def _on_task_route_change(self, project: str, _task: str, host: str, port: int | None) -> None:
         if self.proxy is None:
@@ -762,27 +779,56 @@ class TaskmuxDaemon:
             self.proxy.set_route(project, host, port)
 
     async def _resync_project_routes(self, session: str) -> dict:
+        """Reconcile a project's proxy routes against disk state + live tasks.
+
+        Used after an out-of-band CLI lifecycle command (start/stop/restart/kill
+        or alias add/remove) in a separate process. We re-read assigned_ports
+        from state.json, build the desired host set from (live tasks ∪ aliases),
+        drop any existing route not in that set, and set the desired ones.
+        """
+        from .aliases import loadAliases as _loadAliases
+
         async with self._lock:
             sup = self.projects.get(session)
             cfg = self.configs.get(session)
         if sup is None or cfg is None:
             return {"ok": False, "error": "unknown_session", "added": [], "dropped": []}
         sup.reload_state()
+
         added: list[str] = []
         dropped: list[str] = []
-        running = set(sup.list_windows()) if sup.session_exists() else set()
+        running_windows: set[str] = set()
+        try:
+            if sup.session_exists():
+                running_windows = set(sup.list_windows())
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"resync: list_windows failed for {session!r}: {e}")
+
+        desired: dict[str, int] = {}
         for task_name, task_cfg in cfg.tasks.items():
             if task_cfg.host is None:
                 continue
             port = sup.assigned_ports.get(task_name)
-            if task_name in running and port is not None:
-                if self.proxy is not None:
-                    self.proxy.set_route(session, task_cfg.host, port)
-                added.append(task_cfg.host)
-            else:
-                if self.proxy is not None:
-                    self.proxy.drop_route(session, task_cfg.host)
-                dropped.append(task_cfg.host)
+            if task_name in running_windows and port is not None:
+                desired[task_cfg.host] = port
+        for alias_entry in _loadAliases(sup.config.name, sup.worktree_id).values():
+            desired[alias_entry["host"]] = alias_entry["port"]
+
+        if self.proxy is not None:
+            snapshot = (
+                self.proxy.routes_snapshot() if hasattr(self.proxy, "routes_snapshot") else {}
+            )
+            existing = set(snapshot.get(session, {}).keys())
+            for host in existing - desired.keys():
+                self.proxy.drop_route(session, host)
+                dropped.append(host)
+            for host, port in desired.items():
+                self.proxy.set_route(session, host, port)
+                added.append(host)
+        else:
+            added.extend(desired.keys())
+        with contextlib.suppress(Exception):
+            self._sync_hostnames()
         return {"ok": True, "added": added, "dropped": dropped}
 
     async def _mark_missing(self, session: str) -> None:
@@ -940,6 +986,13 @@ class TaskmuxDaemon:
         async with self._lock:
             sup = self.projects.get(session)
             cfg = self.configs.get(session)
+        if sup is None and command == "resync":
+            # CLI may have just registered the project (e.g. `alias add` on a
+            # fresh project). Beat the watcher: sync once, then look again.
+            await self._sync_with_registry()
+            async with self._lock:
+                sup = self.projects.get(session)
+                cfg = self.configs.get(session)
         if sup is None or cfg is None:
             return {"error": "unknown_session", "session": session, "command": command}
 

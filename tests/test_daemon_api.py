@@ -300,8 +300,11 @@ host = "api"
             def drop_route(self, project, host):
                 self.routes.pop((project, host), None)
 
-            def routes_snapshot(self):
-                return {f"{p}/{h}": port for (p, h), port in self.routes.items()}
+            def routes_snapshot(self) -> dict[str, dict[str, int]]:
+                out: dict[str, dict[str, int]] = {}
+                for (project, host), port in self.routes.items():
+                    out.setdefault(project, {})[host] = port
+                return out
 
         fake = _FakeProxy()
         daemon.proxy = fake  # type: ignore[assignment]

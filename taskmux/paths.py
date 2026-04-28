@@ -73,6 +73,11 @@ def projectStatePath(project: str, worktree_id: str | None = None) -> Path:
     return projectDir(project, worktree_id) / "state.json"
 
 
+def projectAliasesPath(project: str, worktree_id: str | None = None) -> Path:
+    """Per-project alias map JSON. Aliases route external ports through the proxy."""
+    return projectDir(project, worktree_id) / "aliases.json"
+
+
 def projectCertDir(project_id: str) -> Path:
     """mkcert-issued cert directory keyed by project_id (already encodes worktree)."""
     return CERTS_DIR / project_id

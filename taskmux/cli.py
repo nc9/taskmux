@@ -34,7 +34,6 @@ from .output import is_json_mode, print_error, print_result, set_json_mode
 from .paths import (
     ensureTaskmuxDir,
     globalDaemonLogPath,
-    projectLogsDir,
     taskLogPath,
 )
 from .paths import migrate as migrateLayout
@@ -157,6 +156,15 @@ def _call_session(command: str, session: str, **params) -> dict:
     payload = {"session": session, **params}
     resp = ipc_client.call(command, params=payload)
     return resp.get("result", resp)
+
+
+def _notify_daemon_resync(session: str) -> None:
+    """Nudge the daemon to reconcile proxy routes against disk state.
+
+    Best-effort — silently no-ops if no daemon is running. Used by alias
+    add/remove and other out-of-band mutators.
+    """
+    ipc_client.call_no_ensure("resync", params={"session": session})
 
 
 def _version_callback(value: bool) -> None:
@@ -438,33 +446,187 @@ def _follow_all(
 def logs_clean(
     task: str | None = typer.Argument(None, help="Task name (omit for all)"),
 ):
-    """Delete persistent log files."""
+    """Delete persistent log files (alias for `clean --logs`).
+
+    Removes log files from ~/.taskmux/projects/{session}/logs/. Specify a task
+    name to clean only that task's logs, or omit to clean all logs for the
+    current session.
+    """
+    from .cleanup import cleanLogs
+
     cli = TaskmuxCLI()
-    log_dir = projectLogsDir(cli.identity.project, cli.worktree_id)
-    if not log_dir.exists():
-        if is_json_mode():
-            print_result({"ok": True, "deleted": 0})
+    report = cleanLogs(cli.config.name, cli.identity.worktree_id, task=task)
+    if is_json_mode():
+        print_result({"ok": True, "task": task, "deleted": len(report["deleted"])})
+        return
+    if not report["deleted"]:
+        console.print("No log files found")
+    elif task:
+        console.print(f"Deleted {len(report['deleted'])} log file(s) for '{task}'")
+    else:
+        console.print(f"Deleted all logs for session '{cli.project_id}'")
+
+
+@app.command()
+def clean(
+    logs: bool = typer.Option(False, "--logs", help="Only delete log files"),  # noqa: B008
+    events: bool = typer.Option(  # noqa: B008
+        False, "--events", help="Only truncate ~/.taskmux/events.jsonl"
+    ),
+    certs: bool = typer.Option(  # noqa: B008
+        False, "--certs", help="Only remove minted *.localhost certs (mkcert root CA stays)"
+    ),
+    all_: bool = typer.Option(  # noqa: B008
+        False, "--all", help="Wipe ~/.taskmux/ entirely except config.toml"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report only, no deletes"),  # noqa: B008
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),  # noqa: B008
+    force: bool = typer.Option(  # noqa: B008
+        False, "--force", help="Wipe even if session running / daemon up"
+    ),
+):
+    """Wipe taskmux state. Default: current project (logs, state, certs, registry).
+
+    Flags select scope. Multiple are combined. With no scope flag and no
+    --all, wipes the current project's per-project state. --all is global
+    and refuses while the daemon is running unless --force.
+    """
+    from .cleanup import (
+        cleanAll,
+        cleanCerts,
+        cleanEvents,
+        cleanLogs,
+        cleanProjectState,
+    )
+
+    scoped = logs or events or certs
+    reports: dict = {}
+
+    if all_:
+        if not yes and not dry_run and not is_json_mode():
+            confirm = typer.confirm(
+                f"Wipe ~/.taskmux/ entirely (keep {globalDaemonLogPath().parent}/config.toml)?",
+                default=False,
+            )
+            if not confirm:
+                console.print("Aborted")
+                return
+        reports["all"] = cleanAll(dry_run=dry_run, force=force)
+    else:
+        cli = TaskmuxCLI()
+        proj = cli.config.name
+        wt = cli.identity.worktree_id
+        pid = cli.project_id
+
+        if not scoped:
+            if not yes and not dry_run and not is_json_mode():
+                confirm = typer.confirm(
+                    f"Wipe state for project '{pid}' (logs, state.json, certs, registry)?",
+                    default=False,
+                )
+                if not confirm:
+                    console.print("Aborted")
+                    return
+            reports["project"] = cleanProjectState(proj, wt, pid, dry_run=dry_run, force=force)
         else:
-            console.print("No log files found")
+            if logs:
+                reports["logs"] = cleanLogs(proj, wt, dry_run=dry_run)
+            if events:
+                reports["events"] = cleanEvents(dry_run=dry_run)
+            if certs:
+                reports["certs"] = cleanCerts(pid, dry_run=dry_run)
+
+    if is_json_mode():
+        print_result({"ok": True, "dry_run": dry_run, "reports": reports})
         return
 
-    if task:
-        count = 0
-        for f in log_dir.glob(f"{task}.log*"):
-            f.unlink()
-            count += 1
-        if is_json_mode():
-            print_result({"ok": True, "task": task, "deleted": count})
-        else:
-            console.print(f"Deleted {count} log file(s) for '{task}'")
-    else:
-        import shutil
+    for scope, rep in reports.items():
+        prefix = "[dim]would delete[/dim]" if dry_run else "Deleted"
+        for path in rep["deleted"]:
+            console.print(f"{prefix} {path}  [dim]({scope})[/dim]")
+        for s in rep["skipped"]:
+            console.print(f"[yellow]Skipped: {s}[/yellow]")
+        for sess in rep.get("unregistered", []):
+            verb = "would unregister" if dry_run else "Unregistered"
+            console.print(f"{verb} '{sess}'  [dim]({scope})[/dim]")
+    if not any(r["deleted"] or r["skipped"] or r.get("unregistered") for r in reports.values()):
+        console.print("Nothing to clean")
 
-        shutil.rmtree(log_dir)
+
+@app.command()
+def prune(
+    apply: bool = typer.Option(  # noqa: B008
+        False, "--apply", help="Act on the orphans (default is dry-run / report only)"
+    ),
+):
+    """Detect (and optionally clean) orphaned tmux sessions, registry entries,
+    leaked ports, and stale state.json windows.
+
+    Default is a read-only report. Use --apply to kill leaked-port pids,
+    drop stale registry rows, trim state.json, and kill stray tmux sessions.
+    """
+    from .cleanup import applyPrune, findOrphans
+
+    report = findOrphans()
+
+    if apply:
+        actions = applyPrune(report)
         if is_json_mode():
-            print_result({"ok": True, "session": cli.project_id, "action": "logs_cleaned"})
-        else:
-            console.print(f"Deleted all logs for session '{cli.project_id}'")
+            print_result({"ok": True, "report": report, "actions": actions})
+            return
+        if actions["killed_pids"]:
+            console.print(f"Killed pids: {actions['killed_pids']}")
+        for sess in actions["unregistered"]:
+            console.print(f"Unregistered '{sess}'")
+        for trim in actions["trimmed_state"]:
+            console.print(f"Trimmed state for '{trim['session']}': {trim['tasks']}")
+        for sess in actions["killed_sessions"]:
+            console.print(f"Killed tmux session '{sess}'")
+        if actions["removed_pidfile"]:
+            console.print("Removed stale daemon.pid")
+        if (
+            not any(actions[k] for k in ("killed_pids", "unregistered", "killed_sessions"))
+            and not actions["trimmed_state"]
+            and not actions["removed_pidfile"]
+        ):
+            console.print("Nothing to prune")
+        return
+
+    if is_json_mode():
+        print_result({"ok": True, "report": report, "applied": False})
+        return
+
+    any_found = False
+    for sess in report["stray_tmux_sessions"]:
+        any_found = True
+        console.print(f"[yellow]stray tmux session:[/yellow] {sess}")
+    for stale in report["stale_registry"]:
+        any_found = True
+        console.print(
+            f"[yellow]stale registry:[/yellow] {stale['session']} ([dim]{stale['reason']}[/dim])"
+        )
+    for leak in report["leaked_ports"]:
+        any_found = True
+        console.print(
+            f"[yellow]leaked port:[/yellow] {leak['session']}/{leak['task']} "
+            f"port {leak['port']} held by pid {leak['pid']} ([dim]{leak['reason']}[/dim])"
+        )
+    for miss in report["missing_windows"]:
+        any_found = True
+        console.print(
+            f"[yellow]stale state:[/yellow] {miss['session']}/{miss['task']} "
+            f"port {miss['port']} (window gone)"
+        )
+    for d in report["orphan_log_dirs"]:
+        any_found = True
+        console.print(f"[yellow]orphan log dir:[/yellow] {d}")
+    if report["stale_daemon_pid"] is not None:
+        any_found = True
+        console.print(f"[yellow]stale daemon.pid:[/yellow] {report['stale_daemon_pid']}")
+    if not any_found:
+        console.print("No orphans found")
+    else:
+        console.print("\n[dim]Re-run with --apply to clean up.[/dim]")
 
 
 @app.command()
@@ -562,30 +724,76 @@ def _status():
                 style="yellow",
             )
 
+    proxy = data.get("proxy")
+    if proxy and not proxy.get("bound"):
+        console.print(f"Proxy: {proxy['reason']}", style="yellow")
+
     console.print("-" * 70)
 
-    if not data.get("tasks"):
+    aliases = data.get("aliases") or []
+    tasks = data.get("tasks", [])
+    if not tasks and not aliases:
         console.print("No tasks configured")
         return
+    if not tasks:
+        console.print("No tasks configured")
+        _print_alias_section(aliases)
+        return
 
-    for t in data["tasks"]:
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("", width=1, no_wrap=True)
+    table.add_column("Status", style="cyan", no_wrap=True)
+    table.add_column("Task", style="magenta", no_wrap=True)
+    table.add_column("URL", no_wrap=True)
+    table.add_column("Command", overflow="ellipsis", no_wrap=True)
+    table.add_column("Notes", style="dim", no_wrap=True)
+
+    fail_rows: list[tuple[str, str, str]] = []
+    for t in tasks:
         health_icon = "G" if t["healthy"] else "R" if t["running"] else "o"
+        icon_style = "green" if t["healthy"] else "red" if t["running"] else "dim"
         status_text = "Healthy" if t["healthy"] else "Running" if t["running"] else "Stopped"
-        auto = "" if t["auto_start"] else " [manual]"
-        url = t.get("url") or ""
-        url_col = f" {url}" if url else ""
-        extras = ""
+        notes: list[str] = []
+        if not t["auto_start"]:
+            notes.append("manual")
         if t.get("restart_policy") and t["restart_policy"] != str(RestartPolicy.ON_FAILURE):
-            extras += f" restart={t['restart_policy']}"
+            notes.append(f"restart={t['restart_policy']}")
         if t.get("cwd"):
-            extras += f" cwd={t['cwd']}"
+            notes.append(f"cwd={t['cwd']}")
         if t.get("depends_on"):
-            extras += f" deps=[{','.join(t['depends_on'])}]"
-        line = f"{health_icon} {status_text:8} {t['name']:15}{url_col} {t['command']}"
-        console.print(f"{line}{auto}{extras}")
+            notes.append(f"deps=[{','.join(t['depends_on'])}]")
+        table.add_row(
+            f"[{icon_style}]{health_icon}[/{icon_style}]",
+            status_text,
+            t["name"],
+            t.get("url") or "",
+            t["command"],
+            " ".join(notes),
+        )
         last = t.get("last_health")
         if last and not last.get("ok") and last.get("reason"):
-            console.print(f"    fail: {last['method']} — {last['reason']}", style="red")
+            fail_rows.append((t["name"], last.get("method", ""), last.get("reason", "")))
+
+    console.print(table)
+    for name, method, reason in fail_rows:
+        console.print(f"    {name} fail: {method} — {reason}", style="red")
+
+    _print_alias_section(aliases)
+
+
+def _print_alias_section(aliases: list[dict]) -> None:
+    """Render the 'Aliases (external routes)' section in human status output."""
+    if not aliases:
+        return
+    console.print()
+    console.print("Aliases (external routes):", style="bold")
+    atable = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    atable.add_column("Name", style="magenta")
+    atable.add_column("URL")
+    atable.add_column("Target", style="dim")
+    for a in aliases:
+        atable.add_row(a["name"], a["url"], f"127.0.0.1:{a['port']}")
+    console.print(atable)
 
 
 app.command(name="status")(_status)
@@ -685,26 +893,32 @@ def events(
 
 @app.command()
 def url(
-    task: str = typer.Argument(..., help="Task name"),
+    task: str = typer.Argument(..., help="Task or alias name"),
 ):
-    """Print the proxy URL for a task: https://{host}.{project}.localhost"""
+    """Print the proxy URL for a task or alias: https://{host}.{project}.localhost"""
+    from .aliases import lookupAlias
     from .url import taskUrl
 
     cli = TaskmuxCLI()
     cfg = cli.config.tasks.get(task)
-    if cfg is None:
-        if is_json_mode():
-            print_result({"ok": False, "error": "task_not_found", "task": task})
+    host: str | None = cfg.host if cfg is not None else None
+    if host is None:
+        alias = lookupAlias(cli.config.name, cli.identity.worktree_id, task)
+        if alias is not None:
+            host = alias["host"]
+    if host is None:
+        if cfg is None:
+            err = "task_not_found"
+            msg = f"'{task}' not found as task or alias"
         else:
-            console.print(f"Task '{task}' not found in config", style="red")
-        sys.exit(1)
-    if cfg.host is None:
+            err = "no_host"
+            msg = f"Task '{task}' has no host set (not exposed via proxy)"
         if is_json_mode():
-            print_result({"ok": False, "error": "no_host", "task": task})
+            print_result({"ok": False, "error": err, "task": task})
         else:
-            console.print(f"Task '{task}' has no host set (not exposed via proxy)", style="yellow")
+            console.print(msg, style="yellow" if err == "no_host" else "red")
         sys.exit(1)
-    u = taskUrl(cli.project_id, cfg.host)
+    u = taskUrl(cli.project_id, host)
     if is_json_mode():
         print_result({"ok": True, "task": task, "url": u})
     else:
@@ -1380,6 +1594,124 @@ def worktree_urls():
 
 
 app.add_typer(worktree_app)
+
+
+# ---------------------------------------------------------------------------
+# Alias sub-app — register external ports as proxy routes (no tmux task)
+# ---------------------------------------------------------------------------
+
+alias_app = typer.Typer(
+    name="alias",
+    help=(
+        "Register external ports as proxy routes (Docker containers, external "
+        "dev servers). Aliases live in per-project aliases.json, separate "
+        "from tasks in taskmux.toml."
+    ),
+    no_args_is_help=True,
+)
+
+
+@alias_app.command("add")
+def alias_add(
+    name: str = typer.Argument(..., help="Alias name (also default subdomain)"),
+    port: int = typer.Argument(..., help="Target port on 127.0.0.1"),
+    host: str | None = typer.Option(  # noqa: B008
+        None, "--host", help="Override subdomain (defaults to alias name)"
+    ),
+):
+    """Add a proxy alias: https://{host}.{project}.localhost → 127.0.0.1:{port}.
+
+    The target server must already be running; taskmux does not start or
+    monitor it. Conflicts with task `host` slugs are rejected at registration
+    time.
+    """
+    from .aliases import addAlias
+
+    cli = TaskmuxCLI()
+    effective_host = host or name
+    for task_name, task_cfg in cli.config.tasks.items():
+        if task_cfg.host == effective_host:
+            err = f"alias host '{effective_host}' collides with task '{task_name}' in taskmux.toml"
+            if is_json_mode():
+                print_result({"ok": False, "error": err})
+            else:
+                console.print(err, style="red")
+            sys.exit(1)
+    entry = addAlias(cli.config.name, cli.identity.worktree_id, name, port, host=host)
+    try:
+        registerProject(cli.project_id, cli.config_path)
+    except TaskmuxError as e:
+        if not is_json_mode():
+            console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
+    _notify_daemon_resync(cli.project_id)
+    from .url import taskUrl
+
+    u = taskUrl(cli.project_id, entry["host"])
+    if is_json_mode():
+        print_result(
+            {
+                "ok": True,
+                "alias": name,
+                "host": entry["host"],
+                "port": entry["port"],
+                "url": u,
+            }
+        )
+    else:
+        console.print(f"Alias '{name}' → {u} (127.0.0.1:{entry['port']})")
+
+
+@alias_app.command("list")
+def alias_list():
+    """List all aliases for the current project."""
+    from .aliases import loadAliases
+    from .url import taskUrl
+
+    cli = TaskmuxCLI()
+    aliases = loadAliases(cli.config.name, cli.identity.worktree_id)
+    rows = [
+        {"name": n, "host": e["host"], "port": e["port"], "url": taskUrl(cli.project_id, e["host"])}
+        for n, e in sorted(aliases.items())
+    ]
+    if is_json_mode():
+        print_result({"aliases": rows, "count": len(rows)})
+        return
+    if not rows:
+        console.print("No aliases configured")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Name")
+    table.add_column("Host")
+    table.add_column("Port", justify="right")
+    table.add_column("URL")
+    for r in rows:
+        table.add_row(r["name"], r["host"], str(r["port"]), r["url"])
+    console.print(table)
+
+
+@alias_app.command("remove")
+def alias_remove(
+    name: str = typer.Argument(..., help="Alias name"),
+):
+    """Remove an alias from the current project."""
+    from .aliases import removeAlias
+
+    cli = TaskmuxCLI()
+    removed = removeAlias(cli.config.name, cli.identity.worktree_id, name)
+    if not removed:
+        if is_json_mode():
+            print_result({"ok": False, "error": "alias_not_found", "alias": name})
+        else:
+            console.print(f"Alias '{name}' not found", style="yellow")
+        sys.exit(1)
+    _notify_daemon_resync(cli.project_id)
+    if is_json_mode():
+        print_result({"ok": True, "alias": name, "action": "removed"})
+    else:
+        console.print(f"Removed alias '{name}'")
+
+
+app.add_typer(alias_app)
 
 
 def main():
