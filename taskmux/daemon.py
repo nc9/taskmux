@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 from datetime import datetime
@@ -27,13 +28,16 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .events import recordEvent
+from .host_resolver import HostResolver, getResolver
 from .paths import (
     REGISTRY_PATH,
     ensureTaskmuxDir,
     globalDaemonLogPath,
     globalDaemonPidPath,
 )
+from .proxy import ProxyServer
 from .registry import readRegistry
+from .url import taskUrl
 
 if TYPE_CHECKING:
     from .cli import TaskmuxCLI
@@ -211,6 +215,21 @@ class TaskmuxDaemon:
         self.registry_observer: Observer | None = None  # type: ignore[reportInvalidTypeForm]
         self.project_states: dict[str, str] = {}  # session -> "ok" | "config_missing" | "error"
         self.project_paths: dict[str, str] = {}  # session -> abs config_path
+        self.proxy: ProxyServer | None = None
+        # Proxy is "eligible" once CA is installed and config allows it; we may
+        # not have started the listener yet (no registered projects → nothing
+        # to certify). First eligible project register triggers the bind.
+        self._proxy_eligible = False
+        self._proxy_started = False
+        # Pre-bound listening socket for :443. Opened in start() while we still
+        # have root, then handed to ProxyServer after privilege drop.
+        self._proxy_sock: socket.socket | None = None
+        # Pluggable hostname resolution (writes /etc/hosts by default; can
+        # also run an in-process DNS server). Constructed during start().
+        self.host_resolver: HostResolver | None = None
+        # In-process DNS server (only when host_resolver = "dns_server").
+        # Lifetime tied to the daemon's asyncio loop. None for other resolvers.
+        self.dns_server: object | None = None
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self.logger = self._setup_logging()
@@ -263,14 +282,33 @@ class TaskmuxDaemon:
             self.logger.error(f"Global daemon already running (pid {existing})")
             sys.exit(1)
 
+        # Step 1: while we may still have root, pre-bind the privileged proxy
+        # socket. This must happen before _drop_privileges() since :443 needs
+        # CAP_NET_BIND_SERVICE / root.
+        self._proxy_sock = self._pre_bind_proxy_socket()
+
+        # Step 2: also while privileged, do whatever the resolver needs at
+        # root level. For `etc_hosts` this writes the managed block. For
+        # `dns_server` this writes /etc/resolver/<tld> (or platform equivalent).
+        self._install_resolver_root()
+
+        # Step 3: drop privileges back to the user that ran sudo. Everything
+        # after this point — tmux ops, mkcert minting, state files, pid file,
+        # the DNS server itself — runs as the user, so paths and file
+        # ownership are correct.
+        self._drop_privileges()
+
         _write_daemon_pid()
         self.running = True
         self._loop = asyncio.get_running_loop()
 
-        self.logger.info(f"Starting unified taskmux daemon (pid {os.getpid()})")
+        self.logger.info(f"Starting unified taskmux daemon (pid {os.getpid()}, uid {os.getuid()})")
 
         await self._sync_with_registry()
         self._start_registry_watcher()
+        await self._maybe_start_dns_server()
+        self._sync_hostnames()
+        await self._maybe_start_proxy()
 
         self.health_check_task = asyncio.create_task(self._health_check_loop())
         api_task = asyncio.create_task(self._start_api_server())
@@ -298,6 +336,14 @@ class TaskmuxDaemon:
 
         if self.health_check_task and not self.health_check_task.done():
             self.health_check_task.cancel()
+
+        if self.proxy is not None and self._loop is not None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(self.proxy.stop(), self._loop)
+
+        if self.dns_server is not None and self._loop is not None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(self.dns_server.stop(), self._loop)  # type: ignore[attr-defined]
 
         _clear_daemon_pid()
         self.logger.info("Taskmux daemon stopped")
@@ -361,11 +407,38 @@ class TaskmuxDaemon:
         self.projects[session] = cli
         self.project_states[session] = "ok"
 
+        # Wire route updates from TmuxManager to the proxy regardless of proxy state.
+        cli.tmux.on_task_route_change = self._on_task_route_change
+        if self._proxy_eligible and self.proxy is not None:
+            self._mint_and_register_proxy(session, cli)
+            # Late bind: if proxy was eligible but had no projects yet, bind now.
+            if self._loop is not None and not self._proxy_started:
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._start_proxy_listener())
+                )
+        # Refresh host resolver mappings. For dns_server this is a pure
+        # in-memory update (no privilege needed). For etc_hosts post-drop
+        # this no-ops with EACCES; we log a hint so the user knows.
+        if self.host_resolver is not None:
+            new_hosts = [
+                f"{tc.host}.{cli.config.name}.{self.global_config.dns_managed_tld}"
+                for tc in cli.config.tasks.values()
+                if tc.host is not None
+            ]
+            self._sync_hostnames()
+            if new_hosts and self.host_resolver.name == "etc_hosts":
+                self.logger.info(
+                    f"Project '{session}' added with hosts {new_hosts}. "
+                    f"Restart `sudo taskmux daemon` to refresh /etc/hosts "
+                    f'(or use host_resolver = "dns_server" for dynamic adds).'
+                )
+
         if self._loop is not None:
             observer = Observer()
             handler = ConfigWatcher(
                 cli,
                 self._loop,
+                on_reload=lambda c, s=session: self._on_project_reload(s),
                 on_missing=lambda c, s=session: self._loop.call_soon_threadsafe(  # type: ignore[union-attr]
                     lambda: asyncio.create_task(self._mark_missing(s))
                 ),
@@ -386,10 +459,382 @@ class TaskmuxDaemon:
         self.projects.pop(session, None)
         self.project_states.pop(session, None)
         self.project_paths.pop(session, None)
+        if self.proxy is not None:
+            self.proxy.unregister_project(session)
+            from .ca import dropCert
+
+            with contextlib.suppress(Exception):
+                dropCert(session)
+        # Refresh the resolver so the unregistered project's hosts disappear
+        # (dns_server: instant; etc_hosts: no-op post-drop).
+        self._sync_hostnames()
         self.logger.info(f"Unregistered project '{session}'")
 
+    # ---- privileged bootstrap ----
+
+    def _pre_bind_proxy_socket(self) -> socket.socket | None:
+        """Open + listen on the proxy port while we still have root.
+
+        Returns the listening socket; ProxyServer wraps it in TLS later.
+        Returns None when proxy is disabled, port is non-privileged, or bind
+        fails (logged). Safe to call as a non-root user — bind to a high port
+        will succeed without privileges.
+        """
+        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+            return None
+        if not self.global_config.proxy_enabled:
+            return None
+        family = socket.AF_INET
+        addr = (self.global_config.proxy_bind, self.global_config.proxy_https_port)
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(addr)
+            s.listen(128)
+            s.setblocking(False)
+        except (PermissionError, OSError) as e:
+            s.close()
+            self.logger.error(
+                f"Pre-bind to {addr[0]}:{addr[1]} failed: {e}. "
+                f"Run with `sudo taskmux daemon` (the daemon binds :443 as root "
+                f"then drops privileges immediately) or set proxy_https_port to "
+                f"a non-privileged port (>=1024) in ~/.taskmux/config.toml."
+            )
+            return None
+        self.logger.info(
+            f"Pre-bound proxy listener on {addr[0]}:{addr[1]} (will TLS-wrap after privilege drop)"
+        )
+        return s
+
+    def _install_resolver_root(self) -> None:
+        """While privileged, do the resolver-specific one-time install:
+
+        - etc_hosts: write a managed block now (will need re-sync later
+          but we're going to lose privilege so do it once).
+        - dns_server: write /etc/resolver/<tld> (or the platform's
+          equivalent) so the OS sends queries to our soon-to-start
+          in-process DNS server.
+        - noop: nothing.
+        """
+        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+            return
+        if not self.global_config.proxy_enabled:
+            return
+
+        kind = self.global_config.host_resolver
+        if kind == "etc_hosts":
+            # Build the etc_hosts resolver up-front and let it write while root.
+            try:
+                self.host_resolver = getResolver("etc_hosts")
+            except ValueError as e:
+                self.logger.error(f"Host resolver init failed: {e}")
+                return
+            mappings = self._collect_host_mappings()
+            try:
+                self.host_resolver.sync(mappings)
+            except (PermissionError, OSError) as e:
+                self.logger.warning(
+                    f"etc_hosts sync failed ({e}). Run with sudo or set "
+                    f'host_resolver = "noop" in ~/.taskmux/config.toml.'
+                )
+        elif kind == "dns_server":
+            from . import dns_install
+
+            try:
+                dns_install.installDelegation(
+                    self.global_config.dns_managed_tld,
+                    self.global_config.dns_server_port,
+                )
+                dns_install.flushDnsCache()
+            except (PermissionError, OSError, RuntimeError) as e:
+                self.logger.error(
+                    f"DNS delegation install failed: {e}. "
+                    f"Browsers won't resolve {self.global_config.dns_managed_tld} "
+                    f"hostnames until this is fixed (or switch to "
+                    f'host_resolver = "etc_hosts").'
+                )
+
+    async def _maybe_start_dns_server(self) -> None:
+        """Post-privilege-drop: start the in-process DNS server if configured."""
+        if self.global_config.host_resolver != "dns_server":
+            return
+        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+            return
+
+        from .dns_server import DnsServer
+
+        srv = DnsServer(
+            host="127.0.0.1",
+            port=self.global_config.dns_server_port,
+            tld=self.global_config.dns_managed_tld,
+        )
+        try:
+            await srv.start()
+        except OSError as e:
+            self.logger.error(
+                f"DNS server bind to 127.0.0.1:{self.global_config.dns_server_port} "
+                f"failed: {e}. Likely something else (dnsmasq / pihole) is on this "
+                f"port — change dns_server_port in ~/.taskmux/config.toml."
+            )
+            return
+        self.dns_server = srv
+        self.host_resolver = getResolver("dns_server", dns_server=srv)
+
+    def _collect_host_mappings(self) -> list[tuple[str, str]]:
+        """Walk the registry; return every (fqdn, 127.0.0.1) for tasks with host."""
+        from .config import loadConfig
+        from .registry import readRegistry
+
+        mappings: list[tuple[str, str]] = []
+        for session, entry in readRegistry().items():
+            cfg_path = Path(entry["config_path"])
+            if not cfg_path.exists():
+                continue
+            try:
+                cfg = loadConfig(cfg_path)
+            except Exception as e:  # noqa: BLE001
+                self.logger.warning(f"Skipping host collection for {session!r}: {e}")
+                continue
+            for task_cfg in cfg.tasks.values():
+                if task_cfg.host is None:
+                    continue
+                fqdn = f"{task_cfg.host}.{cfg.name}.{self.global_config.dns_managed_tld}"
+                mappings.append((fqdn, "127.0.0.1"))
+        return mappings
+
+    def _sync_hostnames(self) -> None:
+        """Push the current set of mappings into whichever resolver is active.
+
+        Cheap to call — for `etc_hosts` after-drop this will likely fail with
+        EACCES (which we already wrote while root). For `dns_server` it's a
+        pure in-memory map update; we call this on every project register /
+        unregister / config-reload.
+        """
+        if self.host_resolver is None:
+            return
+        mappings = self._collect_host_mappings()
+        # etc_hosts post-drop sync is expected to fail with EACCES — the root
+        # bootstrap already populated the file; suppression intended.
+        with contextlib.suppress(PermissionError, OSError):
+            self.host_resolver.sync(mappings)
+
+    def _drop_privileges(self) -> None:
+        """If running as root via sudo, drop to SUDO_UID/SUDO_GID.
+
+        Without this, libtmux talks to /tmp/tmux-0 (root's tmux server) and
+        can't see the user's sessions, mkcert writes root-owned cert files,
+        and ~/.taskmux/ resolves under root's HOME. We bind :443 first, then
+        come back down to the invoking user.
+        """
+        # geteuid is POSIX-only; on Windows we don't drop privileges (the daemon
+        # either runs as Admin or doesn't bind privileged ports — there's no
+        # sudo equivalent to demote from).
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return
+        sudo_uid = os.environ.get("SUDO_UID")
+        sudo_gid = os.environ.get("SUDO_GID")
+        if not sudo_uid or not sudo_gid:
+            self.logger.warning(
+                "Daemon is running as root with no SUDO_UID — staying as root. "
+                "tmux/state/cert ownership will be off; prefer `sudo taskmux daemon`."
+            )
+            return
+        import pwd as _pwd
+
+        uid = int(sudo_uid)
+        gid = int(sudo_gid)
+        pw = _pwd.getpwuid(uid)
+        # Heal any prior root-owned state under the user's ~/.taskmux/ before
+        # dropping privileges — pid file, cert dirs, etc. left behind by a
+        # daemon that ran without dropping privs would otherwise EACCES the
+        # newly-unprivileged daemon.
+        taskmux_dir = Path(pw.pw_dir) / ".taskmux"
+        if taskmux_dir.is_dir():
+            for entry in taskmux_dir.rglob("*"):
+                with contextlib.suppress(OSError):
+                    if entry.stat().st_uid != uid:
+                        os.chown(entry, uid, gid, follow_symlinks=False)
+            with contextlib.suppress(OSError):
+                if taskmux_dir.stat().st_uid != uid:
+                    os.chown(taskmux_dir, uid, gid, follow_symlinks=False)
+        os.initgroups(pw.pw_name, gid)
+        os.setgid(gid)
+        os.setuid(uid)
+        # Reset env so child processes (mkcert, hooks, …) and HOME-derived
+        # paths resolve under the original user.
+        os.environ["HOME"] = pw.pw_dir
+        os.environ["USER"] = pw.pw_name
+        os.environ["LOGNAME"] = pw.pw_name
+        # paths.py captured TASKMUX_DIR at import — re-evaluate so it points
+        # at the user's ~/.taskmux instead of /var/root/.taskmux.
+        from . import paths as _paths
+
+        _paths.TASKMUX_DIR = Path(pw.pw_dir) / ".taskmux"
+        _paths.EVENTS_FILE = _paths.TASKMUX_DIR / "events.jsonl"
+        _paths.PROJECTS_DIR = _paths.TASKMUX_DIR / "projects"
+        _paths.CERTS_DIR = _paths.TASKMUX_DIR / "certs"
+        _paths.REGISTRY_PATH = _paths.TASKMUX_DIR / "registry.json"
+        _paths.GLOBAL_DAEMON_PID = _paths.TASKMUX_DIR / "daemon.pid"
+        _paths.GLOBAL_DAEMON_LOG = _paths.TASKMUX_DIR / "daemon.log"
+        _paths.GLOBAL_CONFIG_PATH = _paths.TASKMUX_DIR / "config.toml"
+        # daemon.py imported REGISTRY_PATH directly; refresh.
+        global REGISTRY_PATH
+        REGISTRY_PATH = _paths.REGISTRY_PATH
+        self.logger.info(f"Dropped privileges: now running as {pw.pw_name} (uid={uid}, gid={gid})")
+
+    # ---- proxy ----
+
+    async def _maybe_start_proxy(self) -> None:
+        """Prepare the HTTPS proxy: verify CA install + build ProxyServer +
+        mint certs for known projects.
+
+        The actual listener bind is deferred to _start_proxy_listener, which
+        is called once we have at least one project with a cert. That way
+        `taskmux daemon` works on an empty registry and only attaches the
+        TLS listener when there's something to serve.
+
+        On every daemon start, `mkcert -install` is invoked. It's idempotent —
+        a no-op when the CA is already trusted — but acts as a check that
+        the trust store still has our CA (e.g. a system update may have
+        cleared it). Failure is logged but doesn't kill the proxy; certs
+        will be served untrusted until `taskmux ca install` is run manually
+        in an interactive session.
+        """
+        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+            self.logger.info("Proxy disabled via TASKMUX_DISABLE_PROXY=1")
+            return
+        if not self.global_config.proxy_enabled:
+            self.logger.info("Proxy disabled in global config")
+            return
+        from .ca import MkcertMissing, ensureCAInstalled
+
+        try:
+            ensureCAInstalled()
+        except MkcertMissing as e:
+            self.logger.warning(f"Proxy not started: {e.message}")
+            return
+        except Exception as e:  # noqa: BLE001
+            # mkcert -install failed (e.g. denied keychain prompt, no GUI
+            # session for first-time install). Don't kill the proxy — log
+            # and proceed with potentially-untrusted certs.
+            self.logger.warning(
+                f"CA install/verify failed: {e}. Run `taskmux ca install` "
+                f"interactively to trust the local CA. Browsers will show "
+                f"a warning until then."
+            )
+
+        self.proxy = ProxyServer(
+            https_port=self.global_config.proxy_https_port,
+            bind=self.global_config.proxy_bind,
+            sock=self._proxy_sock,
+        )
+        self._proxy_eligible = True
+        # Mint certs for projects already registered at startup, then bind if any.
+        async with self._lock:
+            for session, cli in list(self.projects.items()):
+                self._mint_and_register_proxy(session, cli)
+                cli.tmux.on_task_route_change = self._on_task_route_change
+            await self._start_proxy_listener()
+
+    async def _start_proxy_listener(self) -> None:
+        """Bind the proxy listener if not yet bound and at least one project has a cert."""
+        if self.proxy is None or self._proxy_started:
+            return
+        if not self.proxy._projects:
+            return
+        try:
+            await self.proxy.start()
+        except (PermissionError, OSError) as e:
+            self.logger.error(
+                f"Proxy bind to :{self.global_config.proxy_https_port} failed: {e}. "
+                f"Use `sudo` (daemon must run as root for :443) or "
+                f"`setcap cap_net_bind_service+ep $(readlink -f $(which python3))` on Linux."
+            )
+            self.proxy = None
+            self._proxy_eligible = False
+            return
+        self._proxy_started = True
+        self.logger.info(
+            f"Proxy bound on https://{self.global_config.proxy_bind}:"
+            f"{self.global_config.proxy_https_port}"
+        )
+
+    def _mint_and_register_proxy(self, session: str, cli: TaskmuxCLI) -> None:
+        """Mint cert + register project + seed routes for already-assigned ports."""
+        if self.proxy is None:
+            return
+        from .ca import mintCert
+
+        try:
+            cert, key = mintCert(session)
+        except Exception as e:  # noqa: BLE001
+            self.logger.error(f"mkcert failed for '{session}': {e}")
+            return
+        self.proxy.register_project(session, cert, key)
+        # Seed routes only for tasks whose tmux window is actually alive.
+        # Sticky port assignments in state.json can outlive the process; if
+        # we route blindly, a different process binding that port later
+        # would receive proxied traffic addressed to the trusted URL.
+        running_windows: set[str] = set()
+        try:
+            if cli.tmux.session_exists():
+                running_windows = set(cli.tmux.list_windows())
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"list_windows failed for {session!r}: {e}")
+        for task_name, task_cfg in cli.config.tasks.items():
+            if task_cfg.host is None:
+                continue
+            port = cli.tmux.assigned_ports.get(task_name)
+            if port is not None and task_name in running_windows:
+                self.proxy.set_route(session, task_cfg.host, port)
+
+    def _on_task_route_change(self, project: str, _task: str, host: str, port: int | None) -> None:
+        """TmuxManager callback: task started (port=N) or stopped (port=None)."""
+        if self.proxy is None:
+            return
+        if port is None:
+            self.proxy.drop_route(project, host)
+        else:
+            self.proxy.set_route(project, host, port)
+
+    async def _resync_project_routes(self, session: str) -> dict:
+        """Reconcile a project's proxy routes from disk state + live tmux panes.
+
+        Used after an out-of-band CLI lifecycle command (start/stop/restart/kill)
+        in a separate process — that process owns its own TmuxManager and won't
+        emit route callbacks here. We re-read assigned_ports from state.json,
+        then for each task with a host: route up if its window is alive, drop
+        otherwise.
+        """
+        async with self._lock:
+            cli = self.projects.get(session)
+        if cli is None:
+            return {"ok": False, "error": "unknown_session", "added": [], "dropped": []}
+        cli.tmux.reload_state()
+        added: list[str] = []
+        dropped: list[str] = []
+        running_windows: set[str] = set()
+        try:
+            if cli.tmux.session_exists():
+                running_windows = set(cli.tmux.list_windows())
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"resync: list_windows failed for {session!r}: {e}")
+        for task_name, task_cfg in cli.config.tasks.items():
+            if task_cfg.host is None:
+                continue
+            port = cli.tmux.assigned_ports.get(task_name)
+            if task_name in running_windows and port is not None:
+                if self.proxy is not None:
+                    self.proxy.set_route(session, task_cfg.host, port)
+                added.append(task_cfg.host)
+            else:
+                if self.proxy is not None:
+                    self.proxy.drop_route(session, task_cfg.host)
+                dropped.append(task_cfg.host)
+        return {"ok": True, "added": added, "dropped": dropped}
+
     async def _mark_missing(self, session: str) -> None:
-        """Mark a project as config_missing — drop the live CLI but keep the entry."""
+        """Mark a project as config_missing — drop live CLI + proxy + DNS state."""
         async with self._lock:
             observer = self.observers.pop(session, None)
             if observer is not None:
@@ -398,7 +843,32 @@ class TaskmuxDaemon:
                     observer.join(timeout=2)
             self.projects.pop(session, None)
             self.project_states[session] = "config_missing"
-            self.logger.info(f"Project '{session}' marked config_missing — health checks paused")
+            # Drop proxy routes + cert for this session — keeping them around
+            # would let the trusted URL keep resolving to whatever stale port
+            # the assignments map remembers.
+            if self.proxy is not None:
+                self.proxy.unregister_project(session)
+                from .ca import dropCert
+
+                with contextlib.suppress(Exception):
+                    dropCert(session)
+        # Sync host resolver so DNS map / etc_hosts forgets this project too.
+        self._sync_hostnames()
+        self.logger.info(f"Project '{session}' marked config_missing — health checks paused")
+
+    def _on_project_reload(self, session: str) -> None:
+        """ConfigWatcher reload callback: refresh proxy routes + host mappings.
+
+        Runs in the watchdog thread → schedule the actual work on the loop.
+        """
+        if self._loop is None:
+            return
+
+        async def _do() -> None:
+            await self._resync_project_routes(session)
+            self._sync_hostnames()
+
+        self._loop.call_soon_threadsafe(lambda: asyncio.create_task(_do()))
 
     # ---- health loop ----
 
@@ -448,7 +918,19 @@ class TaskmuxDaemon:
         async with websockets.serve(handle_client, "localhost", self.api_port):  # type: ignore[arg-type]
             await asyncio.Future()
 
-    KNOWN_COMMANDS = frozenset({"list_projects", "status_all", "status", "restart", "kill", "logs"})
+    KNOWN_COMMANDS = frozenset(
+        {
+            "list_projects",
+            "status_all",
+            "status",
+            "restart",
+            "kill",
+            "logs",
+            "proxy_routes",
+            "url",
+            "resync",
+        }
+    )
 
     async def _handle_api_request(self, data: dict) -> dict:
         command = data.get("command")
@@ -463,6 +945,10 @@ class TaskmuxDaemon:
         if command == "status_all":
             return {"command": command, "data": await self._aggregate_status()}
 
+        if command == "proxy_routes":
+            routes = self.proxy.routes_snapshot() if self.proxy is not None else {}
+            return {"command": command, "running": self.proxy is not None, "routes": routes}
+
         # Session-scoped commands
         session = params.get("session")
         if not session:
@@ -473,6 +959,32 @@ class TaskmuxDaemon:
 
         if command == "status":
             return {"command": command, "session": session, "data": self._project_status(cli)}
+
+        if command == "resync":
+            # CLI just changed task lifecycle out-of-band (started/stopped/killed
+            # in a separate process). Re-read assigned_ports from disk and
+            # reconcile proxy routes against actual tmux pane state.
+            return {
+                "command": command,
+                "session": session,
+                "data": await self._resync_project_routes(session),
+            }
+
+        if command == "url":
+            task_name = params.get("task")
+            if not task_name:
+                return {"error": "missing_task", "session": session}
+            task_cfg = cli.config.tasks.get(task_name)
+            if task_cfg is None:
+                return {"error": "unknown_task", "session": session, "task": task_name}
+            if task_cfg.host is None:
+                return {"command": command, "session": session, "task": task_name, "url": None}
+            return {
+                "command": command,
+                "session": session,
+                "task": task_name,
+                "url": taskUrl(session, task_cfg.host),
+            }
 
         if command == "restart":
             task_name = params.get("task")

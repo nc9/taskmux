@@ -146,19 +146,21 @@ class TestPrecedence:
                 "web": {
                     "command": "echo",
                     "health_check": "true",
-                    "port": 1,  # closed
+                    "host": "web",
                 }
             }
         )
         mgr = _make_manager(cfg)
+        mgr.assigned_ports["web"] = 1  # closed
         result = mgr.check_health("web")
         assert result.ok is True
         assert result.method == "shell"
 
-    def test_tcp_used_when_only_port(self, http_server):
+    def test_tcp_used_when_only_host(self, http_server):
         port, _ = http_server
-        cfg = _make_config(tasks={"web": {"command": "echo", "port": port}})
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
         mgr = _make_manager(cfg)
+        mgr.assigned_ports["web"] = port
         result = mgr.check_health("web")
         assert result.ok is True
         assert result.method == "tcp"
@@ -181,8 +183,9 @@ class TestPrecedence:
 class TestLastHealthRecorded:
     def test_check_health_stores_on_tracker(self, http_server):
         port, _ = http_server
-        cfg = _make_config(tasks={"web": {"command": "echo", "port": port}})
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
         mgr = _make_manager(cfg)
+        mgr.assigned_ports["web"] = port
         assert mgr.restart_tracker.last_health("web") is None
         mgr.check_health("web")
         last = mgr.restart_tracker.last_health("web")
@@ -193,8 +196,9 @@ class TestLastHealthRecorded:
 
     def test_list_tasks_surfaces_last_health(self, http_server):
         port, _ = http_server
-        cfg = _make_config(tasks={"web": {"command": "echo", "port": port}})
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
         mgr = _make_manager(cfg)
+        mgr.assigned_ports["web"] = port
         mgr.check_health("web")
         data = mgr.list_tasks()
         task = data["tasks"][0]
@@ -208,6 +212,7 @@ class TestIsHealthyBackcompat:
 
     def test_returns_bool(self, http_server):
         port, _ = http_server
-        cfg = _make_config(tasks={"web": {"command": "echo", "port": port}})
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
         mgr = _make_manager(cfg)
+        mgr.assigned_ports["web"] = port
         assert mgr.is_task_healthy("web") is True

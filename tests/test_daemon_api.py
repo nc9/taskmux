@@ -49,10 +49,12 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(paths_mod, "TASKMUX_DIR", tmp_path)
     monkeypatch.setattr(paths_mod, "EVENTS_FILE", tmp_path / "events.jsonl")
     monkeypatch.setattr(paths_mod, "PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(paths_mod, "CERTS_DIR", tmp_path / "certs")
     monkeypatch.setattr(paths_mod, "REGISTRY_PATH", tmp_path / "registry.json")
     monkeypatch.setattr(paths_mod, "GLOBAL_DAEMON_PID", tmp_path / "daemon.pid")
     monkeypatch.setattr(paths_mod, "GLOBAL_DAEMON_LOG", tmp_path / "daemon.log")
     monkeypatch.setattr(daemon_mod, "REGISTRY_PATH", tmp_path / "registry.json")
+    monkeypatch.setenv("TASKMUX_DISABLE_PROXY", "1")
     # Stub TmuxManager so we don't talk to real tmux
     from taskmux import cli as cli_mod
 
@@ -61,7 +63,7 @@ def isolated(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _seed_project(tmp_path: Path, name: str, port: int = 4000) -> Path:
+def _seed_project(tmp_path: Path, name: str) -> Path:
     proj = tmp_path / "src" / name
     proj.mkdir(parents=True, exist_ok=True)
     cfg = proj / "taskmux.toml"
@@ -69,7 +71,6 @@ def _seed_project(tmp_path: Path, name: str, port: int = 4000) -> Path:
         f"""name = "{name}"
 [tasks.web]
 command = "echo hi"
-port = {port}
 """
     )
     return cfg
@@ -115,8 +116,8 @@ async def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.05):
 def test_daemon_serves_list_projects(isolated):
     """End-to-end: spin daemon, register two projects, query list_projects."""
     port = _free_port()
-    cfg_a = _seed_project(isolated, "alpha", port=4001)
-    cfg_b = _seed_project(isolated, "beta", port=4002)
+    cfg_a = _seed_project(isolated, "alpha")
+    cfg_b = _seed_project(isolated, "beta")
     reg.registerProject("alpha", cfg_a)
     reg.registerProject("beta", cfg_b)
 
@@ -156,7 +157,7 @@ def test_daemon_serves_list_projects(isolated):
 def test_daemon_picks_up_new_registry_entry(isolated):
     """Add a project after the daemon starts; daemon should auto-register it."""
     port = _free_port()
-    cfg_a = _seed_project(isolated, "alpha", port=4001)
+    cfg_a = _seed_project(isolated, "alpha")
     reg.registerProject("alpha", cfg_a)
 
     async def run():
@@ -166,7 +167,7 @@ def test_daemon_picks_up_new_registry_entry(isolated):
             try:
                 await _wait_for_port(port)
                 # Register a second project after daemon is up
-                cfg_b = _seed_project(isolated, "beta", port=4002)
+                cfg_b = _seed_project(isolated, "beta")
                 reg.registerProject("beta", cfg_b)
                 # Force sync directly (registry watcher would fire too, but be deterministic)
                 await daemon._sync_with_registry()
@@ -207,7 +208,7 @@ def test_daemon_handles_unknown_command(isolated):
 def test_list_projects_includes_config_missing_entry(isolated):
     """Registry entry pointing to a non-existent toml is exposed as config_missing."""
     port = _free_port()
-    cfg_real = _seed_project(isolated, "alpha", port=4001)
+    cfg_real = _seed_project(isolated, "alpha")
     reg.registerProject("alpha", cfg_real)
     # Point a second registration at a path that doesn't exist on disk.
     bogus = isolated / "missing" / "taskmux.toml"
@@ -236,10 +237,117 @@ def test_list_projects_includes_config_missing_entry(isolated):
     asyncio.run(run())
 
 
+def test_resync_reconciles_routes_from_disk(isolated, tmp_path: Path):
+    """resync re-reads state.json + tmux pane state and updates proxy routes."""
+
+    class _RichFakeTmux:
+        """Adds the assigned_ports + reload_state + window-list surface that
+        real TmuxManager exposes — but no actual tmux contact."""
+
+        def __init__(self, config):
+            self.config = config
+            self.assigned_ports: dict[str, int] = {}
+            self._windows: list[str] = []
+            self._exists = False
+
+        def session_exists(self) -> bool:
+            return self._exists
+
+        def list_windows(self) -> list[str]:
+            return list(self._windows)
+
+        def reload_state(self) -> None:
+            from taskmux.paths import projectStatePath
+
+            try:
+                import json as _json
+
+                data = _json.loads(projectStatePath(self.config.name).read_text())
+                ports = data.get("assigned_ports", {})
+                self.assigned_ports = {k: int(v) for k, v in ports.items()}
+            except Exception:  # noqa: BLE001
+                self.assigned_ports = {}
+
+        def auto_restart_tasks(self) -> None:
+            pass
+
+        def get_task_status(self, task_name: str) -> dict:
+            return {"name": task_name, "running": False, "healthy": False}
+
+    from taskmux import cli as cli_mod
+
+    cli_mod.TmuxManager = _RichFakeTmux  # type: ignore[assignment]
+
+    port = _free_port()
+    proj = isolated / "src" / "alpha"
+    proj.mkdir(parents=True, exist_ok=True)
+    cfg = proj / "taskmux.toml"
+    cfg.write_text(
+        """name = "alpha"
+[tasks.api]
+command = "echo hi"
+host = "api"
+"""
+    )
+    reg.registerProject("alpha", cfg)
+    # Pre-seed the project state file with an assigned port — simulates
+    # a `taskmux start` in another process.
+    state_dir = isolated / "projects" / "alpha"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "state.json").write_text('{"assigned_ports": {"api": 12345}}')
+
+    async def run():
+        daemon = daemon_mod.TaskmuxDaemon(api_port=port)
+
+        class _FakeProxy:
+            def __init__(self):
+                self.routes: dict[tuple[str, str], int] = {}
+
+            def set_route(self, project, host, p):
+                self.routes[(project, host)] = p
+
+            def drop_route(self, project, host):
+                self.routes.pop((project, host), None)
+
+        fake = _FakeProxy()
+        daemon.proxy = fake  # type: ignore[assignment]
+
+        with patch.object(daemon_mod.signal, "signal"):
+            server_task = asyncio.create_task(daemon.start())
+            try:
+                await _wait_for_port(port)
+                # Tell the daemon's TmuxManager the api window is up.
+                tm = daemon.projects["alpha"].tmux
+                tm._exists = True  # type: ignore[attr-defined]
+                tm._windows = ["api"]  # type: ignore[attr-defined]
+
+                resp = await _ws_request(
+                    port, {"command": "resync", "params": {"session": "alpha"}}
+                )
+                assert resp["data"]["ok"] is True
+                assert "api" in resp["data"]["added"]
+                assert fake.routes[("alpha", "api")] == 12345
+
+                # Now simulate the task being stopped.
+                tm._windows = []  # type: ignore[attr-defined]
+                resp = await _ws_request(
+                    port, {"command": "resync", "params": {"session": "alpha"}}
+                )
+                assert "api" in resp["data"]["dropped"]
+                assert ("alpha", "api") not in fake.routes
+            finally:
+                daemon.stop()
+                server_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, TimeoutError, SystemExit):
+                    await asyncio.wait_for(server_task, timeout=1.0)
+
+    asyncio.run(run())
+
+
 def test_deleting_config_marks_project_missing(isolated):
     """Deleting a registered project's taskmux.toml marks it config_missing."""
     port = _free_port()
-    cfg = _seed_project(isolated, "alpha", port=4001)
+    cfg = _seed_project(isolated, "alpha")
     reg.registerProject("alpha", cfg)
 
     async def run():

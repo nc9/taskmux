@@ -192,6 +192,38 @@ def _spawn_detached_daemon(port: int | None = None) -> int | None:
     return proc.pid
 
 
+def _notify_daemon_resync(session: str, timeout: float = 1.0) -> None:
+    """Best-effort WS notify so the running daemon resyncs proxy routes.
+
+    Fired after CLI lifecycle ops (start/stop/restart/kill) since the CLI's
+    local TmuxManager has no callback wired into the daemon's proxy. Silently
+    no-op if no daemon, no daemon at the configured port, or any failure.
+    """
+    if get_daemon_pid() is None:
+        return
+    try:
+        import websockets
+
+        from .global_config import loadGlobalConfig
+
+        port = loadGlobalConfig().api_port
+    except Exception:  # noqa: BLE001
+        return
+
+    async def _go() -> None:
+        try:
+            async with websockets.connect(
+                f"ws://localhost:{port}", open_timeout=timeout, close_timeout=timeout
+            ) as ws:
+                await ws.send(json.dumps({"command": "resync", "params": {"session": session}}))
+                await asyncio.wait_for(ws.recv(), timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return
+
+    with contextlib.suppress(Exception):
+        asyncio.run(_go())
+
+
 def _autoRegisterCwd() -> None:
     """Best-effort auto-register of the cwd's project. Swallows collisions."""
     cfg_path = Path("taskmux.toml")
@@ -243,6 +275,8 @@ def start(
         if not is_json_mode():
             console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
 
+    _notify_daemon_resync(cli.config.name)
+
     if daemon or cli.config.auto_daemon:
         pid = _spawn_detached_daemon()
         if not is_json_mode():
@@ -279,6 +313,7 @@ def stop(
         _handle_results(results)
     else:
         _handle_result(cli.tmux.stop_all())
+    _notify_daemon_resync(cli.config.name)
 
 
 @app.command()
@@ -296,6 +331,7 @@ def restart(
         _handle_results(results)
     else:
         _handle_result(cli.tmux.restart_all())
+    _notify_daemon_resync(cli.config.name)
 
 
 @app.command()
@@ -309,6 +345,7 @@ def kill(
     """
     cli = TaskmuxCLI()
     _handle_result(cli.tmux.kill_task(task))
+    _notify_daemon_resync(cli.config.name)
 
 
 @app.command()
@@ -416,13 +453,24 @@ def add(
     task: str = typer.Argument(..., help="Task name"),
     command: str = typer.Argument(..., help="Command to run"),
     cwd: str | None = typer.Option(None, "--cwd", help="Working directory"),
+    host: str | None = typer.Option(  # noqa: B008
+        None, "--host", help="Subdomain to expose via the proxy: {host}.{project}.localhost"
+    ),
     health_check: str | None = typer.Option(None, "--health-check", help="Health check command"),
     depends_on: Optional[List[str]] = typer.Option(  # noqa: UP006, UP045, B008
         None, "--depends-on", help="Dependency task names"
     ),
 ):
     """Add a new task to taskmux.toml."""
-    addTask(None, task, command, cwd=cwd, health_check=health_check, depends_on=depends_on)
+    addTask(
+        None,
+        task,
+        command,
+        cwd=cwd,
+        host=host,
+        health_check=health_check,
+        depends_on=depends_on,
+    )
     if is_json_mode():
         print_result({"ok": True, "task": task, "command": command, "action": "added"})
     else:
@@ -494,7 +542,8 @@ def _status():
         health_icon = "G" if t["healthy"] else "R" if t["running"] else "o"
         status_text = "Healthy" if t["healthy"] else "Running" if t["running"] else "Stopped"
         auto = "" if t["auto_start"] else " [manual]"
-        port = f" :{t['port']}" if t.get("port") else ""
+        url = t.get("url") or ""
+        url_col = f" {url}" if url else ""
         extras = ""
         if t.get("restart_policy") and t["restart_policy"] != str(RestartPolicy.ON_FAILURE):
             extras += f" restart={t['restart_policy']}"
@@ -502,7 +551,7 @@ def _status():
             extras += f" cwd={t['cwd']}"
         if t.get("depends_on"):
             extras += f" deps=[{','.join(t['depends_on'])}]"
-        line = f"{health_icon} {status_text:8} {t['name']:15}{port:7} {t['command']}"
+        line = f"{health_icon} {status_text:8} {t['name']:15}{url_col} {t['command']}"
         console.print(f"{line}{auto}{extras}")
         last = t.get("last_health")
         if last and not last.get("ok") and last.get("reason"):
@@ -621,6 +670,34 @@ def events(
 
 
 @app.command()
+def url(
+    task: str = typer.Argument(..., help="Task name"),
+):
+    """Print the proxy URL for a task: https://{host}.{project}.localhost"""
+    from .url import taskUrl
+
+    cli = TaskmuxCLI()
+    cfg = cli.config.tasks.get(task)
+    if cfg is None:
+        if is_json_mode():
+            print_result({"ok": False, "error": "task_not_found", "task": task})
+        else:
+            console.print(f"Task '{task}' not found in config", style="red")
+        sys.exit(1)
+    if cfg.host is None:
+        if is_json_mode():
+            print_result({"ok": False, "error": "no_host", "task": task})
+        else:
+            console.print(f"Task '{task}' has no host set (not exposed via proxy)", style="yellow")
+        sys.exit(1)
+    u = taskUrl(cli.config.name, cfg.host)
+    if is_json_mode():
+        print_result({"ok": True, "task": task, "url": u})
+    else:
+        console.print(u)
+
+
+@app.command()
 def watch():
     """Watch taskmux.toml for changes and reload on edit.
 
@@ -712,6 +789,24 @@ def daemon_start(
         print_result({"ok": True, "pid": pid, "action": "started"})
     else:
         console.print(f"Daemon started (pid {pid})")
+
+
+@daemon_app.command("pid")
+def daemon_pid():
+    """Print the daemon PID (just the integer; empty if not running).
+
+    Useful for scripting: `kill $(taskmux daemon pid)` or
+    `lsof -p $(taskmux daemon pid)`. Exits 1 if no daemon is running.
+    """
+    pid = get_daemon_pid()
+    if pid is None:
+        if is_json_mode():
+            print_result({"ok": False, "pid": None})
+        sys.exit(1)
+    if is_json_mode():
+        print_result({"ok": True, "pid": pid})
+    else:
+        print(pid)
 
 
 @daemon_app.command("stop")
@@ -997,6 +1092,189 @@ def config_path():
 
 
 app.add_typer(config_app)
+
+
+# ---------------------------------------------------------------------------
+# CA sub-app (mkcert wrapper)
+# ---------------------------------------------------------------------------
+
+ca_app = typer.Typer(
+    name="ca",
+    help="Local CA management for the proxy (wraps mkcert).",
+    no_args_is_help=True,
+)
+
+
+@ca_app.command("install")
+def ca_install():
+    """Run `mkcert -install` to trust the local CA in your system store."""
+    from .ca import MkcertMissing, ensureCAInstalled
+
+    try:
+        ensureCAInstalled()
+    except MkcertMissing as e:
+        if is_json_mode():
+            print_result({"ok": False, "error": e.message})
+        else:
+            console.print(e.message, style="red")
+        sys.exit(1)
+    if is_json_mode():
+        print_result({"ok": True, "action": "installed"})
+    else:
+        console.print("Local CA installed (mkcert -install).")
+
+
+@ca_app.command("mint")
+def ca_mint():
+    """Mint a wildcard cert for the current project: *.{project}.localhost."""
+    from .ca import MkcertMissing, mintCert
+
+    cli = TaskmuxCLI()
+    try:
+        cert, key = mintCert(cli.config.name)
+    except MkcertMissing as e:
+        if is_json_mode():
+            print_result({"ok": False, "error": e.message})
+        else:
+            console.print(e.message, style="red")
+        sys.exit(1)
+    if is_json_mode():
+        print_result({"ok": True, "project": cli.config.name, "cert": str(cert), "key": str(key)})
+    else:
+        console.print(f"Cert: {cert}")
+        console.print(f"Key:  {key}")
+
+
+app.add_typer(ca_app)
+
+
+# ---------------------------------------------------------------------------
+# DNS sub-app — manage in-process DNS server delegation
+# ---------------------------------------------------------------------------
+
+dns_app = typer.Typer(
+    name="dns",
+    help="Manage the in-process DNS server delegation (host_resolver = 'dns_server').",
+    no_args_is_help=True,
+)
+
+
+@dns_app.command("install")
+def dns_install_cmd():
+    """Install OS-level DNS delegation for the configured TLD.
+
+    Writes /etc/resolver/<tld> on macOS, systemd-resolved drop-in on Linux,
+    or NRPT rule on Windows. Requires root/Admin. Idempotent.
+    """
+    from . import dns_install
+    from .global_config import loadGlobalConfig
+
+    cfg = loadGlobalConfig()
+    try:
+        dns_install.installDelegation(cfg.dns_managed_tld, cfg.dns_server_port)
+        dns_install.flushDnsCache()
+    except (PermissionError, OSError, RuntimeError) as e:
+        if is_json_mode():
+            print_result({"ok": False, "error": str(e)})
+        else:
+            console.print(f"DNS install failed: {e}", style="red")
+        sys.exit(1)
+    if is_json_mode():
+        print_result({"ok": True, "tld": cfg.dns_managed_tld, "port": cfg.dns_server_port})
+    else:
+        console.print(
+            f"DNS delegation installed: .{cfg.dns_managed_tld} -> 127.0.0.1:{cfg.dns_server_port}"
+        )
+
+
+@dns_app.command("uninstall")
+def dns_uninstall_cmd():
+    """Remove OS-level DNS delegation."""
+    from . import dns_install
+    from .global_config import loadGlobalConfig
+
+    cfg = loadGlobalConfig()
+    try:
+        dns_install.uninstallDelegation(cfg.dns_managed_tld)
+        dns_install.flushDnsCache()
+    except (PermissionError, OSError) as e:
+        if is_json_mode():
+            print_result({"ok": False, "error": str(e)})
+        else:
+            console.print(f"DNS uninstall failed: {e}", style="red")
+        sys.exit(1)
+    if is_json_mode():
+        print_result({"ok": True, "tld": cfg.dns_managed_tld})
+    else:
+        console.print(f"DNS delegation removed for .{cfg.dns_managed_tld}")
+
+
+@dns_app.command("flush")
+def dns_flush_cmd():
+    """Flush the OS DNS cache."""
+    from . import dns_install
+
+    dns_install.flushDnsCache()
+    if is_json_mode():
+        print_result({"ok": True})
+    else:
+        console.print("DNS cache flushed")
+
+
+@dns_app.command("query")
+def dns_query_cmd(
+    name: str = typer.Argument(..., help="Hostname to look up"),
+    qtype: str = typer.Option("A", "--type", help="Record type (A, AAAA)"),
+):
+    """Query the running taskmux DNS server directly (debug helper)."""
+    import socket as _sock
+
+    from dnslib import QTYPE, RCODE, DNSRecord
+
+    from .global_config import loadGlobalConfig
+
+    cfg = loadGlobalConfig()
+    qt = QTYPE[qtype.upper()]
+    q = DNSRecord.question(name, qtype=qtype.upper())
+    with _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM) as s:
+        s.settimeout(2.0)
+        try:
+            s.sendto(q.pack(), ("127.0.0.1", cfg.dns_server_port))
+            data, _ = s.recvfrom(4096)
+        except OSError as e:
+            if is_json_mode():
+                print_result({"ok": False, "error": str(e)})
+            else:
+                console.print(
+                    f"DNS query failed: {e} — is the daemon running with "
+                    f"host_resolver = 'dns_server'?",
+                    style="red",
+                )
+            sys.exit(1)
+    rec = DNSRecord.parse(data)
+    answers = [str(rr.rdata) for rr in rec.rr if rr.rtype == qt]
+    if is_json_mode():
+        print_result(
+            {
+                "ok": True,
+                "name": name,
+                "type": qtype.upper(),
+                "rcode": RCODE[rec.header.rcode],
+                "answers": answers,
+            }
+        )
+    else:
+        rcode = RCODE[rec.header.rcode]
+        if rcode != "NOERROR":
+            console.print(f"{name} {qtype.upper()} -> {rcode}", style="yellow")
+        elif not answers:
+            console.print(f"{name} {qtype.upper()} -> (empty)")
+        else:
+            for a in answers:
+                console.print(a)
+
+
+app.add_typer(dns_app)
 
 
 def main():

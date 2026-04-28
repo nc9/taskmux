@@ -13,6 +13,7 @@ Designed to pair well with coding agents like Claude Code, Codex, and OpenCode �
 - **JSON output** — `--json` on every command for programmatic consumption
 - **Event history** — lifecycle events recorded to `~/.taskmux/events.jsonl`
 - **Lifecycle hooks** — before/after start/stop at global and per-task level
+- **HTTPS proxy** — `host = "api"` exposes a task at `https://api.{project}.localhost` with a trusted local cert (mkcert)
 - **Port cleanup** — kills orphaned listeners before starting
 - **Agent context** — `taskmux init` injects usage instructions into Claude/Codex/OpenCode context files
 - **Daemon mode** — WebSocket API + config watching + health monitoring
@@ -62,13 +63,99 @@ taskmux logs-clean [task]        # delete log files
 
 # Config
 taskmux add <task> "<command>"   # add task to taskmux.toml
+taskmux add api "next dev" --host api  # expose at https://api.{project}.localhost
 taskmux remove <task>            # remove task (kills if running)
 taskmux init                     # create taskmux.toml + inject agent context
 taskmux init --defaults          # non-interactive
 
+# URLs / proxy
+taskmux url <task>               # print proxy URL for a task
+taskmux ca install               # install local CA into system trust store (one-time)
+taskmux ca mint                  # mint cert for the current project
+
 # Monitoring
 taskmux watch                    # watch config, reload on change
 taskmux daemon --port 8765       # daemon: WebSocket API + health + config watch
+```
+
+## URL routing (HTTPS proxy)
+
+Taskmux can front your dev tasks with a stable, trusted HTTPS URL — no port juggling:
+
+```
+https://api.myproject.localhost
+https://web.myproject.localhost
+```
+
+Setup (one time):
+
+```bash
+brew install mkcert nss      # macOS; see mkcert install guide for other OSes
+taskmux ca install            # trusts the local CA in your system store
+sudo taskmux daemon           # binds :443 as root, then drops to your user.
+                              # Everything after the bind (tmux, certs, state)
+                              # runs as you, not root.
+```
+
+In your `taskmux.toml`, replace `port = 3000` style fields with `host = "web"` and read `$PORT` from the env in your command:
+
+```toml
+name = "myproject"
+
+[tasks.api]
+command = "next dev -p $PORT"
+host = "api"
+
+[tasks.web]
+command = "bun dev --port $PORT"
+host = "web"
+```
+
+The daemon picks a free port for each task, injects it as `$PORT`, and routes `https://{host}.{name}.localhost` to it. Browsers resolve `*.localhost` to `127.0.0.1` automatically. The cert is wildcarded over the project, so adding/removing tasks doesn't trigger new cert prompts.
+
+Linux: `sudo setcap cap_net_bind_service+ep $(readlink -f $(which python3))` lets the daemon bind `:443` without sudo at all (no privilege drop needed).
+
+### How hostnames resolve
+
+For browsers to reach `https://api.{project}.localhost`, the name has to resolve to 127.0.0.1. macOS doesn't resolve `*.localhost` natively, Windows doesn't either, and Linux is hit-or-miss. taskmux ships a pluggable resolver that runs once at daemon startup while still privileged:
+
+| `host_resolver` | What it does |
+|-----------------|--------------|
+| `etc_hosts` (default) | Writes a managed block to `/etc/hosts` (or `%SystemRoot%\System32\drivers\etc\hosts` on Windows). Block is delimited by `# BEGIN taskmux managed` / `# END taskmux managed` and rewritten on every daemon start, so it's safe to coexist with your manual entries. **Static** — adding a new task host requires `sudo taskmux daemon` restart. |
+| `dns_server` | Runs a tiny in-process DNS server on `127.0.0.1:5454` (5353 is mDNS — avoid) and delegates `.localhost` queries to it via `/etc/resolver/localhost` (macOS), a `systemd-resolved` drop-in (Linux), or NRPT (Windows). **Dynamic** — adding hosts at runtime is a pure in-memory update, no daemon restart, no privilege escalation. Catch-all: any unmapped `*.localhost` query also resolves to 127.0.0.1, matching RFC 6761. |
+| `noop` | Don't touch anything. Use if you handle resolution yourself — a tunnel, custom DNS, dnsmasq, etc. |
+
+The resolver is a small abstraction (`taskmux/host_resolver.py`) — adding a `CloudflareTunnelResolver`, `NgrokResolver`, or DDNS plugin later is a single class. Configure via `~/.taskmux/config.toml`:
+
+```toml
+host_resolver = "dns_server"      # "etc_hosts" | "dns_server" | "noop"
+dns_server_port = 5454            # only used when host_resolver = "dns_server" (avoid 5353 = mDNS)
+dns_managed_tld = "localhost"     # ditto
+```
+
+#### Switching to `dns_server`
+
+```bash
+# 1. set host_resolver = "dns_server" in ~/.taskmux/config.toml
+# 2. start the daemon under sudo (needed to write /etc/resolver/<tld>);
+#    the DNS server itself runs unprivileged after the install.
+sudo taskmux daemon
+
+# Manage delegation independently of daemon lifecycle:
+taskmux dns install              # write /etc/resolver/localhost (sudo)
+taskmux dns uninstall            # remove it
+taskmux dns flush                # flush OS DNS cache
+taskmux dns query api.foo.localhost   # debug: query our DNS server directly
+```
+
+With `etc_hosts`, hostnames added to a project after the daemon is running won't be auto-written (the daemon has dropped privileges) — restart `sudo taskmux daemon` to refresh the block. With `dns_server` this is a non-issue: new hosts are picked up immediately.
+
+Disable / customize via `~/.taskmux/config.toml`:
+
+```toml
+proxy_enabled = true            # default
+proxy_https_port = 443
+proxy_bind = "127.0.0.1"        # loopback only by default — set to "0.0.0.0" to expose on LAN
 ```
 
 ### stop vs kill vs restart
@@ -118,11 +205,11 @@ depends_on = ["db"]
 health_check = "test -f .migrate-complete"
 
 [tasks.api]
-command = "python manage.py runserver 0.0.0.0:8000"
+command = "python manage.py runserver 0.0.0.0:$PORT"
 cwd = "apps/api"
-port = 8000
+host = "api"
 depends_on = ["migrate"]
-health_check = "curl -sf http://localhost:8000/health"
+health_check = "curl -sf https://api.fullstack-app.localhost/health"
 stop_grace_period = 10
 
 [tasks.worker]
@@ -134,11 +221,11 @@ max_restarts = 10
 restart_backoff = 3.0
 
 [tasks.web]
-command = "bun dev"
+command = "bun dev --port $PORT"
 cwd = "apps/web"
-port = 3000
+host = "web"
 depends_on = ["api"]
-health_check = "curl -sf http://localhost:3000"
+health_check = "curl -sf https://web.fullstack-app.localhost"
 
 [tasks.storybook]
 command = "bun storybook"
@@ -160,7 +247,8 @@ On `taskmux start`: db starts first → migrate + worker wait for db health → 
 | `command` | required | shell command to run |
 | `auto_start` | `true` | include in `taskmux start` |
 | `cwd` | — | working directory |
-| `port` | — | port to clean up before starting; also used as TCP probe target if no `health_url`/`health_check` |
+| `host` | — | DNS-safe subdomain. When set, taskmux assigns a free port via `$PORT`, mints a wildcard cert for `*.{name}.localhost`, and routes `https://{host}.{name}.localhost` → that port |
+| `host_path` | `"/"` | (reserved) base path for future health-URL auto-derivation |
 | `health_url` | — | HTTP URL to probe (e.g. `http://localhost:8000/health`) — uses stdlib, no curl needed |
 | `health_expected_status` | `200` | required HTTP status from `health_url` |
 | `health_expected_body` | — | regex/substring; if set, response body must match (catches dev-server 200-with-error pages) |

@@ -184,7 +184,7 @@ class TestAddCommand:
             result = runner.invoke(app, ["add", "web", "npm start"])
             assert result.exit_code == 0
             mock_add.assert_called_once_with(
-                None, "web", "npm start", cwd=None, health_check=None, depends_on=None
+                None, "web", "npm start", cwd=None, host=None, health_check=None, depends_on=None
             )
 
     def test_add_with_options(self, sample_toml: Path):
@@ -212,9 +212,37 @@ class TestAddCommand:
                 "api",
                 "cargo run",
                 cwd="apps/api",
+                host=None,
                 health_check="curl -sf localhost:4000/health",
                 depends_on=["db"],
             )
+
+
+class TestUrlCommand:
+    def test_url_with_host(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\nhost = "api"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("taskmux.cli.TmuxManager"):
+            result = runner.invoke(app, ["url", "api"])
+        assert result.exit_code == 0
+        assert "https://api.demo.localhost" in result.output
+
+    def test_url_without_host_fails(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("taskmux.cli.TmuxManager"):
+            result = runner.invoke(app, ["url", "api"])
+        assert result.exit_code == 1
+
+    def test_url_unknown_task(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("taskmux.cli.TmuxManager"):
+            result = runner.invoke(app, ["url", "ghost"])
+        assert result.exit_code == 1
 
 
 class TestRemoveCommand:

@@ -26,6 +26,7 @@ from pathlib import Path
 TASKMUX_DIR = Path.home() / ".taskmux"
 EVENTS_FILE = TASKMUX_DIR / "events.jsonl"
 PROJECTS_DIR = TASKMUX_DIR / "projects"
+CERTS_DIR = TASKMUX_DIR / "certs"
 REGISTRY_PATH = TASKMUX_DIR / "registry.json"
 GLOBAL_DAEMON_PID = TASKMUX_DIR / "daemon.pid"
 GLOBAL_DAEMON_LOG = TASKMUX_DIR / "daemon.log"
@@ -48,8 +49,24 @@ def taskLogPath(session: str, task: str) -> Path:
     return projectLogsDir(session) / f"{task}.log"
 
 
+def projectStatePath(session: str) -> Path:
+    """Per-project runtime state JSON (assigned ports, etc.)."""
+    return projectDir(session) / "state.json"
+
+
+def projectCertDir(session: str) -> Path:
+    """Per-project mkcert-issued cert directory."""
+    return CERTS_DIR / session
+
+
 def ensureProjectDir(session: str) -> Path:
     d = projectDir(session)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def ensureProjectCertDir(session: str) -> Path:
+    d = projectCertDir(session)
     d.mkdir(parents=True, exist_ok=True)
     return d
 

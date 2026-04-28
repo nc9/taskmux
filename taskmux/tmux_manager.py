@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -13,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -25,6 +27,7 @@ from .errors import ErrorCode, TaskmuxError
 from .events import recordEvent
 from .hooks import runHook
 from .models import RestartPolicy, TaskConfig, TaskmuxConfig
+from .url import taskUrl
 
 _SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
@@ -155,7 +158,78 @@ class TmuxManager:
         self.session: libtmux.Session | None = None
         self.task_health: dict = {}
         self.restart_tracker = RestartTracker()
+        self.assigned_ports: dict[str, int] = self._load_state()
+        self.on_task_route_change: Callable[[str, str, str, int | None], None] | None = None
         self._refresh_session()
+
+    # ---- state persistence (assigned ports) ----
+
+    def _state_path(self) -> Path:
+        from .paths import projectStatePath
+
+        return projectStatePath(self.config.name)
+
+    def _load_state(self) -> dict[str, int]:
+        try:
+            data = json.loads(self._state_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        ports = data.get("assigned_ports", {})
+        return {k: int(v) for k, v in ports.items() if isinstance(v, int | str)}
+
+    def reload_state(self) -> None:
+        """Re-read assigned_ports from disk. Used by the daemon to pick up
+        port assignments made by another process (e.g. a CLI `taskmux start`)."""
+        self.assigned_ports = self._load_state()
+
+    def _save_state(self) -> None:
+        from .paths import ensureProjectDir
+
+        ensureProjectDir(self.config.name)
+        path = self._state_path()
+        with contextlib.suppress(OSError):
+            path.write_text(json.dumps({"assigned_ports": self.assigned_ports}, indent=2))
+
+    @staticmethod
+    def _pick_free_port() -> int:
+        """Bind ephemeral port and immediately release it; OS gives caller a fresh number."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def _ensure_port(self, task_name: str) -> int:
+        """Return the assigned port for a hosted task, allocating + persisting if new."""
+        existing = self.assigned_ports.get(task_name)
+        if existing is not None:
+            return existing
+        port = self._pick_free_port()
+        self.assigned_ports[task_name] = port
+        self._save_state()
+        return port
+
+    def _emit_route(self, task_name: str, port: int | None) -> None:
+        """Notify proxy/daemon that a route is up (port given) or down (port=None)."""
+        cb = self.on_task_route_change
+        if cb is None:
+            return
+        host = self.config.tasks.get(task_name)
+        if host is None or host.host is None:
+            return
+        with contextlib.suppress(Exception):
+            cb(self.config.name, task_name, host.host, port)
+
+    def _wrap_command(self, task_name: str, command: str) -> str:
+        """If task has a host, allocate $PORT and export it for the command.
+
+        Use `export PORT=N; cmd` rather than `PORT=N cmd` because shells expand
+        `$PORT` against the outer environment BEFORE applying inline command
+        prefixes, so the latter form leaves `$PORT` empty inside the command.
+        """
+        cfg = self.config.tasks.get(task_name)
+        if cfg is None or cfg.host is None:
+            return command
+        port = self._ensure_port(task_name)
+        return f"export PORT={port}; {command}"
 
     def _refresh_session(self) -> None:
         """Refresh session object from server"""
@@ -322,7 +396,7 @@ class TmuxManager:
             return HealthResult(False, "shell", f"OSError: {e}", now)
 
     def check_health(self, task_name: str) -> HealthResult:
-        """Probe task health with precedence: health_url → health_check → tcp(port) → pane-alive."""
+        """Probe task health: health_url → health_check → tcp(assigned port) → pane-alive."""
         task_cfg = self.config.tasks.get(task_name)
         now = time.time()
         if not task_cfg:
@@ -331,6 +405,7 @@ class TmuxManager:
             return result
 
         timeout = float(task_cfg.health_timeout)
+        assigned_port = self.assigned_ports.get(task_name)
         if task_cfg.health_url:
             result = self._probe_http(
                 task_cfg.health_url,
@@ -340,8 +415,8 @@ class TmuxManager:
             )
         elif task_cfg.health_check:
             result = self._probe_shell(task_cfg.health_check, timeout)
-        elif task_cfg.port:
-            result = self._probe_tcp(task_cfg.port, timeout)
+        elif task_cfg.host is not None and assigned_port is not None:
+            result = self._probe_tcp(assigned_port, timeout)
         else:
             ok = self._is_pane_alive(task_name)
             result = HealthResult(ok, "pane", None if ok else "pane shell-only or missing", now)
@@ -449,9 +524,10 @@ class TmuxManager:
         sess = self._get_session()
         task_cfg = self.config.tasks[task_name]
 
-        # Kill anything occupying the port before starting
-        if task_cfg.port:
-            self._cleanup_port(task_cfg.port)
+        # Kill anything occupying the previously-assigned port before starting
+        prior_port = self.assigned_ports.get(task_name)
+        if prior_port is not None:
+            self._cleanup_port(prior_port)
 
         # Check if already running
         existing = sess.windows.get(window_name=task_name, default=None)
@@ -472,6 +548,8 @@ class TmuxManager:
                 ErrorCode.HOOK_FAILED, exit_code="n/a", command=f"{task_name} before_start"
             )
 
+        wrapped = self._wrap_command(task_name, task_cfg.command)
+
         # If session was just created, rename default window instead of creating new
         if len(sess.windows) == 1 and sess.windows[0].window_name != task_name:
             default = sess.windows[0]
@@ -482,15 +560,18 @@ class TmuxManager:
                 if pane:
                     if task_cfg.cwd:
                         pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
-                    pane.send_keys(task_cfg.command, enter=True)
+                    pane.send_keys(wrapped, enter=True)
                     self._attach_log_pipe(pane, task_name)
             else:
-                self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
+                self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
         else:
-            self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
+            self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
 
         runHook(task_cfg.hooks.after_start, task_name)
         runHook(self.config.hooks.after_start, task_name)
+
+        if task_cfg.host is not None:
+            self._emit_route(task_name, self.assigned_ports.get(task_name))
 
         recordEvent("task_started", session=self.config.name, task=task_name)
         result: dict = {"ok": True, "task": task_name, "action": "started"}
@@ -539,6 +620,8 @@ class TmuxManager:
         # Hooks: task after_stop, then global after_stop
         runHook(task_cfg.hooks.after_stop, task_name)
         runHook(self.config.hooks.after_stop, task_name)
+        if task_cfg.host is not None:
+            self._emit_route(task_name, None)
         recordEvent("task_stopped", session=self.config.name, task=task_name, reason="manual")
         return {"ok": True, "task": task_name, "action": "stopped"}
 
@@ -595,6 +678,12 @@ class TmuxManager:
 
             runHook(task_cfg.hooks.before_start, task_name)
 
+            prior_port = self.assigned_ports.get(task_name)
+            if prior_port is not None:
+                self._cleanup_port(prior_port)
+
+            wrapped = self._wrap_command(task_name, task_cfg.command)
+
             if first and sess.windows:
                 # First task reuses default window
                 default_window = sess.windows[0]
@@ -603,13 +692,15 @@ class TmuxManager:
                 if pane:
                     if task_cfg.cwd:
                         pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
-                    pane.send_keys(task_cfg.command, enter=True)
+                    pane.send_keys(wrapped, enter=True)
                     self._attach_log_pipe(pane, task_name)
                 first = False
             else:
-                self._send_command_to_window(sess, task_name, task_cfg.command, task_cfg.cwd)
+                self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
 
             runHook(task_cfg.hooks.after_start, task_name)
+            if task_cfg.host is not None:
+                self._emit_route(task_name, self.assigned_ports.get(task_name))
             started.append(task_name)
 
         # Global after_start
@@ -667,10 +758,12 @@ class TmuxManager:
             if cmd and cmd not in SHELL_NAMES and pid:
                 self._kill_process_tree(pid, sig.SIGKILL)
 
-        # Run after_stop hooks
+        # Run after_stop hooks + drop proxy routes
         for task_name in pane_map:
             task_cfg = self.config.tasks[task_name]
             runHook(task_cfg.hooks.after_stop, task_name)
+            if task_cfg.host is not None:
+                self._emit_route(task_name, None)
 
         session_name = self.config.name
         sess.kill()
@@ -706,7 +799,6 @@ class TmuxManager:
 
         sess = self._get_session()
         task_cfg = self.config.tasks[task_name]
-        command = task_cfg.command
 
         window = sess.windows.get(window_name=task_name, default=None)
         if window:
@@ -725,25 +817,31 @@ class TmuxManager:
                         self._wait_for_exit(pane, timeout=1)
             runHook(task_cfg.hooks.after_stop, task_name)
 
-            # Port cleanup before restart
-            if task_cfg.port:
-                self._cleanup_port(task_cfg.port)
+            prior_port = self.assigned_ports.get(task_name)
+            if prior_port is not None:
+                self._cleanup_port(prior_port)
+
+            wrapped = self._wrap_command(task_name, task_cfg.command)
 
             runHook(task_cfg.hooks.before_start, task_name)
             pane = window.active_pane
             if pane:
                 if task_cfg.cwd:
                     pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
-                pane.send_keys(command, enter=True)
+                pane.send_keys(wrapped, enter=True)
                 self._attach_log_pipe(pane, task_name)
             runHook(task_cfg.hooks.after_start, task_name)
         else:
-            # Port cleanup before start
-            if task_cfg.port:
-                self._cleanup_port(task_cfg.port)
+            prior_port = self.assigned_ports.get(task_name)
+            if prior_port is not None:
+                self._cleanup_port(prior_port)
+            wrapped = self._wrap_command(task_name, task_cfg.command)
             runHook(task_cfg.hooks.before_start, task_name)
-            self._send_command_to_window(sess, task_name, command, task_cfg.cwd)
+            self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
             runHook(task_cfg.hooks.after_start, task_name)
+
+        if task_cfg.host is not None:
+            self._emit_route(task_name, self.assigned_ports.get(task_name))
 
         recordEvent("task_restarted", session=self.config.name, task=task_name)
         return {"ok": True, "task": task_name, "action": "restarted"}
@@ -764,6 +862,9 @@ class TmuxManager:
             if pid:
                 self._kill_process_tree(pid)
         window.kill()
+        task_cfg = self.config.tasks.get(task_name)
+        if task_cfg is not None and task_cfg.host is not None:
+            self._emit_route(task_name, None)
         recordEvent("task_killed", session=self.config.name, task=task_name)
         return {"ok": True, "task": task_name, "action": "killed"}
 
@@ -773,6 +874,7 @@ class TmuxManager:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         task_cfg = self.config.tasks[task_name]
+        url = taskUrl(self.config.name, task_cfg.host) if task_cfg.host is not None else None
         info: dict = {
             "name": task_name,
             "command": task_cfg.command,
@@ -780,6 +882,9 @@ class TmuxManager:
             "restart_policy": str(task_cfg.restart_policy),
             "log_file": str(_logPath(self.config.name, task_name, task_cfg)),
             "cwd": task_cfg.cwd,
+            "host": task_cfg.host,
+            "url": url,
+            "port": self.assigned_ports.get(task_name),
             "health_check": task_cfg.health_check,
             "depends_on": task_cfg.depends_on,
             "running": False,
@@ -1061,6 +1166,7 @@ class TmuxManager:
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
             last = self.restart_tracker.last_health(task_name)
+            url = taskUrl(self.config.name, task_cfg.host) if task_cfg.host is not None else None
             tasks.append(
                 {
                     "name": task_name,
@@ -1068,7 +1174,9 @@ class TmuxManager:
                     "healthy": status["healthy"],
                     "command": task_cfg.command,
                     "auto_start": task_cfg.auto_start,
-                    "port": task_cfg.port,
+                    "host": task_cfg.host,
+                    "url": url,
+                    "port": self.assigned_ports.get(task_name),
                     "restart_policy": str(task_cfg.restart_policy),
                     "cwd": task_cfg.cwd,
                     "depends_on": task_cfg.depends_on,

@@ -9,6 +9,15 @@ from .errors import ErrorCode, TaskmuxError
 
 _SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
+_DNS_SLUG = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def slugify(value: str) -> str:
+    """Make value DNS-label-safe: lowercase, only [a-z0-9-], no leading/trailing hyphens."""
+    s = re.sub(r"[^a-z0-9-]+", "-", value.lower())
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s or "taskmux"
+
 
 class RestartPolicy(StrEnum):
     """Docker-style restart policy for tasks."""
@@ -53,7 +62,8 @@ class TaskConfig(_StrictConfig):
     command: str
     auto_start: bool = True
     cwd: str | None = None
-    port: int | None = None
+    host: str | None = None
+    host_path: str = "/"
     health_check: str | None = None
     health_url: str | None = None
     health_expected_status: int = 200
@@ -70,6 +80,21 @@ class TaskConfig(_StrictConfig):
     log_max_files: int = 3
     depends_on: list[str] = []
     hooks: HookConfig = HookConfig()
+
+    @field_validator("host")
+    @classmethod
+    def _validate_host(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not _DNS_SLUG.match(v):
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    f"Invalid host {v!r}. Must be DNS-safe: lowercase letters, digits, "
+                    "and hyphens (not at start/end). E.g. 'api', 'web-1'."
+                ),
+            )
+        return v
 
     @field_validator("log_max_size")
     @classmethod
@@ -97,6 +122,36 @@ class TaskmuxConfig(_StrictConfig):
     auto_daemon: bool = False
     hooks: HookConfig = HookConfig()
     tasks: dict[str, TaskConfig] = {}
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        if not _DNS_SLUG.match(v):
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    f"Invalid project name {v!r}. Must be DNS-safe (used in URLs as "
+                    "{host}.{name}.localhost): lowercase letters, digits, and hyphens "
+                    "(not at start/end)."
+                ),
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_unique_hosts(self) -> "TaskmuxConfig":
+        seen: dict[str, str] = {}
+        for name, cfg in self.tasks.items():
+            if cfg.host is None:
+                continue
+            if cfg.host in seen:
+                raise TaskmuxError(
+                    ErrorCode.CONFIG_VALIDATION,
+                    detail=(
+                        f"Duplicate host {cfg.host!r} on tasks {seen[cfg.host]!r} and {name!r}"
+                    ),
+                )
+            seen[cfg.host] = name
+        return self
 
     @model_validator(mode="after")
     def _validate_depends_on(self) -> "TaskmuxConfig":

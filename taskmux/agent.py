@@ -40,12 +40,12 @@ def buildContextBlock(config: TaskmuxConfig) -> str:
     ]
 
     if config.tasks:
-        lines.append("| Task | Port | Auto-start | Command |")
-        lines.append("|------|------|------------|---------|")
+        lines.append("| Task | URL | Auto-start | Command |")
+        lines.append("|------|-----|------------|---------|")
         for name, task in config.tasks.items():
-            port = str(task.port) if task.port else "—"
+            url = f"https://{task.host}.{config.name}.localhost" if task.host is not None else "—"
             auto = "yes" if task.auto_start else "no"
-            lines.append(f"| {name} | {port} | {auto} | `{task.command}` |")
+            lines.append(f"| {name} | {url} | {auto} | `{task.command}` |")
     else:
         lines.append('_No tasks configured yet. Use `taskmux add <name> "<command>"` to add._')
 

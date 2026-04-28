@@ -59,13 +59,13 @@ class TestBuildContextBlock:
         assert "npm start" in block
         assert "| no |" in block
 
-    def test_table_includes_port(self):
+    def test_table_includes_url(self):
         cfg = TaskmuxConfig(
             name="test",
-            tasks={"api": TaskConfig(command="bun dev", port=4001)},
+            tasks={"api": TaskConfig(command="bun dev", host="api")},
         )
         block = buildContextBlock(cfg)
-        assert "| 4001 |" in block
+        assert "https://api.test.localhost" in block
 
     def test_empty_tasks_message(self):
         cfg = TaskmuxConfig(name="test")

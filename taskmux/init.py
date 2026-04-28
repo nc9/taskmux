@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .agent import detectInstalledAgents, injectAgentContext
 from .config import CONFIG_FILENAME, configExists, writeConfig
-from .models import TaskmuxConfig
+from .models import TaskmuxConfig, slugify
 
 
 def initProject(path: Path | None = None, defaults: bool = False) -> TaskmuxConfig:
@@ -16,8 +16,8 @@ def initProject(path: Path | None = None, defaults: bool = False) -> TaskmuxConf
         print(f"Config already exists: {config_path}")
         return TaskmuxConfig()
 
-    # Determine session name
-    dir_name = project_path.name or "taskmux"
+    # Determine session name (slugified to DNS-safe form for proxy URLs)
+    dir_name = slugify(project_path.name or "taskmux")
 
     if defaults:
         session_name = dir_name
@@ -27,7 +27,7 @@ def initProject(path: Path | None = None, defaults: bool = False) -> TaskmuxConf
         except (EOFError, KeyboardInterrupt):
             print("\nAborted.")
             return TaskmuxConfig()
-        session_name = answer or dir_name
+        session_name = slugify(answer) if answer else dir_name
 
     config = TaskmuxConfig(name=session_name)
     writeConfig(config_path, config)

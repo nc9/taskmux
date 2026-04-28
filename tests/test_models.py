@@ -59,7 +59,8 @@ class TestTaskConfig:
         assert t.command == "echo hi"
         assert t.auto_start is True
         assert t.cwd is None
-        assert t.port is None
+        assert t.host is None
+        assert t.host_path == "/"
         assert t.health_check is None
         assert t.health_interval == 10
         assert t.health_timeout == 5
@@ -87,7 +88,8 @@ class TestTaskConfig:
         t = TaskConfig(
             command="cargo run",
             cwd="apps/api",
-            port=4001,
+            host="api",
+            host_path="/health",
             health_check="curl -sf localhost:4000/health",
             health_interval=5,
             stop_grace_period=10,
@@ -96,13 +98,29 @@ class TestTaskConfig:
             depends_on=["db"],
         )
         assert t.cwd == "apps/api"
-        assert t.port == 4001
+        assert t.host == "api"
+        assert t.host_path == "/health"
         assert t.health_check == "curl -sf localhost:4000/health"
         assert t.health_interval == 5
         assert t.stop_grace_period == 10
         assert t.max_restarts == 3
         assert t.restart_backoff == 3.0
         assert t.depends_on == ["db"]
+
+    def test_host_validation_accepts(self):
+        for h in ("api", "a", "web-1", "v2", "foo-bar-baz"):
+            assert TaskConfig(command="x", host=h).host == h
+
+    def test_host_validation_rejects(self):
+        for h in ("Api", "web_1", "-foo", "foo-", "foo.bar", "FOO", "1-", "-1"):
+            with pytest.raises(TaskmuxError) as exc_info:
+                TaskConfig(command="x", host=h)
+            assert exc_info.value.code == ErrorCode.CONFIG_VALIDATION
+
+    def test_old_port_key_rejected(self):
+        with pytest.raises(TaskmuxError) as exc_info:
+            TaskConfig(command="x", port=8000)  # type: ignore[call-arg]
+        assert exc_info.value.code == ErrorCode.CONFIG_UNKNOWN_KEYS
 
     def test_auto_start_false(self):
         t = TaskConfig(command="echo hi", auto_start=False)
@@ -189,6 +207,22 @@ class TestTaskmuxConfig:
         )
         assert c.tasks["api"].depends_on == ["db"]
         assert c.tasks["web"].depends_on == ["api"]
+
+    def test_name_validation_rejects(self):
+        for n in ("My_Project", "foo.bar", "FOO", "-x", "x-", ""):
+            with pytest.raises(TaskmuxError) as exc_info:
+                TaskmuxConfig(name=n)
+            assert exc_info.value.code == ErrorCode.CONFIG_VALIDATION
+
+    def test_duplicate_host_rejected(self):
+        with pytest.raises(TaskmuxError) as exc_info:
+            TaskmuxConfig(
+                tasks={
+                    "a": TaskConfig(command="echo a", host="api"),
+                    "b": TaskConfig(command="echo b", host="api"),
+                }
+            )
+        assert exc_info.value.code == ErrorCode.CONFIG_VALIDATION
 
     def test_depends_on_three_node_cycle(self):
         with pytest.raises(TaskmuxError) as exc_info:

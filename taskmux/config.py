@@ -118,8 +118,10 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("auto_start", False)
         if task_cfg.cwd is not None:
             inner.add("cwd", task_cfg.cwd)
-        if task_cfg.port is not None:
-            inner.add("port", task_cfg.port)
+        if task_cfg.host is not None:
+            inner.add("host", task_cfg.host)
+        if task_cfg.host_path != "/":
+            inner.add("host_path", task_cfg.host_path)
         if task_cfg.health_check is not None:
             inner.add("health_check", task_cfg.health_check)
         if task_cfg.health_url is not None:
@@ -167,6 +169,7 @@ def addTask(
     command: str,
     *,
     cwd: str | None = None,
+    host: str | None = None,
     health_check: str | None = None,
     depends_on: list[str] | None = None,
 ) -> TaskmuxConfig:
@@ -176,6 +179,8 @@ def addTask(
     kwargs: dict = {"command": command}
     if cwd is not None:
         kwargs["cwd"] = cwd
+    if host is not None:
+        kwargs["host"] = host
     if health_check is not None:
         kwargs["health_check"] = health_check
     if depends_on:
