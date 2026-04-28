@@ -20,9 +20,25 @@ from taskmux import registry as reg
 class FakeTmuxManager:
     """Minimal stand-in for TmuxManager — no real tmux contact."""
 
-    def __init__(self, config, config_dir=None):  # noqa: ARG002
+    def __init__(
+        self,
+        config,
+        config_dir=None,  # noqa: ARG002
+        project_id: str | None = None,
+        worktree_id: str | None = None,  # noqa: ARG002
+    ):
         self.config = config
+        self.project_id = project_id or config.name
+        self.worktree_id = worktree_id
         self.session = None
+        self.on_task_route_change = None
+        self.assigned_ports: dict[str, int] = {}
+
+    def list_windows(self) -> list[str]:
+        return []
+
+    def reload_state(self) -> None:
+        pass
 
     def session_exists(self) -> bool:
         return False
@@ -244,11 +260,20 @@ def test_resync_reconciles_routes_from_disk(isolated, tmp_path: Path):
         """Adds the assigned_ports + reload_state + window-list surface that
         real TmuxManager exposes — but no actual tmux contact."""
 
-        def __init__(self, config, config_dir=None):  # noqa: ARG002
+        def __init__(
+            self,
+            config,
+            config_dir=None,  # noqa: ARG002
+            project_id: str | None = None,
+            worktree_id: str | None = None,
+        ):
             self.config = config
+            self.project_id = project_id or config.name
+            self.worktree_id = worktree_id
             self.assigned_ports: dict[str, int] = {}
             self._windows: list[str] = []
             self._exists = False
+            self.on_task_route_change = None
 
         def session_exists(self) -> bool:
             return self._exists
@@ -262,7 +287,7 @@ def test_resync_reconciles_routes_from_disk(isolated, tmp_path: Path):
             try:
                 import json as _json
 
-                data = _json.loads(projectStatePath(self.config.name).read_text())
+                data = _json.loads(projectStatePath(self.config.name, self.worktree_id).read_text())
                 ports = data.get("assigned_ports", {})
                 self.assigned_ports = {k: int(v) for k, v in ports.items()}
             except Exception:  # noqa: BLE001

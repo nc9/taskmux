@@ -3,7 +3,13 @@
 from pathlib import Path
 
 from taskmux.config import addTask, configExists, loadConfig, removeTask, writeConfig
-from taskmux.models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
+from taskmux.models import (
+    HookConfig,
+    RestartPolicy,
+    TaskConfig,
+    TaskmuxConfig,
+    WorktreeConfig,
+)
 
 
 class TestConfigExists:
@@ -212,6 +218,53 @@ class TestWriteConfigNewFields:
         assert loaded.tasks["a"].restart_policy == RestartPolicy.NO
         assert loaded.tasks["b"].restart_policy == RestartPolicy.ALWAYS
         assert loaded.tasks["c"].restart_policy == RestartPolicy.ON_FAILURE
+
+
+class TestWriteConfigWorktreeRoundtrip:
+    def test_omits_table_when_all_defaults(self, config_dir: Path):
+        cfg = TaskmuxConfig(name="x", tasks={"a": TaskConfig(command="echo a")})
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        assert "[worktree]" not in p.read_text()
+
+    def test_persists_disabled(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            worktree=WorktreeConfig(enabled=False),
+            tasks={"a": TaskConfig(command="echo a")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert "[worktree]" in text
+        assert "enabled = false" in text
+        loaded = loadConfig(p)
+        assert loaded.worktree.enabled is False
+
+    def test_persists_custom_separator_and_main_branches(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            worktree=WorktreeConfig(separator="--", main_branches=["trunk"]),
+            tasks={"a": TaskConfig(command="echo a")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.worktree.separator == "--"
+        assert loaded.worktree.main_branches == ["trunk"]
+
+    def test_addTask_preserves_worktree_disabled(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            worktree=WorktreeConfig(enabled=False),
+            tasks={"a": TaskConfig(command="echo a")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        addTask(p, "new", "echo new")
+        reloaded = loadConfig(p)
+        assert reloaded.worktree.enabled is False
+        assert "new" in reloaded.tasks
 
 
 class TestAddTask:

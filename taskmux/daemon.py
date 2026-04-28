@@ -400,9 +400,9 @@ class TaskmuxDaemon:
             self.project_states[session] = "error"
             return
 
-        if cli.config.name != session:
+        if cli.project_id != session:
             self.logger.warning(
-                f"Registry session '{session}' != config name '{cli.config.name}' "
+                f"Registry session '{session}' != project_id '{cli.project_id}' "
                 f"for {config_path}; using registry key"
             )
 
@@ -423,7 +423,7 @@ class TaskmuxDaemon:
         # this no-ops with EACCES; we log a hint so the user knows.
         if self.host_resolver is not None:
             new_hosts = [
-                f"{tc.host}.{cli.config.name}.{self.global_config.dns_managed_tld}"
+                f"{tc.host}.{cli.project_id}.{self.global_config.dns_managed_tld}"
                 for tc in cli.config.tasks.values()
                 if tc.host is not None
             ]
@@ -618,7 +618,7 @@ class TaskmuxDaemon:
 
     def _collect_host_mappings(self) -> list[tuple[str, str]]:
         """Walk the registry; return every (fqdn, 127.0.0.1) for tasks with host."""
-        from .config import loadConfig
+        from .config import loadProjectIdentity
         from .registry import readRegistry
 
         mappings: list[tuple[str, str]] = []
@@ -627,14 +627,17 @@ class TaskmuxDaemon:
             if not cfg_path.exists():
                 continue
             try:
-                cfg = loadConfig(cfg_path)
+                identity = loadProjectIdentity(cfg_path)
             except Exception as e:  # noqa: BLE001
                 self.logger.warning(f"Skipping host collection for {session!r}: {e}")
                 continue
-            for task_cfg in cfg.tasks.values():
+            # Registry key is project_id (worktree-aware). Use the same id for
+            # the fqdn so DNS / proxy routing match.
+            project_id = session if session == identity.project_id else identity.project_id
+            for task_cfg in identity.config.tasks.values():
                 if task_cfg.host is None:
                     continue
-                fqdn = f"{task_cfg.host}.{cfg.name}.{self.global_config.dns_managed_tld}"
+                fqdn = f"{task_cfg.host}.{project_id}.{self.global_config.dns_managed_tld}"
                 mappings.append((fqdn, "127.0.0.1"))
         return mappings
 
@@ -1019,7 +1022,7 @@ class TaskmuxDaemon:
                 "command": command,
                 "session": session,
                 "task": task_name,
-                "url": taskUrl(session, task_cfg.host),
+                "url": taskUrl(cli.project_id, task_cfg.host),
             }
 
         if command == "restart":
@@ -1063,7 +1066,13 @@ class TaskmuxDaemon:
         for task_name in cli.config.tasks:
             tasks[task_name] = cli.tmux.get_task_status(task_name)
         return {
-            "session_name": cli.config.name,
+            "session_name": cli.project_id,
+            "project": cli.config.name,
+            "worktree": cli.identity.worktree_id,
+            "branch": cli.identity.branch,
+            "worktree_path": (
+                str(cli.identity.worktree_path) if cli.identity.worktree_path else None
+            ),
             "session_exists": session_exists,
             "tasks": tasks,
             "config_path": str(cli.config_path),
@@ -1119,9 +1128,19 @@ class TaskmuxDaemon:
             if cli is not None:
                 row["session_exists"] = cli.tmux.session_exists()
                 row["task_count"] = len(cli.config.tasks)
+                row["project"] = cli.config.name
+                row["worktree"] = cli.identity.worktree_id
+                row["branch"] = cli.identity.branch
+                row["worktree_path"] = (
+                    str(cli.identity.worktree_path) if cli.identity.worktree_path else None
+                )
             else:
                 row["session_exists"] = False
                 row["task_count"] = 0
+                row["project"] = session
+                row["worktree"] = None
+                row["branch"] = None
+                row["worktree_path"] = None
             out.append(row)
         return out
 

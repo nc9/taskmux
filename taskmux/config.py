@@ -1,6 +1,7 @@
 """Functional TOML configuration management for Taskmux."""
 
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 import tomlkit
@@ -8,8 +9,32 @@ from pydantic import ValidationError
 
 from .errors import ErrorCode, TaskmuxError
 from .models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
+from .worktree import (
+    WorktreeInfo,
+    composeProjectId,
+    computeWorktreeId,
+    detectWorktree,
+)
 
 CONFIG_FILENAME = "taskmux.toml"
+
+
+@dataclass(frozen=True)
+class ProjectIdentity:
+    """Bundles loaded config + computed worktree-aware identity.
+
+    `project_id` is the canonical session/registry key — `name` for primary
+    worktrees, `name-{worktree_id}` for linked.
+    """
+
+    config: TaskmuxConfig
+    config_path: Path
+    project: str
+    worktree_id: str | None
+    project_id: str
+    branch: str | None
+    worktree_path: Path | None
+    primary_worktree_path: Path | None
 
 
 def configExists(path: Path | None = None) -> bool:
@@ -73,6 +98,67 @@ def loadConfig(path: Path | None = None) -> TaskmuxConfig:
         raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=msgs) from e
 
 
+def loadProjectIdentity(
+    path: Path | None = None,
+    cwd: Path | None = None,
+) -> ProjectIdentity:
+    """Load config + detect worktree state and compose project_id.
+
+    `path` selects the taskmux.toml; defaults to the cwd lookup. Worktree
+    detection runs against `cwd` (or path's parent dir if cwd is None) so the
+    same config can yield different identities under different worktrees.
+    """
+    cfg_path = (path or Path(CONFIG_FILENAME)).expanduser().resolve()
+    config = loadConfig(cfg_path)
+    detect_dir = (cwd or cfg_path.parent).resolve()
+
+    info: WorktreeInfo | None = None
+    if config.worktree.enabled:
+        info = detectWorktree(detect_dir)
+
+    worktree_id: str | None = None
+    branch: str | None = None
+    worktree_path: Path | None = None
+    primary_worktree_path: Path | None = None
+    if info is not None:
+        worktree_id = computeWorktreeId(info, config.worktree.main_branches)
+        branch = info.branch
+        worktree_path = info.path
+        primary_worktree_path = info.primary_path
+
+    project_id = composeProjectId(config.name, worktree_id, config.worktree.separator)
+    return ProjectIdentity(
+        config=config,
+        config_path=cfg_path,
+        project=config.name,
+        worktree_id=worktree_id,
+        project_id=project_id,
+        branch=branch,
+        worktree_path=worktree_path,
+        primary_worktree_path=primary_worktree_path,
+    )
+
+
+def _writeWorktreeTable(wt) -> tomlkit.items.Table | None:  # type: ignore[name-defined]
+    """Build a tomlkit table for [worktree], or None if all fields are defaults."""
+    from .models import WorktreeConfig
+
+    defaults = WorktreeConfig()
+    fields = []
+    if wt.enabled != defaults.enabled:
+        fields.append(("enabled", wt.enabled))
+    if wt.separator != defaults.separator:
+        fields.append(("separator", wt.separator))
+    if list(wt.main_branches) != list(defaults.main_branches):
+        fields.append(("main_branches", list(wt.main_branches)))
+    if not fields:
+        return None
+    tbl = tomlkit.table()
+    for k, v in fields:
+        tbl.add(k, v)
+    return tbl
+
+
 def _writeHooksTable(hooks: HookConfig) -> tomlkit.items.Table | None:  # type: ignore[name-defined]
     """Build a tomlkit table for hooks, returning None if all empty."""
     fields = [
@@ -108,6 +194,12 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
     hooks_tbl = _writeHooksTable(config.hooks)
     if hooks_tbl:
         doc.add("hooks", hooks_tbl)
+        doc.add(tomlkit.nl())
+
+    # Worktree settings (only emitted when at least one field differs from default)
+    wt_tbl = _writeWorktreeTable(config.worktree)
+    if wt_tbl is not None:
+        doc.add("worktree", wt_tbl)
         doc.add(tomlkit.nl())
 
     for task_name, task_cfg in config.tasks.items():
@@ -186,7 +278,14 @@ def addTask(
     if depends_on:
         kwargs["depends_on"] = depends_on
     new_tasks[name] = TaskConfig(**kwargs)
-    cfg = TaskmuxConfig(name=cfg.name, auto_start=cfg.auto_start, hooks=cfg.hooks, tasks=new_tasks)
+    cfg = TaskmuxConfig(
+        name=cfg.name,
+        auto_start=cfg.auto_start,
+        auto_daemon=cfg.auto_daemon,
+        hooks=cfg.hooks,
+        worktree=cfg.worktree,
+        tasks=new_tasks,
+    )
     writeConfig(path, cfg)
     return cfg
 
@@ -197,6 +296,13 @@ def removeTask(path: Path | None, name: str) -> tuple[TaskmuxConfig, bool]:
     if name not in cfg.tasks:
         return cfg, False
     new_tasks = {k: v for k, v in cfg.tasks.items() if k != name}
-    cfg = TaskmuxConfig(name=cfg.name, auto_start=cfg.auto_start, hooks=cfg.hooks, tasks=new_tasks)
+    cfg = TaskmuxConfig(
+        name=cfg.name,
+        auto_start=cfg.auto_start,
+        auto_daemon=cfg.auto_daemon,
+        hooks=cfg.hooks,
+        worktree=cfg.worktree,
+        tasks=new_tasks,
+    )
     writeConfig(path, cfg)
     return cfg, True

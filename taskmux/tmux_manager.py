@@ -42,13 +42,18 @@ def _parseSize(size_str: str) -> int:
     return int(upper)
 
 
-def _logPath(session_name: str, task_name: str, task_cfg: TaskConfig) -> Path:
+def _logPath(
+    project: str,
+    task_name: str,
+    task_cfg: TaskConfig,
+    worktree_id: str | None = None,
+) -> Path:
     """Resolve log file path for a task."""
     if task_cfg.log_file:
         return Path(task_cfg.log_file).expanduser()
     from .paths import taskLogPath
 
-    return taskLogPath(session_name, task_name)
+    return taskLogPath(project, task_name, worktree_id)
 
 
 def _parseSince(since_str: str) -> datetime:
@@ -152,13 +157,25 @@ def _find_new_lines(current: list[str], prev_tail: list[str]) -> list[str]:
 class TmuxManager:
     """Manages tmux sessions and tasks using libtmux API."""
 
-    def __init__(self, config: TaskmuxConfig, config_dir: Path | None = None):
+    def __init__(
+        self,
+        config: TaskmuxConfig,
+        config_dir: Path | None = None,
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+    ):
         self.config = config
         # Directory of the taskmux.toml — used as the base for resolving
         # relative `cwd` fields. Without this, cwd would be interpreted
         # against the daemon's process cwd (or tmux server cwd), which is
         # whatever directory `sudo taskmux daemon` happened to be run from.
         self.config_dir = config_dir
+        # `project_id` is the canonical session/registry/URL key. For the
+        # primary worktree (or non-worktree project) it equals `config.name`;
+        # for linked worktrees it's `config.name-{worktree_id}`. Defaulted to
+        # config.name so legacy call sites keep working without changes.
+        self.project_id: str = project_id or config.name
+        self.worktree_id: str | None = worktree_id
         self.server = libtmux.Server()
         self.session: libtmux.Session | None = None
         self.task_health: dict = {}
@@ -183,7 +200,7 @@ class TmuxManager:
     def _state_path(self) -> Path:
         from .paths import projectStatePath
 
-        return projectStatePath(self.config.name)
+        return projectStatePath(self.config.name, self.worktree_id)
 
     def _load_state(self) -> dict[str, int]:
         try:
@@ -201,7 +218,7 @@ class TmuxManager:
     def _save_state(self) -> None:
         from .paths import ensureProjectDir
 
-        ensureProjectDir(self.config.name)
+        ensureProjectDir(self.config.name, self.worktree_id)
         path = self._state_path()
         with contextlib.suppress(OSError):
             path.write_text(json.dumps({"assigned_ports": self.assigned_ports}, indent=2))
@@ -232,7 +249,7 @@ class TmuxManager:
         if host is None or host.host is None:
             return
         with contextlib.suppress(Exception):
-            cb(self.config.name, task_name, host.host, port)
+            cb(self.project_id, task_name, host.host, port)
 
     def _wrap_command(self, task_name: str, command: str) -> str:
         """If task has a host, allocate $PORT and export it for the command.
@@ -250,7 +267,7 @@ class TmuxManager:
     def _refresh_session(self) -> None:
         """Refresh session object from server"""
         try:
-            self.session = self.server.sessions.get(session_name=self.config.name)
+            self.session = self.server.sessions.get(session_name=self.project_id)
         except Exception:
             self.session = None
 
@@ -267,7 +284,7 @@ class TmuxManager:
     def _attach_log_pipe(self, pane: libtmux.Pane, task_name: str) -> None:
         """Attach pipe-pane to mirror pane output to a timestamped log file."""
         task_cfg = self.config.tasks[task_name]
-        log_path = _logPath(self.config.name, task_name, task_cfg)
+        log_path = _logPath(self.config.name, task_name, task_cfg, self.worktree_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         max_bytes = _parseSize(task_cfg.log_max_size)
         max_files = task_cfg.log_max_files
@@ -281,7 +298,7 @@ class TmuxManager:
         """Return log file path if it exists on disk."""
         if task_name not in self.config.tasks:
             return None
-        path = _logPath(self.config.name, task_name, self.config.tasks[task_name])
+        path = _logPath(self.config.name, task_name, self.config.tasks[task_name], self.worktree_id)
         return path if path.exists() else None
 
     def list_windows(self) -> list[str]:
@@ -535,7 +552,7 @@ class TmuxManager:
 
         if not self.session_exists():
             # Create empty session first
-            self.session = self.server.new_session(session_name=self.config.name, attach=False)
+            self.session = self.server.new_session(session_name=self.project_id, attach=False)
 
         sess = self._get_session()
         task_cfg = self.config.tasks[task_name]
@@ -590,7 +607,13 @@ class TmuxManager:
         if task_cfg.host is not None:
             self._emit_route(task_name, self.assigned_ports.get(task_name))
 
-        recordEvent("task_started", session=self.config.name, task=task_name)
+        recordEvent(
+            "task_started",
+            session=self.project_id,
+            task=task_name,
+            project=self.config.name,
+            worktree=self.worktree_id,
+        )
         result: dict = {"ok": True, "task": task_name, "action": "started"}
         if warnings:
             result["warnings"] = warnings
@@ -600,7 +623,7 @@ class TmuxManager:
         """Graceful stop with signal escalation: C-c → SIGTERM → SIGKILL."""
         self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
-            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.project_id)
 
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
@@ -639,20 +662,27 @@ class TmuxManager:
         runHook(self.config.hooks.after_stop, task_name)
         if task_cfg.host is not None:
             self._emit_route(task_name, None)
-        recordEvent("task_stopped", session=self.config.name, task=task_name, reason="manual")
+        recordEvent(
+            "task_stopped",
+            session=self.project_id,
+            task=task_name,
+            reason="manual",
+            project=self.config.name,
+            worktree=self.worktree_id,
+        )
         return {"ok": True, "task": task_name, "action": "stopped"}
 
     def start_all(self) -> dict:
         """Start all auto_start tasks in dependency order."""
         if self.session_exists():
-            return self._err(ErrorCode.SESSION_EXISTS, session=self.config.name)
+            return self._err(ErrorCode.SESSION_EXISTS, session=self.project_id)
 
         if not self.config.auto_start:
             # Create empty session, no tasks
-            self.session = self.server.new_session(session_name=self.config.name, attach=False)
+            self.session = self.server.new_session(session_name=self.project_id, attach=False)
             return {
                 "ok": True,
-                "session": self.config.name,
+                "session": self.project_id,
                 "action": "started",
                 "tasks": [],
                 "warnings": ["auto_start disabled, no tasks launched"],
@@ -671,7 +701,7 @@ class TmuxManager:
         if not runHook(self.config.hooks.before_start):
             return self._err(ErrorCode.HOOK_FAILED, exit_code="n/a", command="global before_start")
 
-        self.session = self.server.new_session(session_name=self.config.name, attach=False)
+        self.session = self.server.new_session(session_name=self.project_id, attach=False)
         sess = self._get_session()
 
         started: list[str] = []
@@ -723,11 +753,17 @@ class TmuxManager:
 
         # Global after_start
         runHook(self.config.hooks.after_start)
-        recordEvent("session_started", session=self.config.name, tasks=started)
+        recordEvent(
+            "session_started",
+            session=self.project_id,
+            tasks=started,
+            project=self.config.name,
+            worktree=self.worktree_id,
+        )
 
         result: dict = {
             "ok": True,
-            "session": self.config.name,
+            "session": self.project_id,
             "action": "started",
             "tasks": started,
         }
@@ -741,7 +777,7 @@ class TmuxManager:
             self.restart_tracker.mark_manually_stopped(task_name)
 
         if not self.session_exists():
-            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.project_id)
 
         # Global before_stop
         runHook(self.config.hooks.before_stop)
@@ -783,12 +819,17 @@ class TmuxManager:
             if task_cfg.host is not None:
                 self._emit_route(task_name, None)
 
-        session_name = self.config.name
+        session_name = self.project_id
         sess.kill()
 
         # Global after_stop
         runHook(self.config.hooks.after_stop)
-        recordEvent("session_stopped", session=session_name)
+        recordEvent(
+            "session_stopped",
+            session=session_name,
+            project=self.config.name,
+            worktree=self.worktree_id,
+        )
         return {"ok": True, "session": session_name, "action": "stopped"}
 
     def restart_all(self) -> dict:
@@ -810,7 +851,7 @@ class TmuxManager:
         """Restart a specific task with full stop escalation."""
         self.restart_tracker.clear_manually_stopped(task_name)
         if not self.session_exists():
-            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.project_id)
 
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
@@ -862,14 +903,20 @@ class TmuxManager:
         if task_cfg.host is not None:
             self._emit_route(task_name, self.assigned_ports.get(task_name))
 
-        recordEvent("task_restarted", session=self.config.name, task=task_name)
+        recordEvent(
+            "task_restarted",
+            session=self.project_id,
+            task=task_name,
+            project=self.config.name,
+            worktree=self.worktree_id,
+        )
         return {"ok": True, "task": task_name, "action": "restarted"}
 
     def kill_task(self, task_name: str) -> dict:
         """Kill a specific task (process group + window)."""
         self.restart_tracker.mark_manually_stopped(task_name)
         if not self.session_exists():
-            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
+            return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.project_id)
 
         window = self._get_session().windows.get(window_name=task_name, default=None)
         if not window:
@@ -884,7 +931,13 @@ class TmuxManager:
         task_cfg = self.config.tasks.get(task_name)
         if task_cfg is not None and task_cfg.host is not None:
             self._emit_route(task_name, None)
-        recordEvent("task_killed", session=self.config.name, task=task_name)
+        recordEvent(
+            "task_killed",
+            session=self.project_id,
+            task=task_name,
+            project=self.config.name,
+            worktree=self.worktree_id,
+        )
         return {"ok": True, "task": task_name, "action": "killed"}
 
     def inspect_task(self, task_name: str) -> dict:
@@ -893,13 +946,13 @@ class TmuxManager:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         task_cfg = self.config.tasks[task_name]
-        url = taskUrl(self.config.name, task_cfg.host) if task_cfg.host is not None else None
+        url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
         info: dict = {
             "name": task_name,
             "command": task_cfg.command,
             "auto_start": task_cfg.auto_start,
             "restart_policy": str(task_cfg.restart_policy),
-            "log_file": str(_logPath(self.config.name, task_name, task_cfg)),
+            "log_file": str(_logPath(self.config.name, task_name, task_cfg, self.worktree_id)),
             "cwd": task_cfg.cwd,
             "host": task_cfg.host,
             "url": url,
@@ -1095,7 +1148,7 @@ class TmuxManager:
 
         # Fallback to capture-pane
         if not self.session_exists():
-            raise TaskmuxError(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
+            raise TaskmuxError(ErrorCode.SESSION_NOT_FOUND, session=self.project_id)
 
         sess = self._get_session()
         window = sess.windows.get(window_name=task_name, default=None)
@@ -1185,7 +1238,7 @@ class TmuxManager:
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
             last = self.restart_tracker.last_health(task_name)
-            url = taskUrl(self.config.name, task_cfg.host) if task_cfg.host is not None else None
+            url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
             tasks.append(
                 {
                     "name": task_name,
@@ -1204,7 +1257,9 @@ class TmuxManager:
             )
 
         return {
-            "session": self.config.name,
+            "session": self.project_id,
+            "project": self.config.name,
+            "worktree": self.worktree_id,
             "running": exists,
             "active_tasks": len(windows),
             "tasks": tasks,
@@ -1259,9 +1314,11 @@ class TmuxManager:
                 failures = self.restart_tracker.record_health_failure(task_name)
                 recordEvent(
                     "health_check_failed",
-                    session=self.config.name,
+                    session=self.project_id,
                     task=task_name,
                     attempt=failures,
+                    project=self.config.name,
+                    worktree=self.worktree_id,
                 )
                 if failures >= task_cfg.health_retries:
                     should_restart = True
@@ -1269,9 +1326,11 @@ class TmuxManager:
                 failures = self.restart_tracker.record_health_failure(task_name)
                 recordEvent(
                     "health_check_failed",
-                    session=self.config.name,
+                    session=self.project_id,
                     task=task_name,
                     attempt=failures,
+                    project=self.config.name,
+                    worktree=self.worktree_id,
                 )
                 if failures >= task_cfg.health_retries:
                     should_restart = True
@@ -1284,9 +1343,11 @@ class TmuxManager:
             if task_cfg.max_restarts and info["count"] >= task_cfg.max_restarts:
                 recordEvent(
                     "max_restarts_reached",
-                    session=self.config.name,
+                    session=self.project_id,
                     task=task_name,
                     count=int(info["count"]),
+                    project=self.config.name,
+                    worktree=self.worktree_id,
                 )
                 continue
 
@@ -1296,7 +1357,14 @@ class TmuxManager:
                 continue
 
             reason = "process_exited" if not pane_alive else "health_retries_exceeded"
-            recordEvent("auto_restart", session=self.config.name, task=task_name, reason=reason)
+            recordEvent(
+                "auto_restart",
+                session=self.project_id,
+                task=task_name,
+                reason=reason,
+                project=self.config.name,
+                worktree=self.worktree_id,
+            )
             print(f"Auto-restarting task: {task_name}")
             self.restart_task(task_name)
             self.restart_tracker.record(task_name)

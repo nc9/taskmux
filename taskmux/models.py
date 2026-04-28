@@ -114,6 +114,16 @@ class TaskConfig(_StrictConfig):
         )
 
 
+class WorktreeConfig(_StrictConfig):
+    """Git worktree behaviour. When taskmux runs inside a linked worktree it
+    derives a worktree_id and composes `project_id = name-{worktree_id}` so
+    each worktree has its own session, state, ports, and URL namespace."""
+
+    enabled: bool = True
+    separator: str = "-"
+    main_branches: list[str] = ["main", "master"]
+
+
 class TaskmuxConfig(_StrictConfig):
     """Top-level taskmux.toml schema."""
 
@@ -121,6 +131,7 @@ class TaskmuxConfig(_StrictConfig):
     auto_start: bool = True
     auto_daemon: bool = False
     hooks: HookConfig = HookConfig()
+    worktree: WorktreeConfig = WorktreeConfig()
     tasks: dict[str, TaskConfig] = {}
 
     @field_validator("name")

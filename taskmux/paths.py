@@ -7,9 +7,17 @@ Layout:
     events.jsonl              # global, cross-project
     registry.json             # central project registry
     projects/
-      {session_name}/
+      {project}/              # primary worktree (or non-worktree project)
         logs/
           {task}.log[.N]
+        state.json
+        worktrees/
+          {worktree_id}/      # linked worktree
+            logs/
+              {task}.log[.N]
+            state.json
+    certs/
+      {project_id}/           # cert per project_id (primary OR linked)
     .migrated-v2              # legacy layout migration marker
     .migrated-v3              # unified-daemon migration marker
 """
@@ -36,37 +44,48 @@ _MIGRATION_MARKER = TASKMUX_DIR / ".migrated-v2"
 _MIGRATION_MARKER_V3 = TASKMUX_DIR / ".migrated-v3"
 
 
-def projectDir(session: str) -> Path:
-    """Per-project state directory. Created on demand."""
-    return PROJECTS_DIR / session
+def projectDir(project: str, worktree_id: str | None = None) -> Path:
+    """Per-project (or per-worktree) state directory. Created on demand.
+
+    Primary / non-worktree: ~/.taskmux/projects/{project}/
+    Linked worktree:        ~/.taskmux/projects/{project}/worktrees/{worktree_id}/
+    """
+    if worktree_id:
+        return PROJECTS_DIR / project / "worktrees" / worktree_id
+    return PROJECTS_DIR / project
 
 
-def projectLogsDir(session: str) -> Path:
-    return projectDir(session) / "logs"
+def projectWorktreesDir(project: str) -> Path:
+    """Container for all linked-worktree state of a project."""
+    return PROJECTS_DIR / project / "worktrees"
 
 
-def taskLogPath(session: str, task: str) -> Path:
-    return projectLogsDir(session) / f"{task}.log"
+def projectLogsDir(project: str, worktree_id: str | None = None) -> Path:
+    return projectDir(project, worktree_id) / "logs"
 
 
-def projectStatePath(session: str) -> Path:
-    """Per-project runtime state JSON (assigned ports, etc.)."""
-    return projectDir(session) / "state.json"
+def taskLogPath(project: str, task: str, worktree_id: str | None = None) -> Path:
+    return projectLogsDir(project, worktree_id) / f"{task}.log"
 
 
-def projectCertDir(session: str) -> Path:
-    """Per-project mkcert-issued cert directory."""
-    return CERTS_DIR / session
+def projectStatePath(project: str, worktree_id: str | None = None) -> Path:
+    """Per-project (or per-worktree) runtime state JSON (assigned ports, etc.)."""
+    return projectDir(project, worktree_id) / "state.json"
 
 
-def ensureProjectDir(session: str) -> Path:
-    d = projectDir(session)
+def projectCertDir(project_id: str) -> Path:
+    """mkcert-issued cert directory keyed by project_id (already encodes worktree)."""
+    return CERTS_DIR / project_id
+
+
+def ensureProjectDir(project: str, worktree_id: str | None = None) -> Path:
+    d = projectDir(project, worktree_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def ensureProjectCertDir(session: str) -> Path:
-    d = projectCertDir(session)
+def ensureProjectCertDir(project_id: str) -> Path:
+    d = projectCertDir(project_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -76,11 +95,30 @@ def ensureTaskmuxDir() -> Path:
     return TASKMUX_DIR
 
 
-def listProjects() -> list[str]:
-    """Return session names of projects with state on disk."""
+def listProjects() -> list[tuple[str, str | None]]:
+    """Return (project, worktree_id|None) tuples for everything on disk.
+
+    The primary slot for each project (the directory itself, with `state.json`
+    or `logs/` inside) yields `(project, None)`. Each subdir under
+    `projects/{project}/worktrees/` yields `(project, worktree_id)`.
+    """
     if not PROJECTS_DIR.exists():
         return []
-    return sorted(p.name for p in PROJECTS_DIR.iterdir() if p.is_dir())
+    out: list[tuple[str, str | None]] = []
+    for p in sorted(PROJECTS_DIR.iterdir()):
+        if not p.is_dir():
+            continue
+        # Treat the project dir as primary if it has any non-`worktrees`
+        # children — the legacy layout had logs/state directly inside.
+        has_primary_state = any(child.name != "worktrees" for child in p.iterdir())
+        if has_primary_state:
+            out.append((p.name, None))
+        wt_dir = p / "worktrees"
+        if wt_dir.is_dir():
+            for w in sorted(wt_dir.iterdir()):
+                if w.is_dir():
+                    out.append((p.name, w.name))
+    return out
 
 
 def globalDaemonPidPath() -> Path:
