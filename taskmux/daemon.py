@@ -625,6 +625,7 @@ class TaskmuxDaemon:
         sync when both are true (etc_hosts + a wildcard task) so the user knows
         to switch resolver if they want wildcards to resolve in the browser.
         """
+        from .aliases import loadAliases
         from .config import loadProjectIdentity
         from .registry import readRegistry
 
@@ -653,6 +654,10 @@ class TaskmuxDaemon:
                     fqdn = f"{project_id}.{tld}"
                 else:
                     fqdn = f"{task_cfg.host}.{project_id}.{tld}"
+                mappings.append((fqdn, "127.0.0.1"))
+            for alias_entry in loadAliases(identity.project, identity.worktree_id).values():
+                host = alias_entry["host"]
+                fqdn = f"{project_id}.{tld}" if host == "" else f"{host}.{project_id}.{tld}"
                 mappings.append((fqdn, "127.0.0.1"))
         if wildcard_under_etc_hosts and self.global_config.host_resolver == "etc_hosts":
             projects = ", ".join(sorted(set(wildcard_under_etc_hosts)))
@@ -848,6 +853,10 @@ class TaskmuxDaemon:
             port = cli.tmux.assigned_ports.get(task_name)
             if port is not None and task_name in running_windows:
                 self.proxy.set_route(session, task_cfg.host, port)
+        from .aliases import loadAliases as _loadAliases
+
+        for alias_entry in _loadAliases(cli.identity.project, cli.identity.worktree_id).values():
+            self.proxy.set_route(session, alias_entry["host"], alias_entry["port"])
 
     def _on_task_route_change(self, project: str, _task: str, host: str, port: int | None) -> None:
         """TmuxManager callback: task started (port=N) or stopped (port=None)."""
@@ -859,19 +868,24 @@ class TaskmuxDaemon:
             self.proxy.set_route(project, host, port)
 
     async def _resync_project_routes(self, session: str) -> dict:
-        """Reconcile a project's proxy routes from disk state + live tmux panes.
+        """Reconcile a project's proxy routes against disk state + live tmux.
 
-        Used after an out-of-band CLI lifecycle command (start/stop/restart/kill)
-        in a separate process — that process owns its own TmuxManager and won't
-        emit route callbacks here. We re-read assigned_ports from state.json,
-        then for each task with a host: route up if its window is alive, drop
-        otherwise.
+        Used after an out-of-band CLI lifecycle command (start/stop/restart/kill
+        or alias add/remove) in a separate process. We re-read assigned_ports
+        from state.json, build the desired host set from (live tasks ∪ aliases),
+        drop any existing route not in that set, and set the desired ones.
+
+        Reconciling the full set (rather than just the hosts we know about)
+        is what catches removed/renamed aliases and tasks deleted from the
+        config — otherwise stale routes outlive the daemon restart.
         """
         async with self._lock:
             cli = self.projects.get(session)
         if cli is None:
             return {"ok": False, "error": "unknown_session", "added": [], "dropped": []}
         cli.tmux.reload_state()
+        from .aliases import loadAliases as _loadAliases
+
         added: list[str] = []
         dropped: list[str] = []
         running_windows: set[str] = set()
@@ -880,18 +894,32 @@ class TaskmuxDaemon:
                 running_windows = set(cli.tmux.list_windows())
         except Exception as e:  # noqa: BLE001
             self.logger.warning(f"resync: list_windows failed for {session!r}: {e}")
+
+        desired: dict[str, int] = {}
         for task_name, task_cfg in cli.config.tasks.items():
             if task_cfg.host is None:
                 continue
             port = cli.tmux.assigned_ports.get(task_name)
             if task_name in running_windows and port is not None:
-                if self.proxy is not None:
-                    self.proxy.set_route(session, task_cfg.host, port)
-                added.append(task_cfg.host)
-            else:
-                if self.proxy is not None:
-                    self.proxy.drop_route(session, task_cfg.host)
-                dropped.append(task_cfg.host)
+                desired[task_cfg.host] = port
+        for alias_entry in _loadAliases(cli.identity.project, cli.identity.worktree_id).values():
+            desired[alias_entry["host"]] = alias_entry["port"]
+
+        if self.proxy is not None:
+            snapshot = (
+                self.proxy.routes_snapshot() if hasattr(self.proxy, "routes_snapshot") else {}
+            )
+            existing = set(snapshot.get(session, {}).keys())
+            for host in existing - desired.keys():
+                self.proxy.drop_route(session, host)
+                dropped.append(host)
+            for host, port in desired.items():
+                self.proxy.set_route(session, host, port)
+                added.append(host)
+        else:
+            added.extend(desired.keys())
+        with contextlib.suppress(Exception):
+            self._sync_hostnames()
         return {"ok": True, "added": added, "dropped": dropped}
 
     async def _mark_missing(self, session: str) -> None:
@@ -1015,6 +1043,11 @@ class TaskmuxDaemon:
         if not session:
             return {"error": "missing_session", "command": command}
         cli = self.projects.get(session)
+        if cli is None and command == "resync":
+            # CLI may have just registered the project (e.g. `alias add` on a
+            # fresh project). Beat the watcher: sync once, then look again.
+            await self._sync_with_registry()
+            cli = self.projects.get(session)
         if cli is None:
             return {"error": "unknown_session", "session": session, "command": command}
 

@@ -1283,7 +1283,11 @@ class TmuxManager:
         exists = self.session_exists()
         windows = self.list_windows() if exists else []
 
-        any_host = any(tc.host is not None for tc in self.config.tasks.values())
+        from .aliases import loadAliases as _loadAliasesForProxy
+
+        any_host = any(tc.host is not None for tc in self.config.tasks.values()) or bool(
+            _loadAliasesForProxy(self.config.name, self.worktree_id)
+        )
         proxy_info = self._proxy_listener_status() if any_host else None
 
         tasks = []
@@ -1327,6 +1331,19 @@ class TmuxManager:
                 }
             )
 
+        from .aliases import loadAliases as _loadAliases
+
+        aliases_out: list[dict] = []
+        for alias_name, entry in _loadAliases(self.config.name, self.worktree_id).items():
+            aliases_out.append(
+                {
+                    "name": alias_name,
+                    "host": entry["host"],
+                    "port": entry["port"],
+                    "url": taskUrl(self.project_id, entry["host"]),
+                }
+            )
+
         result: dict = {
             "session": self.project_id,
             "project": self.config.name,
@@ -1334,6 +1351,7 @@ class TmuxManager:
             "running": exists,
             "active_tasks": len(windows),
             "tasks": tasks,
+            "aliases": aliases_out,
         }
         if proxy_info is not None:
             # Don't leak the routes map (per-project cache) into status output.
