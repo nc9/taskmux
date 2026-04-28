@@ -13,7 +13,8 @@ Designed to pair well with coding agents like Claude Code, Codex, and OpenCode �
 - **JSON output** — `--json` on every command for programmatic consumption
 - **Event history** — lifecycle events recorded to `~/.taskmux/events.jsonl`
 - **Lifecycle hooks** — before/after start/stop at global and per-task level
-- **HTTPS proxy** — `host = "api"` exposes a task at `https://api.{project}.localhost` with a trusted local cert (mkcert)
+- **HTTPS proxy** — `host = "api"` exposes a task at `https://api.{project}.localhost` with a trusted local cert (mkcert); taskmux assigns a free `$PORT` per task so config never pins ports
+- **Dynamic DNS** — optional in-process DNS server resolves any `*.localhost` to `127.0.0.1` (no `/etc/hosts` churn, no daemon restart when adding hosts)
 - **Port cleanup** — kills orphaned listeners before starting
 - **Agent context** — `taskmux init` injects a thin pointer + project task table into Claude/Codex/OpenCode context files; install the [taskmux skill](#claude-code-skill) for richer Claude Code guidance loaded on demand
 - **Daemon mode** — WebSocket API + config watching + health monitoring
@@ -311,7 +312,7 @@ Probe precedence (first match wins):
 
 1. **`health_url`** — HTTP GET via stdlib. Pass when status matches `health_expected_status` (default 200) and, if set, body matches `health_expected_body` (regex). No curl dependency.
 2. **`health_check`** — arbitrary shell command, exit 0 = healthy.
-3. **`port`** — TCP probe to `localhost:port`. Pass when the port accepts a connection.
+3. **TCP probe** — when `host` is set, probes `localhost:$PORT` (the port taskmux assigned to the task). Pass when the port accepts a connection.
 4. **fallback** — pane-alive check (foreground command is not a shell).
 
 Must fail `health_retries` consecutive times before triggering restart.
@@ -322,9 +323,9 @@ Many dev servers (Next.js, Vite, etc.) keep returning HTTP 200 even when the bui
 
 ```toml
 [tasks.web]
-command = "next dev"
-port = 3000
-health_url = "http://localhost:3000"
+command = "next dev -p $PORT"
+host = "web"
+health_url = "http://localhost:$PORT"
 health_expected_body = "id=\"__next\""   # absent on the Next error overlay
 ```
 
@@ -352,12 +353,15 @@ taskmux daemon status             # running + pid + registered project count
 taskmux daemon restart            # stop, wait for exit, respawn
 taskmux daemon list               # all registered projects + live state
 taskmux daemon register [-c PATH] # add cwd's (or PATH's) project to the registry
+taskmux daemon register -f        # overwrite an existing entry whose config moved
 taskmux daemon unregister NAME    # remove a project from the registry
 ```
 
 `start`, `restart`, and `list` take `--port` to override the configured `api_port`; when omitted they fall back to `~/.taskmux/config.toml`. All commands accept `--json` (global flag). Daemon log: `~/.taskmux/daemon.log`.
 
 Each project carries a `state`: `ok` while loaded, `config_missing` if its `taskmux.toml` is absent or was deleted (entry stays in the registry, health checks pause), `error` if loading the config raised. Surfaced in `daemon list` and the `list_projects` WS command.
+
+If you move `taskmux.toml` to a new directory and re-register, the registry auto-heals when the old path no longer exists on disk. If both paths still exist, `register` rejects the collision (E305) — pass `--force` to make the new path win.
 
 ### WebSocket API
 
