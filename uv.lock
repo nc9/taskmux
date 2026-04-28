@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.11"
 
 [options]
-exclude-newer = "2026-04-25T10:40:01.495903Z"
+exclude-newer = "2026-04-25T12:05:38.982955Z"
 exclude-newer-span = "P3D"
 
 [[package]]
@@ -698,7 +698,7 @@ wheels = [
 
 [[package]]
 name = "taskmux"
-version = "0.6.0"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
