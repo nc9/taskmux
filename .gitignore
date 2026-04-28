@@ -13,3 +13,4 @@ wheels/
 CLAUDE.md
 .env*
 .DS_Store
+.claude/
