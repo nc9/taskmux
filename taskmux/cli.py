@@ -597,27 +597,55 @@ def _status():
         console.print("No tasks configured")
         return
 
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("", width=1, no_wrap=True)
+    table.add_column("Status", style="cyan", no_wrap=True)
+    table.add_column("Task", style="magenta", no_wrap=True)
+    table.add_column("URL", no_wrap=True)
+    table.add_column("Command", overflow="ellipsis", no_wrap=True)
+    table.add_column("Notes", style="dim", no_wrap=True)
+
+    fail_rows: list[tuple[str, str, str]] = []
     for t in data["tasks"]:
         health_icon = "G" if t["healthy"] else "R" if t["running"] else "o"
+        icon_style = "green" if t["healthy"] else "red" if t["running"] else "dim"
         status_text = "Healthy" if t["healthy"] else "Running" if t["running"] else "Stopped"
-        auto = "" if t["auto_start"] else " [manual]"
-        url = t.get("url") or ""
-        url_col = f" {url}" if url else ""
-        extras = ""
+        notes: list[str] = []
+        if not t["auto_start"]:
+            notes.append("manual")
         if t.get("restart_policy") and t["restart_policy"] != str(RestartPolicy.ON_FAILURE):
-            extras += f" restart={t['restart_policy']}"
+            notes.append(f"restart={t['restart_policy']}")
         if t.get("cwd"):
-            extras += f" cwd={t['cwd']}"
+            notes.append(f"cwd={t['cwd']}")
         if t.get("depends_on"):
-            extras += f" deps=[{','.join(t['depends_on'])}]"
-        line = f"{health_icon} {status_text:8} {t['name']:15}{url_col} {t['command']}"
-        console.print(f"{line}{auto}{extras}")
+            notes.append(f"deps=[{','.join(t['depends_on'])}]")
+        table.add_row(
+            f"[{icon_style}]{health_icon}[/{icon_style}]",
+            status_text,
+            t["name"],
+            t.get("url") or "",
+            t["command"],
+            " ".join(notes),
+        )
         last = t.get("last_health")
         if last and not last.get("ok") and last.get("reason"):
-            console.print(
-                f"    fail: {last['method']} — {last['reason']}",
-                style="red",
-            )
+            fail_rows.append((t["name"], last.get("method", ""), last.get("reason", "")))
+
+    console.print(table)
+    for name, method, reason in fail_rows:
+        console.print(f"    {name} fail: {method} — {reason}", style="red")
+
+    aliases = data.get("aliases") or []
+    if aliases:
+        console.print()
+        console.print("Aliases (external routes):", style="bold")
+        atable = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+        atable.add_column("Name", style="magenta")
+        atable.add_column("URL")
+        atable.add_column("Target", style="dim")
+        for a in aliases:
+            atable.add_row(a["name"], a["url"], f"127.0.0.1:{a['port']}")
+        console.print(atable)
 
 
 app.command(name="status")(_status)
