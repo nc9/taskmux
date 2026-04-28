@@ -1,6 +1,6 @@
 ---
 name: taskmux
-version: 0.6.4
+version: 0.7.0
 description: Manage long-running dev tasks (servers, watchers, build processes) via taskmux — a tmux-backed task runner driven by `taskmux.toml`. TRIGGER when cwd has `taskmux.toml`, when the user mentions taskmux, or when the user wants to start/stop/inspect/tail-logs of long-running processes in a project that has taskmux configured. SKIP for one-shot commands (tests, builds) and for projects without `taskmux.toml`.
 ---
 
