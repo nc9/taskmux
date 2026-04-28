@@ -13,8 +13,9 @@ Designed to pair well with coding agents like Claude Code, Codex, and OpenCode �
 - **JSON output** — `--json` on every command for programmatic consumption
 - **Event history** — lifecycle events recorded to `~/.taskmux/events.jsonl`
 - **Lifecycle hooks** — before/after start/stop at global and per-task level
-- **HTTPS proxy** — `host = "api"` exposes a task at `https://api.{project}.localhost` with a trusted local cert (mkcert); taskmux assigns a free `$PORT` per task so config never pins ports
+- **HTTPS proxy** — `host = "api"` exposes a task at `https://api.{project}.localhost` with a trusted local cert (mkcert); taskmux assigns a free `$PORT` per task so config never pins ports. Apex (`@`) and wildcard (`*`) host routes supported alongside specific subdomains
 - **Dynamic DNS** — optional in-process DNS server resolves any `*.localhost` to `127.0.0.1` (no `/etc/hosts` churn, no daemon restart when adding hosts)
+- **Worktree-aware** — linked git worktrees auto-namespace their `project_id` (`myproject-feat-foo`) so logs, registry entries, and proxy URLs don't collide with the primary checkout
 - **Port cleanup** — kills orphaned listeners before starting
 - **Agent context** — `taskmux init` injects a thin pointer + project task table into Claude/Codex/OpenCode context files; install the [taskmux skill](#claude-code-skill) for richer Claude Code guidance loaded on demand
 - **Daemon mode** — WebSocket API + config watching + health monitoring
@@ -125,6 +126,15 @@ host = "web"
 
 The daemon picks a free port for each task, injects it as `$PORT`, and routes `https://{host}.{name}.localhost` to it. Browsers resolve `*.localhost` to `127.0.0.1` automatically. The cert is wildcarded over the project, so adding/removing tasks doesn't trigger new cert prompts.
 
+**Apex and wildcard hosts.** Two reserved values let a single project answer for more than just specific subdomains:
+
+| `host = ` | URL it serves | Use case |
+|-----------|---------------|----------|
+| `"@"`     | `https://{name}.localhost`   | the bare project domain |
+| `"*"`     | catch-all for any `*.{name}.localhost` not claimed by a specific host | tenant subdomains, preview hosts |
+
+Specific slugs win over wildcard (e.g. with both `host = "api"` and `host = "*"`, `api.foo.localhost` hits the `api` task and `anything-else.foo.localhost` hits the `*` task). At most one apex and one wildcard per project.
+
 Linux: `sudo setcap cap_net_bind_service+ep $(readlink -f $(which python3))` lets the daemon bind `:443` without sudo at all (no privilege drop needed).
 
 ### How hostnames resolve
@@ -166,9 +176,11 @@ Disable / customize via `~/.taskmux/config.toml`:
 
 ```toml
 proxy_enabled = true            # default
-proxy_https_port = 443
-proxy_bind = "127.0.0.1"        # loopback only by default — set to "0.0.0.0" to expose on LAN
+proxy_https_port = 443          # set to >=1024 (e.g. 8443) to run unprivileged — no sudo needed
+proxy_bind = "127.0.0.1"        # loopback only by default — "0.0.0.0" exposes on LAN
 ```
+
+`taskmux status` flips host-routed tasks to `healthy: false` when the proxy listener isn't bound or this project's host route isn't registered — see the top-level `proxy: {bound, port, reason}` block in `--json` output and the per-task `last_health.method == "proxy"` reason.
 
 ### stop vs kill vs restart
 
@@ -259,7 +271,7 @@ On `taskmux start`: db starts first → migrate + worker wait for db health → 
 | `command` | required | shell command to run |
 | `auto_start` | `true` | include in `taskmux start` |
 | `cwd` | — | working directory |
-| `host` | — | DNS-safe subdomain. When set, taskmux assigns a free port via `$PORT`, mints a wildcard cert for `*.{name}.localhost`, and routes `https://{host}.{name}.localhost` → that port |
+| `host` | — | DNS-safe subdomain (e.g. `"api"`), `"@"` for apex (`https://{name}.localhost`), or `"*"` for wildcard catch-all. When set, taskmux assigns a free port via `$PORT`, mints a wildcard cert for `*.{name}.localhost`, and routes `https://{host}.{name}.localhost` → that port |
 | `host_path` | `"/"` | (reserved) base path for future health-URL auto-derivation |
 | `health_url` | — | HTTP URL to probe (e.g. `http://localhost:8000/health`) — uses stdlib, no curl needed |
 | `health_expected_status` | `200` | required HTTP status from `health_url` |
