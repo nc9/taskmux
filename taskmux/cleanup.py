@@ -62,20 +62,14 @@ def _rmTree(path: Path, report: CleanReport, dry_run: bool) -> None:
 
 
 def _projectIsRunning(project: str, worktree_id: str | None, project_id: str) -> bool:
-    """True if a tmux session for this project_id still has windows."""
-    try:
-        import libtmux
+    """True if the daemon has any task running for this project_id."""
+    from . import ipc_client
 
-        srv = libtmux.Server()
-        sess = srv.sessions.get(session_name=project_id)
-    except Exception:  # noqa: BLE001
+    resp = ipc_client.call_no_ensure("list_tasks", params={"session": project_id})
+    if resp is None:
         return False
-    if sess is None:
-        return False
-    try:
-        return len(list(sess.windows)) > 0
-    except Exception:  # noqa: BLE001
-        return False
+    data = resp.get("data") or {}
+    return bool(data.get("active_tasks", 0))
 
 
 def cleanProjectState(
@@ -222,30 +216,24 @@ def _readAssignedPorts(project: str, worktree_id: str | None) -> dict[str, int]:
 
 
 def _liveWindows(project_id: str) -> set[str] | None:
-    """Set of window names in the live tmux session, or None if no session."""
-    try:
-        import libtmux
+    """Set of running task names from the live daemon, or None when unavailable."""
+    from . import ipc_client
 
-        srv = libtmux.Server()
-        sess = srv.sessions.get(session_name=project_id)
-    except Exception:  # noqa: BLE001
+    resp = ipc_client.call_no_ensure("list_tasks", params={"session": project_id})
+    if resp is None:
         return None
-    if sess is None:
-        return None
-    try:
-        return {w.window_name for w in sess.windows if w.window_name}
-    except Exception:  # noqa: BLE001
-        return None
+    data = resp.get("data") or {}
+    return {t["name"] for t in data.get("tasks", []) if t.get("running")}
 
 
 def _liveTmuxSessions() -> set[str]:
-    try:
-        import libtmux
+    """Sessions the daemon currently knows about (worktree-aware project_ids)."""
+    from . import ipc_client
 
-        srv = libtmux.Server()
-        return {s.session_name for s in srv.sessions if s.session_name}
-    except Exception:  # noqa: BLE001
+    resp = ipc_client.call_no_ensure("list_projects")
+    if resp is None:
         return set()
+    return {p["session"] for p in resp.get("projects", []) if p.get("session_exists")}
 
 
 def findOrphans() -> OrphanReport:
@@ -414,19 +402,10 @@ def applyPrune(report: OrphanReport) -> dict:
                     state_path.write_text(json.dumps(data, indent=2))
                 actions["trimmed_state"].append({"session": sess, "tasks": removed})
 
-    if report["stray_tmux_sessions"]:
-        try:
-            import libtmux
-
-            srv = libtmux.Server()
-            for sess_name in report["stray_tmux_sessions"]:
-                with contextlib.suppress(Exception):
-                    s = srv.sessions.get(session_name=sess_name)
-                    if s is not None:
-                        s.kill()
-                        actions["killed_sessions"].append(sess_name)
-        except Exception:  # noqa: BLE001
-            pass
+    # Stray sessions used to be tmux sessions without a registry entry; the
+    # daemon-supervisor model has no stray-state concept (the daemon either
+    # owns a project or it doesn't), so this branch is intentionally a no-op
+    # for back-compat callers that still iterate `report["stray_tmux_sessions"]`.
 
     if report["stale_daemon_pid"] is not None:
         with contextlib.suppress(OSError):

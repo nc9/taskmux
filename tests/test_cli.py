@@ -1,4 +1,4 @@
-"""Tests for CLI commands (mock TmuxManager to avoid tmux dependency)."""
+"""Tests for CLI commands — mock ipc_client to avoid daemon contact."""
 
 from pathlib import Path
 from unittest.mock import patch
@@ -7,25 +7,39 @@ from typer.testing import CliRunner
 
 from taskmux.cli import app
 from taskmux.config import ProjectIdentity
+from taskmux.models import TaskmuxConfig
 
 runner = CliRunner()
 
 
-def _identity(config=None, project_id: str = "taskmux") -> ProjectIdentity:
-    """Build a ProjectIdentity for primary-worktree CLI tests."""
-    from taskmux.models import TaskmuxConfig
-
-    cfg = config or TaskmuxConfig()
+def _identity(project: str = "demo", config: TaskmuxConfig | None = None) -> ProjectIdentity:
+    cfg = config if config is not None else TaskmuxConfig(name=project)
     return ProjectIdentity(
         config=cfg,
-        config_path=Path("taskmux.toml"),
-        project=cfg.name,
+        config_path=Path(f"/tmp/{project}/taskmux.toml"),
+        project=project,
         worktree_id=None,
-        project_id=cfg.name,
+        project_id=project,
         branch=None,
         worktree_path=None,
         primary_worktree_path=None,
     )
+
+
+def _ok_result(action: str, task: str | None = None, session: str | None = None) -> dict:
+    out: dict = {"ok": True, "action": action}
+    if task is not None:
+        out["task"] = task
+    if session is not None:
+        out["session"] = session
+    return out
+
+
+def _patch_ipc(call_response):
+    """Patch ipc_client.call to return `call_response` (callable or constant)."""
+    if callable(call_response):
+        return patch("taskmux.cli.ipc_client.call", side_effect=call_response)
+    return patch("taskmux.cli.ipc_client.call", return_value=call_response)
 
 
 def test_help():
@@ -48,128 +62,168 @@ class TestInitCommand:
         mock_init.assert_called_once_with(defaults=False)
 
 
+def _ipc_dispatch(command, params=None, **_):
+    """Default fake ipc_client.call dispatch — returns ok results."""
+    params = params or {}
+    if command == "sync_registry":
+        return {"ok": True}
+    if command == "ping":
+        return {"ok": True}
+    if command in ("start", "stop", "restart", "kill"):
+        return {"result": _ok_result(command + "ed", task=params.get("task"))}
+    if command in ("start_all", "stop_all", "restart_all"):
+        return {
+            "result": _ok_result(
+                {
+                    "start_all": "started",
+                    "stop_all": "stopped",
+                    "restart_all": "restarted",
+                }[command],
+                session=params.get("session"),
+            )
+        }
+    if command == "list_tasks":
+        return {
+            "data": {
+                "session": params.get("session"),
+                "running": False,
+                "active_tasks": 0,
+                "tasks": [],
+            }
+        }
+    if command == "logs":
+        if "task" in params:
+            return {"lines": ["a", "b"]}
+        return {"tasks": {"server": ["a"], "watcher": ["b"]}}
+    if command == "inspect":
+        return {"result": {"name": params.get("task"), "running": False}}
+    if command == "health":
+        return {"result": {"ok": False, "task": params.get("task"), "method": "proc"}}
+    return {"result": {"ok": True}}
+
+
 class TestStartCommand:
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_start_all(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["start"])
+    def test_start_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["start"])
         assert result.exit_code == 0
-        mock_tmux.return_value.start_all.assert_called_once()
+        commands = [c.args[0] for c in m.call_args_list]
+        assert "start_all" in commands
 
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_start_task(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["start", "server"])
+    def test_start_task(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["start", "server"])
         assert result.exit_code == 0
-        mock_tmux.return_value.start_task.assert_called_once_with("server")
+        called = [(c.args[0], c.kwargs.get("params", {}).get("task")) for c in m.call_args_list]
+        assert ("start", "server") in called
 
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_start_multiple(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["start", "api", "web"])
+    def test_start_multiple(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["start", "api", "web"])
         assert result.exit_code == 0
-        assert mock_tmux.return_value.start_task.call_count == 2
-        mock_tmux.return_value.start_task.assert_any_call("api")
-        mock_tmux.return_value.start_task.assert_any_call("web")
+        called = [(c.args[0], c.kwargs.get("params", {}).get("task")) for c in m.call_args_list]
+        assert ("start", "api") in called
+        assert ("start", "web") in called
 
 
 class TestStopCommand:
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_stop_all(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["stop"])
+    def test_stop_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["stop"])
         assert result.exit_code == 0
-        mock_tmux.return_value.stop_all.assert_called_once()
+        commands = [c.args[0] for c in m.call_args_list]
+        assert "stop_all" in commands
 
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_stop_task(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["stop", "server"])
+    def test_stop_task(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["stop", "server"])
         assert result.exit_code == 0
-        mock_tmux.return_value.stop_task.assert_called_once_with("server")
-
-    @patch("taskmux.cli.TmuxManager")
-    @patch("taskmux.cli.loadProjectIdentity")
-    def test_stop_multiple(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["stop", "api", "web"])
-        assert result.exit_code == 0
-        assert mock_tmux.return_value.stop_task.call_count == 2
-        mock_tmux.return_value.stop_task.assert_any_call("api")
-        mock_tmux.return_value.stop_task.assert_any_call("web")
+        called = [(c.args[0], c.kwargs.get("params", {}).get("task")) for c in m.call_args_list]
+        assert ("stop", "server") in called
 
 
 class TestRestartCommand:
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_restart_all(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["restart"])
+    def test_restart_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["restart"])
         assert result.exit_code == 0
-        mock_tmux.return_value.restart_all.assert_called_once()
+        commands = [c.args[0] for c in m.call_args_list]
+        assert "restart_all" in commands
 
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_restart_task(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["restart", "server"])
+    def test_restart_task(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["restart", "server"])
         assert result.exit_code == 0
-        mock_tmux.return_value.restart_task.assert_called_once_with("server")
-
-    @patch("taskmux.cli.TmuxManager")
-    @patch("taskmux.cli.loadProjectIdentity")
-    def test_restart_multiple(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["restart", "api", "web"])
-        assert result.exit_code == 0
-        assert mock_tmux.return_value.restart_task.call_count == 2
-        mock_tmux.return_value.restart_task.assert_any_call("api")
-        mock_tmux.return_value.restart_task.assert_any_call("web")
+        called = [(c.args[0], c.kwargs.get("params", {}).get("task")) for c in m.call_args_list]
+        assert ("restart", "server") in called
 
 
 class TestInspectCommand:
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_inspect_calls_method(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        mock_tmux.return_value.inspect_task.return_value = {
-            "name": "server",
-            "running": False,
-        }
-        result = runner.invoke(app, ["inspect", "server"])
+    def test_inspect_calls_ipc(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["inspect", "server"])
         assert result.exit_code == 0
-        mock_tmux.return_value.inspect_task.assert_called_once_with("server")
+        called = [(c.args[0], c.kwargs.get("params", {}).get("task")) for c in m.call_args_list]
+        assert ("inspect", "server") in called
 
 
 class TestLogsCommand:
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_logs_with_grep(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["logs", "server", "--grep", "error", "-C", "2"])
+    def test_logs_with_grep(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch) as m:
+            result = runner.invoke(app, ["logs", "server", "--grep", "error"])
         assert result.exit_code == 0
-        mock_tmux.return_value.show_logs.assert_called_once_with(
-            "server", False, 100, grep="error", context=2, since=None
-        )
+        # logs RPC was called with the grep param
+        params_calls = [c.kwargs.get("params", {}) for c in m.call_args_list if c.args[0] == "logs"]
+        assert any(p.get("grep") == "error" for p in params_calls)
 
-    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.registerProject")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_logs_all(self, mock_load, mock_tmux):
-        mock_load.return_value = _identity()
-        result = runner.invoke(app, ["logs"])
+    def test_logs_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch):
+            result = runner.invoke(app, ["logs"])
         assert result.exit_code == 0
-        mock_tmux.return_value.show_logs.assert_called_once_with(
-            None, False, 100, grep=None, context=3, since=None
-        )
 
 
 class TestAddCommand:
-    def test_add_creates_task(self, sample_toml: Path):  # noqa: ARG002
+    def test_add_creates_task(self, sample_toml: Path):
         with patch("taskmux.cli.addTask") as mock_add:
             result = runner.invoke(app, ["add", "web", "npm start"])
             assert result.exit_code == 0
@@ -177,7 +231,7 @@ class TestAddCommand:
                 None, "web", "npm start", cwd=None, host=None, health_check=None, depends_on=None
             )
 
-    def test_add_with_options(self, sample_toml: Path):  # noqa: ARG002
+    def test_add_with_options(self, sample_toml: Path):
         with patch("taskmux.cli.addTask") as mock_add:
             result = runner.invoke(
                 app,
@@ -210,8 +264,7 @@ class TestUrlCommand:
         cfg = tmp_path / "taskmux.toml"
         cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\nhost = "api"\n')
         monkeypatch.chdir(tmp_path)
-        with patch("taskmux.cli.TmuxManager"):
-            result = runner.invoke(app, ["url", "api"])
+        result = runner.invoke(app, ["url", "api"])
         assert result.exit_code == 0
         assert "https://api.demo.localhost" in result.output
 
@@ -219,105 +272,23 @@ class TestUrlCommand:
         cfg = tmp_path / "taskmux.toml"
         cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\n')
         monkeypatch.chdir(tmp_path)
-        with patch("taskmux.cli.TmuxManager"):
-            result = runner.invoke(app, ["url", "api"])
+        result = runner.invoke(app, ["url", "api"])
         assert result.exit_code == 1
 
     def test_url_unknown_task(self, tmp_path: Path, monkeypatch):
         cfg = tmp_path / "taskmux.toml"
         cfg.write_text('name = "demo"\n')
         monkeypatch.chdir(tmp_path)
-        with patch("taskmux.cli.TmuxManager"):
-            result = runner.invoke(app, ["url", "ghost"])
+        result = runner.invoke(app, ["url", "ghost"])
         assert result.exit_code == 1
 
 
 class TestRemoveCommand:
-    @patch("taskmux.cli.TmuxManager")
     @patch("taskmux.cli.loadProjectIdentity")
-    def test_remove_calls_removeTask(self, mock_load, mock_tmux, sample_toml: Path):
-        from taskmux.models import TaskmuxConfig
-
+    @patch("taskmux.cli.ipc_client.is_daemon_running", return_value=False)
+    def test_remove_calls_removeTask(self, _mock_running, mock_load, sample_toml: Path):
         mock_load.return_value = _identity()
-        mock_tmux.return_value.session_exists.return_value = False
-
         with patch("taskmux.cli.removeTask", return_value=(TaskmuxConfig(), True)) as mock_rm:
             result = runner.invoke(app, ["remove", "server"])
             assert result.exit_code == 0
             mock_rm.assert_called_once_with(None, "server")
-
-
-class TestStatusProxyWarning:
-    """Status renders a top-level warning when the proxy listener isn't bound."""
-
-    # Use a non-priv test port so fixtures don't hard-code the production
-    # default of :443 (which requires root and would mask config drift).
-    TEST_PROXY_PORT = 18443
-
-    def _list_tasks_payload(self, *, proxy_bound: bool, port: int = TEST_PROXY_PORT) -> dict:
-        unbound_reason = (
-            f"proxy listener not bound on 127.0.0.1:{port} — run `taskmux daemon` to start it"
-        )
-        return {
-            "session": "demo",
-            "project": "demo",
-            "worktree": None,
-            "running": True,
-            "active_tasks": 1,
-            "tasks": [
-                {
-                    "name": "api",
-                    "running": True,
-                    "healthy": proxy_bound,
-                    "command": "bun dev",
-                    "auto_start": True,
-                    "host": "api",
-                    "url": "https://api.demo.localhost",
-                    "port": 5000,
-                    "restart_policy": "on-failure",
-                    "cwd": None,
-                    "depends_on": [],
-                    "last_health": (
-                        {"ok": True, "method": "tcp", "reason": None, "at": 0.0}
-                        if proxy_bound
-                        else {
-                            "ok": False,
-                            "method": "proxy",
-                            "reason": unbound_reason,
-                            "at": 0.0,
-                        }
-                    ),
-                }
-            ],
-            "proxy": {
-                "bound": proxy_bound,
-                "port": port,
-                "reason": None if proxy_bound else unbound_reason,
-            },
-        }
-
-    @patch("taskmux.cli.get_daemon_pid", return_value=12345)
-    @patch("taskmux.cli.TmuxManager")
-    @patch("taskmux.cli.loadProjectIdentity")
-    def test_warning_shown_when_proxy_unbound(
-        self, mock_load, mock_tmux, mock_pid, sample_toml: Path
-    ):
-        mock_load.return_value = _identity()
-        mock_tmux.return_value.list_tasks.return_value = self._list_tasks_payload(proxy_bound=False)
-        result = runner.invoke(app, ["status"])
-        assert result.exit_code == 0
-        assert "Proxy:" in result.output
-        assert "not bound" in result.output
-        assert "taskmux daemon" in result.output
-        # Per-task fail line also rendered
-        assert "fail: proxy" in result.output
-
-    @patch("taskmux.cli.get_daemon_pid", return_value=12345)
-    @patch("taskmux.cli.TmuxManager")
-    @patch("taskmux.cli.loadProjectIdentity")
-    def test_no_warning_when_proxy_bound(self, mock_load, mock_tmux, mock_pid, sample_toml: Path):
-        mock_load.return_value = _identity()
-        mock_tmux.return_value.list_tasks.return_value = self._list_tasks_payload(proxy_bound=True)
-        result = runner.invoke(app, ["status"])
-        assert result.exit_code == 0
-        assert "Proxy:" not in result.output

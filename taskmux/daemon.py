@@ -1,11 +1,14 @@
 """Unified multi-project daemon for Taskmux.
 
-A single daemon process per host manages all registered projects:
-  - Each project's `taskmux.toml` is loaded into its own TaskmuxCLI/TmuxManager.
-  - The registry at ~/.taskmux/registry.json is watched for add/remove events.
-  - Each project's config file is watched independently.
-  - Health-check loop iterates all projects, applies per-task restart policy.
-  - WebSocket API serves session-scoped requests + cross-project queries.
+A single daemon process per host owns all task processes for every registered
+project. State is keyed by session name:
+  - `self.projects[session]` -> Supervisor (PTY-backed process owner)
+  - `self.configs[session]`  -> parsed TaskmuxConfig
+  - `self.config_paths[session]` -> abs path to taskmux.toml
+
+Reads the registry at ~/.taskmux/registry.json + watches each project's
+taskmux.toml for live reloads. Auto-restart loop calls supervisor.auto_restart_tasks
+per project. WebSocket API fans out lifecycle commands to the right supervisor.
 """
 
 from __future__ import annotations
@@ -18,30 +21,28 @@ import os
 import signal
 import socket
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import websockets
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from .config import addTask, loadConfig, removeTask
 from .events import recordEvent
 from .host_resolver import HostResolver, getResolver
+from .models import TaskmuxConfig
 from .paths import (
     REGISTRY_PATH,
     ensureTaskmuxDir,
     globalDaemonLogPath,
     globalDaemonPidPath,
+    projectLogsDir,
 )
 from .proxy import ProxyServer
 from .registry import readRegistry
+from .supervisor import Supervisor, _parseSince, make_supervisor, readLogFile
 from .url import taskUrl
-
-if TYPE_CHECKING:
-    from .cli import TaskmuxCLI
-
 
 # ---------------------------------------------------------------------------
 # PID-file helpers (global daemon)
@@ -86,17 +87,18 @@ def _clear_daemon_pid() -> None:
 
 
 class ConfigWatcher(FileSystemEventHandler):
-    """Watches a single project's taskmux.toml and reloads its CLI on change."""
+    """Watches one project's taskmux.toml; calls back on change/missing."""
 
     def __init__(
         self,
-        cli: TaskmuxCLI,
+        session: str,
+        config_path: Path,
         loop: asyncio.AbstractEventLoop,
         on_reload: callable | None = None,  # type: ignore[type-arg]
         on_missing: callable | None = None,  # type: ignore[type-arg]
     ):
-        self.cli = cli
-        self.target_path = str(cli.config_path)
+        self.session = session
+        self.target_path = str(config_path)
         self.loop = loop
         self.on_reload = on_reload
         self.on_missing = on_missing
@@ -105,49 +107,35 @@ class ConfigWatcher(FileSystemEventHandler):
     def _matches(self, event: FileSystemEvent) -> bool:
         if str(event.src_path) == self.target_path:
             return True
-        # os.replace / atomic rename can fire moved events with dest=target.
         dest = getattr(event, "dest_path", None)
         return dest is not None and str(dest) == self.target_path
 
     def on_modified(self, event: FileSystemEvent) -> None:
-        if not self._matches(event):
-            return
-        self.loop.call_soon_threadsafe(self._reload_safe)
+        if self._matches(event):
+            self.loop.call_soon_threadsafe(self._fire_reload)
 
     def on_created(self, event: FileSystemEvent) -> None:
-        if not self._matches(event):
-            return
-        self.loop.call_soon_threadsafe(self._reload_safe)
+        if self._matches(event):
+            self.loop.call_soon_threadsafe(self._fire_reload)
 
     def on_moved(self, event: FileSystemEvent) -> None:
-        # Renamed onto the target → reload; renamed away → mark missing.
         dest = getattr(event, "dest_path", None)
         if dest is not None and str(dest) == self.target_path:
-            self.loop.call_soon_threadsafe(self._reload_safe)
+            self.loop.call_soon_threadsafe(self._fire_reload)
         elif str(event.src_path) == self.target_path:
-            self.loop.call_soon_threadsafe(self._missing_safe)
+            self.loop.call_soon_threadsafe(self._fire_missing)
 
     def on_deleted(self, event: FileSystemEvent) -> None:
-        if str(event.src_path) != self.target_path:
-            return
-        self.loop.call_soon_threadsafe(self._missing_safe)
+        if str(event.src_path) == self.target_path:
+            self.loop.call_soon_threadsafe(self._fire_missing)
 
-    def _reload_safe(self) -> None:
-        try:
-            self.cli.reload_config()
-            recordEvent("config_reloaded", session=self.cli.config.name)
-            self.logger.info(f"Reloaded config for '{self.cli.config.name}'")
-            if self.on_reload:
-                self.on_reload(self.cli)
-        except Exception as e:  # noqa: BLE001
-            self.logger.error(f"Failed to reload config at {self.target_path}: {e}")
+    def _fire_reload(self) -> None:
+        if self.on_reload:
+            self.on_reload(self.session)
 
-    def _missing_safe(self) -> None:
-        self.logger.warning(
-            f"Config for '{self.cli.config.name}' disappeared at {self.target_path}"
-        )
+    def _fire_missing(self) -> None:
         if self.on_missing:
-            self.on_missing(self.cli)
+            self.on_missing(self.session)
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +152,6 @@ class RegistryWatcher(FileSystemEventHandler):
         self.target_path = str(REGISTRY_PATH)
 
     def _matches(self, event: FileSystemEvent) -> bool:
-        # os.replace fires a moved event with dest_path = target.
         if str(event.src_path) == self.target_path:
             return True
         dest = getattr(event, "dest_path", None)
@@ -198,54 +185,40 @@ class RegistryWatcher(FileSystemEventHandler):
 
 
 class TaskmuxDaemon:
-    """Unified multi-project daemon."""
+    """Unified multi-project daemon — owns all task processes via Supervisor."""
 
     def __init__(self, api_port: int | None = None):
         from .global_config import loadGlobalConfig
 
         self.global_config = loadGlobalConfig()
-        # Explicit api_port arg wins over global config so --port still works.
         self.api_port = api_port if api_port is not None else self.global_config.api_port
         self.running = False
         self.health_check_interval = self.global_config.health_check_interval
         self.health_check_task: asyncio.Task | None = None
         self.websocket_clients: set = set()
-        self.projects: dict[str, TaskmuxCLI] = {}
+        # session -> Supervisor / TaskmuxConfig / abs-path / state
+        self.projects: dict[str, Supervisor] = {}
+        self.configs: dict[str, TaskmuxConfig] = {}
+        self.config_paths: dict[str, Path] = {}
+        self.project_states: dict[str, str] = {}
         self.observers: dict[str, Observer] = {}  # type: ignore[reportInvalidTypeForm]
         self.registry_observer: Observer | None = None  # type: ignore[reportInvalidTypeForm]
-        self.project_states: dict[str, str] = {}  # session -> "ok" | "config_missing" | "error"
-        self.project_paths: dict[str, str] = {}  # session -> abs config_path
         self.proxy: ProxyServer | None = None
-        # Proxy is "eligible" once CA is installed and config allows it; we may
-        # not have started the listener yet (no registered projects → nothing
-        # to certify). First eligible project register triggers the bind.
         self._proxy_eligible = False
         self._proxy_started = False
-        # Pre-bound listening socket for :443. Opened in start() while we still
-        # have root, then handed to ProxyServer after privilege drop.
         self._proxy_sock: socket.socket | None = None
-        # Pluggable hostname resolution (writes /etc/hosts by default; can
-        # also run an in-process DNS server). Constructed during start().
         self.host_resolver: HostResolver | None = None
-        # In-process DNS server (only when host_resolver = "dns_server").
-        # Lifetime tied to the daemon's asyncio loop. None for other resolvers.
         self.dns_server: object | None = None
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self.logger = self._setup_logging()
-
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
 
     # ---- logging ----
 
     def _setup_logging(self) -> logging.Logger:
         logger = logging.getLogger("taskmux-daemon")
         logger.setLevel(logging.INFO)
-        # Don't propagate to root — root may have its own handlers (basicConfig
-        # set by deps), which would duplicate every record into our file/console.
         logger.propagate = False
-        # Idempotent: drop any prior handlers before re-attaching.
         for h in list(logger.handlers):
             logger.removeHandler(h)
             with contextlib.suppress(Exception):
@@ -253,9 +226,6 @@ class TaskmuxDaemon:
 
         formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-        # When detached, the spawn redirects stderr → daemon.log already, so a
-        # console (stderr) handler would double every line in the file. Only
-        # attach the console handler when running in a real terminal.
         if sys.stderr.isatty():
             console = logging.StreamHandler()
             console.setLevel(logging.INFO)
@@ -269,11 +239,6 @@ class TaskmuxDaemon:
         logger.addHandler(file_h)
         return logger
 
-    def _signal_handler(self, signum, frame) -> None:  # noqa: ARG002
-        self.logger.info(f"Received signal {signum}, shutting down...")
-        self.stop()
-        sys.exit(0)
-
     # ---- lifecycle ----
 
     async def start(self) -> None:
@@ -283,26 +248,22 @@ class TaskmuxDaemon:
             sys.exit(1)
 
         self._warn_if_unprivileged()
-
-        # Step 1: while we may still have root, pre-bind the privileged proxy
-        # socket. This must happen before _drop_privileges() since :443 needs
-        # CAP_NET_BIND_SERVICE / root.
         self._proxy_sock = self._pre_bind_proxy_socket()
-
-        # Step 2: also while privileged, do whatever the resolver needs at
-        # root level. For `etc_hosts` this writes the managed block. For
-        # `dns_server` this writes /etc/resolver/<tld> (or platform equivalent).
         self._install_resolver_root()
-
-        # Step 3: drop privileges back to the user that ran sudo. Everything
-        # after this point — tmux ops, mkcert minting, state files, pid file,
-        # the DNS server itself — runs as the user, so paths and file
-        # ownership are correct.
         self._drop_privileges()
 
         _write_daemon_pid()
         self.running = True
         self._loop = asyncio.get_running_loop()
+
+        # Use the loop's own signal handlers — async-safe, can schedule shutdown.
+        with contextlib.suppress(NotImplementedError):
+            self._loop.add_signal_handler(
+                signal.SIGTERM, lambda: asyncio.create_task(self._async_shutdown("SIGTERM"))
+            )
+            self._loop.add_signal_handler(
+                signal.SIGINT, lambda: asyncio.create_task(self._async_shutdown("SIGINT"))
+            )
 
         self.logger.info(f"Starting unified taskmux daemon (pid {os.getpid()}, uid {os.getuid()})")
 
@@ -321,6 +282,28 @@ class TaskmuxDaemon:
             await asyncio.gather(self.health_check_task, api_task)
         except asyncio.CancelledError:
             self.logger.info("Daemon tasks cancelled")
+
+    async def _async_shutdown(self, reason: str) -> None:
+        """Stop all task processes (with grace), then drop the daemon."""
+        self.logger.info(f"{reason} received — stopping all task processes")
+        self.running = False
+        # Snapshot then stop_all on each supervisor so process trees die
+        # within stop_grace_period rather than orphaning.
+        async with self._lock:
+            sessions = list(self.projects.items())
+        for session, sup in sessions:
+            try:
+                if sup.session_exists():
+                    await sup.stop_all()
+            except Exception as e:  # noqa: BLE001
+                self.logger.error(f"stop_all failed for {session}: {e}")
+        self.stop()
+        # Cancel the long-running tasks so start()'s gather() unblocks.
+        if self.health_check_task and not self.health_check_task.done():
+            self.health_check_task.cancel()
+        # Schedule final exit on next loop tick.
+        if self._loop is not None:
+            self._loop.call_soon(sys.exit, 0)
 
     def stop(self) -> None:
         self.running = False
@@ -367,25 +350,31 @@ class TaskmuxDaemon:
         self.logger.info(f"Watching registry at {REGISTRY_PATH}")
 
     async def _sync_with_registry(self) -> None:
-        """Diff in-memory projects against registry on disk; add/remove as needed."""
         async with self._lock:
             on_disk = readRegistry()
-            current = set(self.projects.keys())
+            # Treat config_missing/error as "needs retry" rather than "current",
+            # so a recreated taskmux.toml can re-register on the next sync.
+            healthy = {s for s in self.projects if self.project_states.get(s) == "ok"}
+            known = set(self.projects.keys()) | set(self.config_paths.keys())
             wanted = set(on_disk.keys())
 
-            for session in wanted - current:
+            for session in wanted - healthy:
                 entry = on_disk[session]
                 self._register_locked(session, Path(entry["config_path"]))
 
-            for session in current - wanted:
+            for session in known - wanted:
                 self._unregister_locked(session)
 
     def _register_locked(self, session: str, config_path: Path) -> None:
-        """Register a project. Caller must hold self._lock."""
-        from .cli import TaskmuxCLI
+        """Load config + create Supervisor. Caller holds self._lock.
 
-        # Always remember the path so config_missing entries can surface it.
-        self.project_paths[session] = str(config_path)
+        `session` is the worktree-aware project_id stored in the registry.
+        We compose project_id locally too and verify they match — mismatch
+        means the registry is stale; we use the registry key.
+        """
+        from .config import loadProjectIdentity
+
+        self.config_paths[session] = config_path
 
         if session in self.projects:
             return
@@ -394,40 +383,48 @@ class TaskmuxDaemon:
             self.project_states[session] = "config_missing"
             return
         try:
-            cli = TaskmuxCLI(config_path=config_path)
+            identity = loadProjectIdentity(config_path)
         except Exception as e:  # noqa: BLE001
             self.logger.error(f"Failed to load '{session}' from {config_path}: {e}")
             self.project_states[session] = "error"
             return
 
-        if cli.project_id != session:
+        cfg = identity.config
+        if identity.project_id != session:
             self.logger.warning(
-                f"Registry session '{session}' != project_id '{cli.project_id}' "
+                f"Registry session '{session}' != project_id '{identity.project_id}' "
                 f"for {config_path}; using registry key"
             )
 
-        self.projects[session] = cli
+        sup = make_supervisor(
+            cfg,
+            config_dir=config_path.parent,
+            project_id=session,
+            worktree_id=identity.worktree_id,
+        )
+        sup.on_task_route_change = self._on_task_route_change
+
+        self.configs[session] = cfg
+        self.projects[session] = sup
         self.project_states[session] = "ok"
 
-        # Wire route updates from TmuxManager to the proxy regardless of proxy state.
-        cli.tmux.on_task_route_change = self._on_task_route_change
         if self._proxy_eligible and self.proxy is not None:
-            self._mint_and_register_proxy(session, cli)
-            # Late bind: if proxy was eligible but had no projects yet, bind now.
+            self._mint_and_register_proxy(session)
             if self._loop is not None and not self._proxy_started:
                 self._loop.call_soon_threadsafe(
                     lambda: asyncio.create_task(self._start_proxy_listener())
                 )
-        # Refresh host resolver mappings. For dns_server this is a pure
-        # in-memory update (no privilege needed). For etc_hosts post-drop
-        # this no-ops with EACCES; we log a hint so the user knows.
         if self.host_resolver is not None:
-            new_hosts = [
-                f"{tc.host}.{cli.project_id}.{self.global_config.dns_managed_tld}"
-                for tc in cli.config.tasks.values()
-                if tc.host is not None
-            ]
             self._sync_hostnames()
+            tld = self.global_config.dns_managed_tld
+            new_hosts: list[str] = []
+            for tc in cfg.tasks.values():
+                if tc.host is None or tc.host == "*":
+                    continue
+                if tc.host == "":
+                    new_hosts.append(f"{session}.{tld}")
+                else:
+                    new_hosts.append(f"{tc.host}.{session}.{tld}")
             if new_hosts and self.host_resolver.name == "etc_hosts":
                 self.logger.info(
                     f"Project '{session}' added with hosts {new_hosts}. "
@@ -438,12 +435,11 @@ class TaskmuxDaemon:
         if self._loop is not None:
             observer = Observer()
             handler = ConfigWatcher(
-                cli,
+                session,
+                config_path,
                 self._loop,
-                on_reload=lambda c, s=session: self._on_project_reload(s),
-                on_missing=lambda c, s=session: self._loop.call_soon_threadsafe(  # type: ignore[union-attr]
-                    lambda: asyncio.create_task(self._mark_missing(s))
-                ),
+                on_reload=lambda s: self._on_config_reload(s),
+                on_missing=lambda s: asyncio.create_task(self._mark_missing(s)),
             )
             observer.schedule(handler, str(config_path.parent), recursive=False)
             observer.start()
@@ -452,38 +448,31 @@ class TaskmuxDaemon:
         self.logger.info(f"Registered project '{session}' from {config_path}")
 
     def _unregister_locked(self, session: str) -> None:
-        """Unregister a project. Caller must hold self._lock."""
         observer = self.observers.pop(session, None)
         if observer is not None:
             with contextlib.suppress(Exception):
                 observer.stop()
                 observer.join(timeout=2)
         self.projects.pop(session, None)
+        self.configs.pop(session, None)
         self.project_states.pop(session, None)
-        self.project_paths.pop(session, None)
+        self.config_paths.pop(session, None)
         if self.proxy is not None:
             self.proxy.unregister_project(session)
             from .ca import dropCert
 
             with contextlib.suppress(Exception):
                 dropCert(session)
-        # Refresh the resolver so the unregistered project's hosts disappear
-        # (dns_server: instant; etc_hosts: no-op post-drop).
         self._sync_hostnames()
         self.logger.info(f"Unregistered project '{session}'")
 
     # ---- privileged bootstrap ----
 
     def _warn_if_unprivileged(self) -> None:
-        """Loudly warn at startup when the daemon won't be able to bind privileged
-        ports or write to system files (the actual failures still happen + log
-        their own errors, but they're scattered and easy to miss in a tail)."""
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
             return
         if not self.global_config.proxy_enabled:
             return
-        # POSIX: euid 0 means we have full privileges. Windows has no euid;
-        # we let the bind/write attempts surface their own messages there.
         is_root = hasattr(os, "geteuid") and os.geteuid() == 0
         if is_root:
             return
@@ -509,13 +498,6 @@ class TaskmuxDaemon:
         )
 
     def _pre_bind_proxy_socket(self) -> socket.socket | None:
-        """Open + listen on the proxy port while we still have root.
-
-        Returns the listening socket; ProxyServer wraps it in TLS later.
-        Returns None when proxy is disabled, port is non-privileged, or bind
-        fails (logged). Safe to call as a non-root user — bind to a high port
-        will succeed without privileges.
-        """
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
             return None
         if not self.global_config.proxy_enabled:
@@ -543,15 +525,6 @@ class TaskmuxDaemon:
         return s
 
     def _install_resolver_root(self) -> None:
-        """While privileged, do the resolver-specific one-time install:
-
-        - etc_hosts: write a managed block now (will need re-sync later
-          but we're going to lose privilege so do it once).
-        - dns_server: write /etc/resolver/<tld> (or the platform's
-          equivalent) so the OS sends queries to our soon-to-start
-          in-process DNS server.
-        - noop: nothing.
-        """
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
             return
         if not self.global_config.proxy_enabled:
@@ -559,7 +532,6 @@ class TaskmuxDaemon:
 
         kind = self.global_config.host_resolver
         if kind == "etc_hosts":
-            # Build the etc_hosts resolver up-front and let it write while root.
             try:
                 self.host_resolver = getResolver("etc_hosts")
             except ValueError as e:
@@ -591,7 +563,6 @@ class TaskmuxDaemon:
                 )
 
     async def _maybe_start_dns_server(self) -> None:
-        """Post-privilege-drop: start the in-process DNS server if configured."""
         if self.global_config.host_resolver != "dns_server":
             return
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
@@ -617,20 +588,18 @@ class TaskmuxDaemon:
         self.host_resolver = getResolver("dns_server", dns_server=srv)
 
     def _collect_host_mappings(self) -> list[tuple[str, str]]:
-        """Walk the registry; return every (fqdn, 127.0.0.1) the resolver should know.
+        """Walk the registry; emit (fqdn, 127.0.0.1) for each task host.
 
-        Apex (host == "") emits `{project_id}.{tld}`. Wildcard (host == "*") is
-        skipped — `EtcHostsResolver` can't express wildcards; `DnsServerResolver`
-        catch-alls anything in the managed TLD already. We log one warning per
-        sync when both are true (etc_hosts + a wildcard task) so the user knows
-        to switch resolver if they want wildcards to resolve in the browser.
+        Apex (`""`) emits `{project_id}.{tld}`. Wildcard (`"*"`) is skipped
+        for etc_hosts (no glob support); the `dns_server` resolver answers
+        wildcards in code.
         """
         from .aliases import loadAliases
         from .config import loadProjectIdentity
-        from .registry import readRegistry
 
         mappings: list[tuple[str, str]] = []
         wildcard_under_etc_hosts: list[str] = []
+        tld = self.global_config.dns_managed_tld
         for session, entry in readRegistry().items():
             cfg_path = Path(entry["config_path"])
             if not cfg_path.exists():
@@ -640,10 +609,7 @@ class TaskmuxDaemon:
             except Exception as e:  # noqa: BLE001
                 self.logger.warning(f"Skipping host collection for {session!r}: {e}")
                 continue
-            # Registry key is project_id (worktree-aware). Use the same id for
-            # the fqdn so DNS / proxy routing match.
             project_id = session if session == identity.project_id else identity.project_id
-            tld = self.global_config.dns_managed_tld
             for task_cfg in identity.config.tasks.values():
                 if task_cfg.host is None:
                     continue
@@ -669,32 +635,14 @@ class TaskmuxDaemon:
         return mappings
 
     def _sync_hostnames(self) -> None:
-        """Push the current set of mappings into whichever resolver is active.
-
-        Cheap to call — for `etc_hosts` after-drop this will likely fail with
-        EACCES (which we already wrote while root). For `dns_server` it's a
-        pure in-memory map update; we call this on every project register /
-        unregister / config-reload.
-        """
         if self.host_resolver is None:
             return
         mappings = self._collect_host_mappings()
-        # etc_hosts post-drop sync is expected to fail with EACCES — the root
-        # bootstrap already populated the file; suppression intended.
         with contextlib.suppress(PermissionError, OSError):
             self.host_resolver.sync(mappings)
 
     def _drop_privileges(self) -> None:
-        """If running as root via sudo, drop to SUDO_UID/SUDO_GID.
-
-        Without this, libtmux talks to /tmp/tmux-0 (root's tmux server) and
-        can't see the user's sessions, mkcert writes root-owned cert files,
-        and ~/.taskmux/ resolves under root's HOME. We bind :443 first, then
-        come back down to the invoking user.
-        """
-        # geteuid is POSIX-only; on Windows we don't drop privileges (the daemon
-        # either runs as Admin or doesn't bind privileged ports — there's no
-        # sudo equivalent to demote from).
+        """If running as root via sudo, drop to SUDO_UID/SUDO_GID."""
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
             return
         sudo_uid = os.environ.get("SUDO_UID")
@@ -702,7 +650,7 @@ class TaskmuxDaemon:
         if not sudo_uid or not sudo_gid:
             self.logger.warning(
                 "Daemon is running as root with no SUDO_UID — staying as root. "
-                "tmux/state/cert ownership will be off; prefer `sudo taskmux daemon`."
+                "state/cert ownership will be off; prefer `sudo taskmux daemon`."
             )
             return
         import pwd as _pwd
@@ -710,10 +658,6 @@ class TaskmuxDaemon:
         uid = int(sudo_uid)
         gid = int(sudo_gid)
         pw = _pwd.getpwuid(uid)
-        # Heal any prior root-owned state under the user's ~/.taskmux/ before
-        # dropping privileges — pid file, cert dirs, etc. left behind by a
-        # daemon that ran without dropping privs would otherwise EACCES the
-        # newly-unprivileged daemon.
         taskmux_dir = Path(pw.pw_dir) / ".taskmux"
         if taskmux_dir.is_dir():
             for entry in taskmux_dir.rglob("*"):
@@ -726,13 +670,9 @@ class TaskmuxDaemon:
         os.initgroups(pw.pw_name, gid)
         os.setgid(gid)
         os.setuid(uid)
-        # Reset env so child processes (mkcert, hooks, …) and HOME-derived
-        # paths resolve under the original user.
         os.environ["HOME"] = pw.pw_dir
         os.environ["USER"] = pw.pw_name
         os.environ["LOGNAME"] = pw.pw_name
-        # paths.py captured TASKMUX_DIR at import — re-evaluate so it points
-        # at the user's ~/.taskmux instead of /var/root/.taskmux.
         from . import paths as _paths
 
         _paths.TASKMUX_DIR = Path(pw.pw_dir) / ".taskmux"
@@ -743,7 +683,6 @@ class TaskmuxDaemon:
         _paths.GLOBAL_DAEMON_PID = _paths.TASKMUX_DIR / "daemon.pid"
         _paths.GLOBAL_DAEMON_LOG = _paths.TASKMUX_DIR / "daemon.log"
         _paths.GLOBAL_CONFIG_PATH = _paths.TASKMUX_DIR / "config.toml"
-        # daemon.py imported REGISTRY_PATH directly; refresh.
         global REGISTRY_PATH
         REGISTRY_PATH = _paths.REGISTRY_PATH
         self.logger.info(f"Dropped privileges: now running as {pw.pw_name} (uid={uid}, gid={gid})")
@@ -751,21 +690,6 @@ class TaskmuxDaemon:
     # ---- proxy ----
 
     async def _maybe_start_proxy(self) -> None:
-        """Prepare the HTTPS proxy: verify CA install + build ProxyServer +
-        mint certs for known projects.
-
-        The actual listener bind is deferred to _start_proxy_listener, which
-        is called once we have at least one project with a cert. That way
-        `taskmux daemon` works on an empty registry and only attaches the
-        TLS listener when there's something to serve.
-
-        On every daemon start, `mkcert -install` is invoked. It's idempotent —
-        a no-op when the CA is already trusted — but acts as a check that
-        the trust store still has our CA (e.g. a system update may have
-        cleared it). Failure is logged but doesn't kill the proxy; certs
-        will be served untrusted until `taskmux ca install` is run manually
-        in an interactive session.
-        """
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
             self.logger.info("Proxy disabled via TASKMUX_DISABLE_PROXY=1")
             return
@@ -780,9 +704,6 @@ class TaskmuxDaemon:
             self.logger.warning(f"Proxy not started: {e.message}")
             return
         except Exception as e:  # noqa: BLE001
-            # mkcert -install failed (e.g. denied keychain prompt, no GUI
-            # session for first-time install). Don't kill the proxy — log
-            # and proceed with potentially-untrusted certs.
             self.logger.warning(
                 f"CA install/verify failed: {e}. Run `taskmux ca install` "
                 f"interactively to trust the local CA. Browsers will show "
@@ -795,15 +716,12 @@ class TaskmuxDaemon:
             sock=self._proxy_sock,
         )
         self._proxy_eligible = True
-        # Mint certs for projects already registered at startup, then bind if any.
         async with self._lock:
-            for session, cli in list(self.projects.items()):
-                self._mint_and_register_proxy(session, cli)
-                cli.tmux.on_task_route_change = self._on_task_route_change
+            for session in list(self.projects.keys()):
+                self._mint_and_register_proxy(session)
             await self._start_proxy_listener()
 
     async def _start_proxy_listener(self) -> None:
-        """Bind the proxy listener if not yet bound and at least one project has a cert."""
         if self.proxy is None or self._proxy_started:
             return
         if not self.proxy._projects:
@@ -825,9 +743,12 @@ class TaskmuxDaemon:
             f"{self.global_config.proxy_https_port}"
         )
 
-    def _mint_and_register_proxy(self, session: str, cli: TaskmuxCLI) -> None:
-        """Mint cert + register project + seed routes for already-assigned ports."""
+    def _mint_and_register_proxy(self, session: str) -> None:
         if self.proxy is None:
+            return
+        cfg = self.configs.get(session)
+        sup = self.projects.get(session)
+        if cfg is None or sup is None:
             return
         from .ca import mintCert
 
@@ -837,29 +758,19 @@ class TaskmuxDaemon:
             self.logger.error(f"mkcert failed for '{session}': {e}")
             return
         self.proxy.register_project(session, cert, key)
-        # Seed routes only for tasks whose tmux window is actually alive.
-        # Sticky port assignments in state.json can outlive the process; if
-        # we route blindly, a different process binding that port later
-        # would receive proxied traffic addressed to the trusted URL.
-        running_windows: set[str] = set()
-        try:
-            if cli.tmux.session_exists():
-                running_windows = set(cli.tmux.list_windows())
-        except Exception as e:  # noqa: BLE001
-            self.logger.warning(f"list_windows failed for {session!r}: {e}")
-        for task_name, task_cfg in cli.config.tasks.items():
+        running = set(sup.list_windows()) if sup.session_exists() else set()
+        for task_name, task_cfg in cfg.tasks.items():
             if task_cfg.host is None:
                 continue
-            port = cli.tmux.assigned_ports.get(task_name)
-            if port is not None and task_name in running_windows:
+            port = sup.assigned_ports.get(task_name)
+            if port is not None and task_name in running:
                 self.proxy.set_route(session, task_cfg.host, port)
         from .aliases import loadAliases as _loadAliases
 
-        for alias_entry in _loadAliases(cli.identity.project, cli.identity.worktree_id).values():
+        for alias_entry in _loadAliases(sup.config.name, sup.worktree_id).values():
             self.proxy.set_route(session, alias_entry["host"], alias_entry["port"])
 
     def _on_task_route_change(self, project: str, _task: str, host: str, port: int | None) -> None:
-        """TmuxManager callback: task started (port=N) or stopped (port=None)."""
         if self.proxy is None:
             return
         if port is None:
@@ -868,41 +779,39 @@ class TaskmuxDaemon:
             self.proxy.set_route(project, host, port)
 
     async def _resync_project_routes(self, session: str) -> dict:
-        """Reconcile a project's proxy routes against disk state + live tmux.
+        """Reconcile a project's proxy routes against disk state + live tasks.
 
         Used after an out-of-band CLI lifecycle command (start/stop/restart/kill
         or alias add/remove) in a separate process. We re-read assigned_ports
         from state.json, build the desired host set from (live tasks ∪ aliases),
         drop any existing route not in that set, and set the desired ones.
-
-        Reconciling the full set (rather than just the hosts we know about)
-        is what catches removed/renamed aliases and tasks deleted from the
-        config — otherwise stale routes outlive the daemon restart.
         """
-        async with self._lock:
-            cli = self.projects.get(session)
-        if cli is None:
-            return {"ok": False, "error": "unknown_session", "added": [], "dropped": []}
-        cli.tmux.reload_state()
         from .aliases import loadAliases as _loadAliases
+
+        async with self._lock:
+            sup = self.projects.get(session)
+            cfg = self.configs.get(session)
+        if sup is None or cfg is None:
+            return {"ok": False, "error": "unknown_session", "added": [], "dropped": []}
+        sup.reload_state()
 
         added: list[str] = []
         dropped: list[str] = []
         running_windows: set[str] = set()
         try:
-            if cli.tmux.session_exists():
-                running_windows = set(cli.tmux.list_windows())
+            if sup.session_exists():
+                running_windows = set(sup.list_windows())
         except Exception as e:  # noqa: BLE001
             self.logger.warning(f"resync: list_windows failed for {session!r}: {e}")
 
         desired: dict[str, int] = {}
-        for task_name, task_cfg in cli.config.tasks.items():
+        for task_name, task_cfg in cfg.tasks.items():
             if task_cfg.host is None:
                 continue
-            port = cli.tmux.assigned_ports.get(task_name)
+            port = sup.assigned_ports.get(task_name)
             if task_name in running_windows and port is not None:
                 desired[task_cfg.host] = port
-        for alias_entry in _loadAliases(cli.identity.project, cli.identity.worktree_id).values():
+        for alias_entry in _loadAliases(sup.config.name, sup.worktree_id).values():
             desired[alias_entry["host"]] = alias_entry["port"]
 
         if self.proxy is not None:
@@ -923,7 +832,6 @@ class TaskmuxDaemon:
         return {"ok": True, "added": added, "dropped": dropped}
 
     async def _mark_missing(self, session: str) -> None:
-        """Mark a project as config_missing — drop live CLI + proxy + DNS state."""
         async with self._lock:
             observer = self.observers.pop(session, None)
             if observer is not None:
@@ -931,29 +839,37 @@ class TaskmuxDaemon:
                     observer.stop()
                     observer.join(timeout=2)
             self.projects.pop(session, None)
+            self.configs.pop(session, None)
             self.project_states[session] = "config_missing"
-            # Drop proxy routes + cert for this session — keeping them around
-            # would let the trusted URL keep resolving to whatever stale port
-            # the assignments map remembers.
             if self.proxy is not None:
                 self.proxy.unregister_project(session)
                 from .ca import dropCert
 
                 with contextlib.suppress(Exception):
                     dropCert(session)
-        # Sync host resolver so DNS map / etc_hosts forgets this project too.
         self._sync_hostnames()
         self.logger.info(f"Project '{session}' marked config_missing — health checks paused")
 
-    def _on_project_reload(self, session: str) -> None:
-        """ConfigWatcher reload callback: refresh proxy routes + host mappings.
-
-        Runs in the watchdog thread → schedule the actual work on the loop.
-        """
+    def _on_config_reload(self, session: str) -> None:
+        """ConfigWatcher reload — reload the parsed config + refresh routes."""
         if self._loop is None:
             return
 
         async def _do() -> None:
+            cfg_path = self.config_paths.get(session)
+            if cfg_path is None or not cfg_path.exists():
+                return
+            try:
+                cfg = loadConfig(cfg_path)
+            except Exception as e:  # noqa: BLE001
+                self.logger.error(f"Config reload failed for {session}: {e}")
+                return
+            sup = self.projects.get(session)
+            if sup is not None:
+                sup.config = cfg
+            self.configs[session] = cfg
+            recordEvent("config_reloaded", session=session)
+            self.logger.info(f"Reloaded config for '{session}'")
             await self._resync_project_routes(session)
             self._sync_hostnames()
 
@@ -966,10 +882,12 @@ class TaskmuxDaemon:
             try:
                 async with self._lock:
                     snapshot = list(self.projects.items())
-                for session, cli in snapshot:
+                for session, sup in snapshot:
                     try:
-                        if cli.tmux.session_exists():
-                            cli.tmux.auto_restart_tasks()
+                        # No session_exists guard: auto_restart_tasks must
+                        # also revive tasks whose process already exited
+                        # (otherwise they stay dead forever).
+                        await sup.auto_restart_tasks()
                     except Exception as e:  # noqa: BLE001
                         self.logger.error(f"Health check error for '{session}': {e}")
 
@@ -978,6 +896,8 @@ class TaskmuxDaemon:
                     await self._broadcast_to_clients({"type": "health_check", "data": payload})
 
                 await asyncio.sleep(self.health_check_interval)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:  # noqa: BLE001
                 self.logger.error(f"Health check loop error: {e}")
                 await asyncio.sleep(5)
@@ -993,7 +913,7 @@ class TaskmuxDaemon:
                     try:
                         data = json.loads(message)
                         response = await self._handle_api_request(data)
-                        await websocket.send(json.dumps(response))
+                        await websocket.send(json.dumps(response, default=str))
                     except json.JSONDecodeError:
                         await websocket.send(json.dumps({"error": "Invalid JSON"}))
                     except Exception as e:  # noqa: BLE001
@@ -1012,12 +932,26 @@ class TaskmuxDaemon:
             "list_projects",
             "status_all",
             "status",
+            "start",
+            "stop",
             "restart",
             "kill",
+            "start_all",
+            "stop_all",
+            "restart_all",
+            "inspect",
+            "health",
+            "list_tasks",
+            "events",
             "logs",
+            "logs_clean",
+            "add_task",
+            "remove_task",
             "proxy_routes",
             "url",
             "resync",
+            "sync_registry",
+            "ping",
         }
     )
 
@@ -1027,6 +961,13 @@ class TaskmuxDaemon:
 
         if command not in self.KNOWN_COMMANDS:
             return {"error": "unknown_command", "command": command}
+
+        if command == "ping":
+            return {"command": command, "ok": True}
+
+        if command == "sync_registry":
+            await self._sync_with_registry()
+            return {"command": command, "ok": True, "count": len(self.projects)}
 
         if command == "list_projects":
             return {"command": command, "projects": await self._list_projects()}
@@ -1042,22 +983,26 @@ class TaskmuxDaemon:
         session = params.get("session")
         if not session:
             return {"error": "missing_session", "command": command}
-        cli = self.projects.get(session)
-        if cli is None and command == "resync":
+        async with self._lock:
+            sup = self.projects.get(session)
+            cfg = self.configs.get(session)
+        if sup is None and command == "resync":
             # CLI may have just registered the project (e.g. `alias add` on a
             # fresh project). Beat the watcher: sync once, then look again.
             await self._sync_with_registry()
-            cli = self.projects.get(session)
-        if cli is None:
+            async with self._lock:
+                sup = self.projects.get(session)
+                cfg = self.configs.get(session)
+        if sup is None or cfg is None:
             return {"error": "unknown_session", "session": session, "command": command}
 
         if command == "status":
-            return {"command": command, "session": session, "data": self._project_status(cli)}
+            return {"command": command, "session": session, "data": self._project_status(session)}
+
+        if command == "list_tasks":
+            return {"command": command, "session": session, "data": sup.list_tasks()}
 
         if command == "resync":
-            # CLI just changed task lifecycle out-of-band (started/stopped/killed
-            # in a separate process). Re-read assigned_ports from disk and
-            # reconcile proxy routes against actual tmux pane state.
             return {
                 "command": command,
                 "session": session,
@@ -1068,7 +1013,7 @@ class TaskmuxDaemon:
             task_name = params.get("task")
             if not task_name:
                 return {"error": "missing_task", "session": session}
-            task_cfg = cli.config.tasks.get(task_name)
+            task_cfg = cfg.tasks.get(task_name)
             if task_cfg is None:
                 return {"error": "unknown_task", "session": session, "task": task_name}
             if task_cfg.host is None:
@@ -1077,85 +1022,157 @@ class TaskmuxDaemon:
                 "command": command,
                 "session": session,
                 "task": task_name,
-                "url": taskUrl(cli.project_id, task_cfg.host),
+                "url": taskUrl(session, task_cfg.host),
             }
 
-        if command == "restart":
+        if command in ("start", "stop", "restart", "kill", "inspect", "health"):
             task_name = params.get("task")
             if not task_name:
                 return {"error": "missing_task", "session": session}
-            result = cli.tmux.restart_task(task_name)
+            if command == "start":
+                result = await sup.start_task(task_name)
+            elif command == "stop":
+                result = await sup.stop_task(task_name)
+            elif command == "restart":
+                result = await sup.restart_task(task_name)
+            elif command == "kill":
+                result = await sup.kill_task(task_name)
+            elif command == "inspect":
+                result = sup.inspect_task(task_name)
+            else:  # health
+                hr = sup.check_health(task_name)
+                result = {"ok": True, "task": task_name, **hr.to_dict()}
             return {"command": command, "session": session, "result": result}
 
-        if command == "kill":
-            task_name = params.get("task")
-            if not task_name:
-                return {"error": "missing_task", "session": session}
-            result = cli.tmux.kill_task(task_name)
-            return {"command": command, "session": session, "result": result}
+        if command == "start_all":
+            return {"command": command, "session": session, "result": await sup.start_all()}
+        if command == "stop_all":
+            return {"command": command, "session": session, "result": await sup.stop_all()}
+        if command == "restart_all":
+            return {"command": command, "session": session, "result": await sup.restart_all()}
+
+        if command == "events":
+            from .events import queryEvents
+
+            task = params.get("task")
+            since = params.get("since")
+            limit = params.get("limit", 50)
+            since_dt = _parseSince(since) if since else None
+            return {
+                "command": command,
+                "session": session,
+                "events": queryEvents(task=task, session=session, since=since_dt, limit=limit),
+            }
 
         if command == "logs":
-            task_name = params.get("task")
+            task = params.get("task")
             lines = params.get("lines", 100)
-            if not task_name:
+            grep = params.get("grep")
+            since = params.get("since")
+            if task:
+                log_path = sup.getLogPath(task)
+                out = readLogFile(log_path, lines, grep, since) if log_path else []
+                return {"command": command, "session": session, "task": task, "lines": out}
+            tasks_logs: dict[str, list[str]] = {}
+            for name in cfg.tasks:
+                lp = sup.getLogPath(name)
+                tasks_logs[name] = readLogFile(lp, lines, grep, since) if lp else []
+            return {"command": command, "session": session, "tasks": tasks_logs}
+
+        if command == "logs_clean":
+            task = params.get("task")
+            log_dir = projectLogsDir(cfg.name, sup.worktree_id)
+            if not log_dir.exists():
+                return {"command": command, "session": session, "deleted": 0}
+            if task:
+                count = 0
+                for f in log_dir.glob(f"{task}.log*"):
+                    f.unlink()
+                    count += 1
+                return {"command": command, "session": session, "task": task, "deleted": count}
+            import shutil
+
+            shutil.rmtree(log_dir)
+            return {"command": command, "session": session, "action": "logs_cleaned"}
+
+        if command == "add_task":
+            task = params.get("task")
+            cmd = params.get("command")
+            if not task or not cmd:
+                return {"error": "missing_task_or_command", "session": session}
+            cfg_path = self.config_paths.get(session)
+            addTask(
+                cfg_path,
+                task,
+                cmd,
+                cwd=params.get("cwd"),
+                host=params.get("host"),
+                health_check=params.get("health_check"),
+                depends_on=params.get("depends_on"),
+            )
+            return {"command": command, "session": session, "task": task, "action": "added"}
+
+        if command == "remove_task":
+            task = params.get("task")
+            if not task:
                 return {"error": "missing_task", "session": session}
-            try:
-                if not cli.tmux.session_exists():
-                    return {"error": "session_not_running", "session": session}
-                sess = cli.tmux._get_session()
-                window = sess.windows.get(window_name=task_name, default=None)
-                if window and window.active_pane:
-                    output = window.active_pane.cmd("capture-pane", "-p", "-S", f"-{lines}").stdout
-                    return {"command": command, "session": session, "logs": output}
-            except Exception as e:  # noqa: BLE001
-                return {"error": str(e), "session": session}
-            return {"error": "could_not_retrieve_logs", "session": session}
+            cfg_path = self.config_paths.get(session)
+            if task in sup.list_windows():
+                await sup.kill_task(task)
+            _, removed = removeTask(cfg_path, task)
+            return {
+                "command": command,
+                "session": session,
+                "task": task,
+                "removed": removed,
+                "action": "removed",
+            }
 
         return {"error": "unknown_command", "command": command}
 
     # ---- status helpers ----
 
-    def _project_status(self, cli: TaskmuxCLI) -> dict:
-        session_exists = cli.tmux.session_exists()
-        tasks: dict[str, dict] = {}
-        for task_name in cli.config.tasks:
-            tasks[task_name] = cli.tmux.get_task_status(task_name)
+    def _project_status(self, session: str) -> dict:
+        sup = self.projects.get(session)
+        cfg = self.configs.get(session)
+        cfg_path = self.config_paths.get(session)
+        if sup is None or cfg is None:
+            return {
+                "session_name": session,
+                "session_exists": False,
+                "tasks": {},
+                "config_path": str(cfg_path) if cfg_path else "",
+                "timestamp": datetime.now().isoformat(),
+            }
         return {
-            "session_name": cli.project_id,
-            "project": cli.config.name,
-            "worktree": cli.identity.worktree_id,
-            "branch": cli.identity.branch,
-            "worktree_path": (
-                str(cli.identity.worktree_path) if cli.identity.worktree_path else None
-            ),
-            "session_exists": session_exists,
-            "tasks": tasks,
-            "config_path": str(cli.config_path),
+            "session_name": cfg.name,
+            "session_exists": sup.session_exists(),
+            "tasks": {n: sup.get_task_status(n) for n in cfg.tasks},
+            "config_path": str(cfg_path) if cfg_path else "",
             "timestamp": datetime.now().isoformat(),
         }
 
     async def _aggregate_status(self) -> dict:
         async with self._lock:
             sessions = self._all_known_sessions_locked()
-            loaded = dict(self.projects)
             states = dict(self.project_states)
-            paths = dict(self.project_paths)
+            paths = dict(self.config_paths)
+            loaded = set(self.projects.keys())
         out_projects = []
         for session in sessions:
-            cli = loaded.get(session)
-            state = states.get(session, "ok" if cli else "config_missing")
-            if cli is None:
+            state = states.get(session, "ok" if session in loaded else "config_missing")
+            if session not in loaded:
                 out_projects.append(
                     {
                         "session": session,
                         "state": state,
-                        "config_path": paths.get(session, ""),
+                        "config_path": str(paths.get(session, "")),
                     }
                 )
                 continue
             try:
                 out_projects.append(
-                    {"session": session, "state": state} | self._project_status(cli)
+                    {"session": session, "state": state} | self._project_status(session)
                 )
             except Exception as e:  # noqa: BLE001
                 out_projects.append({"session": session, "state": "error", "error": str(e)})
@@ -1168,46 +1185,38 @@ class TaskmuxDaemon:
     async def _list_projects(self) -> list[dict]:
         async with self._lock:
             sessions = self._all_known_sessions_locked()
-            loaded = dict(self.projects)
             states = dict(self.project_states)
-            paths = dict(self.project_paths)
+            paths = dict(self.config_paths)
+            loaded = dict(self.projects)
+            configs = dict(self.configs)
         out: list[dict] = []
         for session in sessions:
-            cli = loaded.get(session)
-            state = states.get(session, "ok" if cli else "config_missing")
+            sup = loaded.get(session)
+            cfg = configs.get(session)
+            state = states.get(session, "ok" if sup else "config_missing")
+            cfg_path = paths.get(session)
             row: dict = {
                 "session": session,
-                "config_path": str(cli.config_path) if cli else paths.get(session, ""),
+                "config_path": str(cfg_path) if cfg_path else "",
                 "state": state,
             }
-            if cli is not None:
-                row["session_exists"] = cli.tmux.session_exists()
-                row["task_count"] = len(cli.config.tasks)
-                row["project"] = cli.config.name
-                row["worktree"] = cli.identity.worktree_id
-                row["branch"] = cli.identity.branch
-                row["worktree_path"] = (
-                    str(cli.identity.worktree_path) if cli.identity.worktree_path else None
-                )
+            if sup is not None and cfg is not None:
+                row["session_exists"] = sup.session_exists()
+                row["task_count"] = len(cfg.tasks)
             else:
                 row["session_exists"] = False
                 row["task_count"] = 0
-                row["project"] = session
-                row["worktree"] = None
-                row["branch"] = None
-                row["worktree_path"] = None
             out.append(row)
         return out
 
     def _all_known_sessions_locked(self) -> list[str]:
-        """Union of registry entries + currently loaded projects, sorted."""
         on_disk = readRegistry()
         return sorted(set(on_disk.keys()) | set(self.projects.keys()))
 
     async def _broadcast_to_clients(self, message: dict) -> None:
         if not self.websocket_clients:
             return
-        payload = json.dumps(message)
+        payload = json.dumps(message, default=str)
         disconnected = set()
         for client in self.websocket_clients:
             try:
@@ -1225,28 +1234,32 @@ class TaskmuxDaemon:
 class SimpleConfigWatcher:
     """Simple config file watcher for `taskmux watch` (non-daemon mode)."""
 
-    def __init__(self, taskmux_cli: TaskmuxCLI):
+    def __init__(self, taskmux_cli):  # type: ignore[no-untyped-def]
         self.taskmux_cli = taskmux_cli
 
     def watch_config(self) -> None:
+        import time as _time
+
         print("Watching taskmux.toml for changes...")
         print("Press Ctrl+C to stop")
 
         loop = asyncio.new_event_loop()
         observer = Observer()
-        observer.schedule(
-            ConfigWatcher(self.taskmux_cli, loop),
-            str(self.taskmux_cli.config_path.parent),
-            recursive=False,
+        cli = self.taskmux_cli
+        watcher = ConfigWatcher(
+            session=cli.config.name,
+            config_path=cli.config_path,
+            loop=loop,
+            on_reload=lambda _s: cli.reload_config(),
         )
+        observer.schedule(watcher, str(cli.config_path.parent), recursive=False)
         observer.start()
 
         try:
             while True:
-                # Drain any pending callbacks scheduled by watcher events.
                 loop.call_soon(loop.stop)
                 loop.run_forever()
-                time.sleep(1)
+                _time.sleep(1)
         except KeyboardInterrupt:
             observer.stop()
             print("\nStopped watching")
@@ -1256,10 +1269,7 @@ class SimpleConfigWatcher:
 
 
 def list_running_projects() -> list[dict]:
-    """Return the registry contents annotated with daemon status.
-
-    Used by `taskmux daemon list` when querying without a live daemon.
-    """
+    """Return the registry contents annotated with daemon status."""
     from .registry import listRegistered
 
     out: list[dict] = []
@@ -1274,7 +1284,6 @@ def list_running_projects() -> list[dict]:
     return out
 
 
-# Backwards-compat shim — referenced by older code paths during the transition.
 def list_running_daemons() -> list[dict]:
-    """Deprecated: returns the registered project list (single global daemon now)."""
+    """Deprecated: returns the registered project list."""
     return list_running_projects()
