@@ -187,7 +187,10 @@ class ProxyServer:
         return await self._proxy_http(request, port)
 
     async def _proxy_http(self, request: web.Request, port: int) -> web.StreamResponse:
-        target = f"http://127.0.0.1:{port}{request.rel_url.raw_path_qs}"
+        # Use `localhost` not `127.0.0.1` so the resolver picks IPv4 / IPv6 to
+        # match whichever family the upstream actually bound (Vite + many Node
+        # tools default to ::1; Python http.server defaults to 0.0.0.0).
+        target = f"http://localhost:{port}{request.rel_url.raw_path_qs}"
         headers = _filter_hop(request.headers)
 
         timeout = aiohttp.ClientTimeout(total=None, sock_read=None, sock_connect=10)
@@ -214,7 +217,7 @@ class ProxyServer:
                 return web.Response(status=502, text=f"upstream error: {e}\n")
 
     async def _proxy_ws(self, request: web.Request, port: int) -> web.StreamResponse:
-        upstream_url = f"ws://127.0.0.1:{port}{request.rel_url.raw_path_qs}"
+        upstream_url = f"ws://localhost:{port}{request.rel_url.raw_path_qs}"
         client_ws = web.WebSocketResponse()
         await client_ws.prepare(request)
 
