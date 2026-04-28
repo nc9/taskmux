@@ -72,11 +72,18 @@ class TestBuildContextBlock:
         block = buildContextBlock(cfg)
         assert "No tasks configured yet" in block
 
-    def test_contains_usage(self):
+    def test_contains_skill_pointer(self):
         cfg = TaskmuxConfig(name="test")
         block = buildContextBlock(cfg)
-        assert "taskmux start" in block
+        assert "taskmux` skill" in block
+        assert "taskmux --help" in block
         assert "taskmux inspect" in block
+
+    def test_no_usage_block(self):
+        cfg = TaskmuxConfig(name="test")
+        block = buildContextBlock(cfg)
+        assert "## Usage" not in block
+        assert "taskmux stop <task>" not in block
 
 
 class TestInjectAgentContext:

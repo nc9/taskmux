@@ -52,21 +52,11 @@ def buildContextBlock(config: TaskmuxConfig) -> str:
     lines.extend(
         [
             "",
-            "## Usage",
-            "",
-            "```bash",
-            "taskmux start              # Start all auto_start tasks",
-            "taskmux stop               # Stop all tasks",
-            "taskmux stop <task>        # Graceful stop (C-c) a single task",
-            "taskmux start <task>       # Start a single task",
-            "taskmux restart <task>     # Restart a single task",
-            "taskmux logs <task>        # Show recent logs",
-            'taskmux logs <task> --grep "error"  # Search logs',
-            "taskmux inspect <task>     # JSON task state",
-            "taskmux status             # Session overview",
-            "```",
-            "",
-            "Always use taskmux to manage long-running processes instead of running them directly.",
+            "Always use taskmux to manage long-running processes (servers, watchers, "
+            "queues) instead of running them directly. If the `taskmux` skill is "
+            "installed, prefer it for CLI details. Otherwise: `taskmux --help`, "
+            "`taskmux status --json`, `taskmux inspect <task> --json`, "
+            "`taskmux logs <task> --grep <pat>`.",
             CONTEXT_END,
         ]
     )

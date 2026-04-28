@@ -15,7 +15,7 @@ Designed to pair well with coding agents like Claude Code, Codex, and OpenCode �
 - **Lifecycle hooks** — before/after start/stop at global and per-task level
 - **HTTPS proxy** — `host = "api"` exposes a task at `https://api.{project}.localhost` with a trusted local cert (mkcert)
 - **Port cleanup** — kills orphaned listeners before starting
-- **Agent context** — `taskmux init` injects usage instructions into Claude/Codex/OpenCode context files
+- **Agent context** — `taskmux init` injects a thin pointer + project task table into Claude/Codex/OpenCode context files; install the [taskmux skill](#claude-code-skill) for richer Claude Code guidance loaded on demand
 - **Daemon mode** — WebSocket API + config watching + health monitoring
 - **Tmux native** — `tmux attach` to see live output, interact with tasks
 
@@ -26,6 +26,17 @@ Requires [tmux](https://github.com/tmux/tmux) and Python 3.11+.
 ```bash
 uv tool install taskmux
 ```
+
+### Claude Code skill
+
+Generic CLI guidance (when to invoke, JSON patterns, anti-patterns) lives in a Claude Code skill at [`skills/taskmux/`](skills/taskmux/SKILL.md). Project task tables still come from `taskmux init` injection. Install via [vercel-labs/skills](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add nc9/taskmux --skill taskmux        # project: .claude/skills/
+npx skills add nc9/taskmux --skill taskmux -g     # global:  ~/.claude/skills/
+```
+
+Codex/OpenCode users don't need the skill — `taskmux init` writes a self-contained `AGENTS.md` block.
 
 ## Commands
 

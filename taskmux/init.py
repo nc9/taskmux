@@ -49,4 +49,17 @@ def initProject(path: Path | None = None, defaults: bool = False) -> TaskmuxConf
         target = injectAgentContext(agent, project_path, config)
         print(f"  Injected {agent} context -> {target.relative_to(project_path)}")
 
+    if "claude" in agents and not defaults and not _skillInstalled(project_path):
+        print(
+            "  Tip: install the taskmux skill for richer Claude Code guidance:\n"
+            "    npx skills add nc9/taskmux --skill taskmux"
+        )
+
     return config
+
+
+def _skillInstalled(project_path: Path) -> bool:
+    """True if the taskmux skill is present at project or user scope."""
+    project_skill = project_path / ".claude" / "skills" / "taskmux" / "SKILL.md"
+    user_skill = Path.home() / ".claude" / "skills" / "taskmux" / "SKILL.md"
+    return project_skill.exists() or user_skill.exists()
