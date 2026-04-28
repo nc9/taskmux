@@ -1156,8 +1156,6 @@ class SimpleConfigWatcher:
 
         loop = asyncio.new_event_loop()
         observer = Observer()
-        # The CLI side still uses TmuxManager during the migration; reload via
-        # its own reload hook.
         cli = self.taskmux_cli
         watcher = ConfigWatcher(
             session=cli.config.name,

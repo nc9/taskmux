@@ -27,7 +27,6 @@ keywords = ["tmux", "terminal", "session", "manager", "development", "daemon", "
 
 dependencies = [
     "watchdog>=3.0.0",
-    "libtmux>=0.37.0",
     "aiohttp>=3.9.0",
     "websockets>=12.0",
     "aiofiles>=23.0.0",

@@ -1,9 +1,8 @@
-"""Process supervisor — daemon-owned, PTY-backed replacement for TmuxManager.
+"""Process supervisor — daemon-owned, PTY-backed task runner.
 
-Replaces tmux: opens a PTY per task, spawns via asyncio.create_subprocess_exec
-with setsid (own process group), drains the master fd into a timestamped log
-file with rotation, and signal-escalates on stop. Drop-in shape for the public
-surface that callers (daemon, CLI) used against `TmuxManager`.
+Opens a PTY per task, spawns via asyncio.create_subprocess_exec with setsid
+(own process group), drains the master fd into a timestamped log file with
+rotation, and signal-escalates on stop.
 
 Posix-only today (mac+linux). `make_supervisor()` raises on Windows; protocol
 seam is in place so a `WindowsSupervisor` (ConPTY + Job Objects) drops in
