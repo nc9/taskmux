@@ -1,4 +1,13 @@
-"""Typer-based CLI interface for Taskmux."""
+"""Typer-based CLI interface for Taskmux.
+
+Thin client over the daemon's WebSocket IPC. Each lifecycle command:
+1. resolves the project from cwd's taskmux.toml
+2. ensures the daemon is running (auto-spawn detached if needed)
+3. auto-registers the project + asks the daemon to sync the registry
+4. fires one IPC call with session + task params
+"""
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -11,6 +20,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import ipc_client
 from .config import addTask, loadConfig, removeTask
 from .daemon import (
     SimpleConfigWatcher,
@@ -21,22 +31,29 @@ from .errors import TaskmuxError
 from .init import initProject
 from .models import TaskmuxConfig
 from .output import is_json_mode, print_error, print_result, set_json_mode
-from .paths import ensureTaskmuxDir, globalDaemonLogPath
+from .paths import (
+    ensureTaskmuxDir,
+    globalDaemonLogPath,
+    projectLogsDir,
+    taskLogPath,
+)
 from .paths import migrate as migrateLayout
 from .registry import (
     listRegistered,
     registerProject,
     unregisterProject,
 )
-from .tmux_manager import TmuxManager
+
+TASK_COLORS = ["cyan", "green", "yellow", "magenta", "blue", "red"]
 
 app = typer.Typer(
     name="taskmux",
     help=(
-        "Tmux session manager for development environments.\n\n"
-        "Reads task definitions from taskmux.toml, manages tmux sessions/windows, "
-        "provides health monitoring, restart policies (no/on-failure/always), "
-        "dependency ordering, lifecycle hooks, and a WebSocket API.\n\n"
+        "Daemon-backed task manager for development environments.\n\n"
+        "Reads task definitions from taskmux.toml. The daemon owns all task "
+        "processes (PTY-backed, supervised) — CLI commands are thin RPC calls. "
+        "Health monitoring, restart policies, dependency ordering, lifecycle "
+        "hooks, WebSocket API, and an HTTPS proxy are all daemon-side.\n\n"
         "Quick start: taskmux init → edit taskmux.toml → taskmux start"
     ),
     epilog="Docs: https://github.com/nc9/taskmux",
@@ -47,8 +64,12 @@ app = typer.Typer(
 console = Console()
 
 
+# ---------------------------------------------------------------------------
+# Result rendering
+# ---------------------------------------------------------------------------
+
+
 def _print_result_human(result: dict) -> None:
-    """Print a TmuxManager result dict in human-readable format."""
     if not result.get("ok"):
         code = result.get("error_code", "")
         msg = result.get("error", "Unknown error")
@@ -75,7 +96,6 @@ def _print_result_human(result: dict) -> None:
 
 
 def _handle_result(result: dict) -> None:
-    """Output result as JSON or human-readable."""
     if is_json_mode():
         print_result(result)
     else:
@@ -83,7 +103,6 @@ def _handle_result(result: dict) -> None:
 
 
 def _handle_results(results: list[dict]) -> None:
-    """Output multiple results."""
     if is_json_mode():
         print_result({"ok": all(r.get("ok") for r in results), "results": results})
     else:
@@ -91,29 +110,43 @@ def _handle_results(results: list[dict]) -> None:
             _print_result_human(r)
 
 
+# ---------------------------------------------------------------------------
+# CLI helper: just config_path + parsed config. No process supervision.
+# ---------------------------------------------------------------------------
+
+
 class TaskmuxCLI:
-    """Main CLI application class. Optionally bound to a specific config path."""
+    """Thin handle on the cwd's taskmux.toml — resolves session name + paths."""
 
     def __init__(self, config_path: Path | None = None):
         self.config_path: Path = (config_path or Path("taskmux.toml")).expanduser().resolve()
         self.config: TaskmuxConfig = loadConfig(self.config_path)
-        self.tmux = TmuxManager(self.config, config_dir=self.config_path.parent)
 
     def reload_config(self) -> None:
-        """Reload config from self.config_path and rebind tmux manager."""
         self.config = loadConfig(self.config_path)
-        self.tmux.config = self.config
 
-    def handle_config_reload(self):
-        """Handle config file reload in daemon mode"""
-        current_windows = self.tmux.list_windows()
 
-        for task_name, _task_cfg in self.config.tasks.items():
-            if task_name in current_windows:
-                self.tmux.restart_task(task_name)
-            else:
-                if self.tmux.session_exists():
-                    self.tmux.restart_task(task_name)
+# ---------------------------------------------------------------------------
+# IPC plumbing — auto-start daemon, auto-register cwd, then call.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_session_known(session: str, config_path: Path) -> None:
+    """Register the project + tell the daemon to pick it up synchronously."""
+    try:
+        registerProject(session, config_path)
+    except TaskmuxError as e:
+        if not is_json_mode():
+            console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
+    with contextlib.suppress(Exception):
+        ipc_client.call("sync_registry")
+
+
+def _call_session(command: str, session: str, **params) -> dict:
+    """Wrap ipc.call: unwraps the {result: ...} envelope when present."""
+    payload = {"session": session, **params}
+    resp = ipc_client.call(command, params=payload)
+    return resp.get("result", resp)
 
 
 def _version_callback(value: bool) -> None:
@@ -151,7 +184,6 @@ def init(
     Creates taskmux.toml with session name (defaults to directory name).
     Detects installed AI coding agents (Claude, Codex, OpenCode) and injects
     taskmux usage instructions into their context files.
-    Use --defaults to skip interactive prompts.
     """
     result = initProject(defaults=defaults)
     if is_json_mode():
@@ -165,10 +197,6 @@ def init(
 
 
 def _warn_unprivileged_daemon() -> None:
-    """Print a terminal warning before spawning/foregrounding the daemon when
-    it'll fail to bind :443 / write /etc/resolver. The daemon logs its own
-    warning too, but that goes to ~/.taskmux/daemon.log — easy to miss when
-    you ran `taskmux daemon` from a shell."""
     import os as _os
 
     from .global_config import loadGlobalConfig
@@ -200,12 +228,7 @@ def _warn_unprivileged_daemon() -> None:
 
 
 def _spawn_detached_daemon(port: int | None = None) -> int | None:
-    """Fork the global taskmux daemon as a detached background process.
-
-    When `port` is given, it's forwarded as `--port <port>` so the spawned
-    process binds the requested port; otherwise the daemon resolves it from
-    `~/.taskmux/config.toml`.
-    """
+    """Fork the global taskmux daemon as a detached background process."""
     import subprocess
 
     existing = get_daemon_pid()
@@ -233,40 +256,7 @@ def _spawn_detached_daemon(port: int | None = None) -> int | None:
     return proc.pid
 
 
-def _notify_daemon_resync(session: str, timeout: float = 1.0) -> None:
-    """Best-effort WS notify so the running daemon resyncs proxy routes.
-
-    Fired after CLI lifecycle ops (start/stop/restart/kill) since the CLI's
-    local TmuxManager has no callback wired into the daemon's proxy. Silently
-    no-op if no daemon, no daemon at the configured port, or any failure.
-    """
-    if get_daemon_pid() is None:
-        return
-    try:
-        import websockets
-
-        from .global_config import loadGlobalConfig
-
-        port = loadGlobalConfig().api_port
-    except Exception:  # noqa: BLE001
-        return
-
-    async def _go() -> None:
-        try:
-            async with websockets.connect(
-                f"ws://localhost:{port}", open_timeout=timeout, close_timeout=timeout
-            ) as ws:
-                await ws.send(json.dumps({"command": "resync", "params": {"session": session}}))
-                await asyncio.wait_for(ws.recv(), timeout=timeout)
-        except Exception:  # noqa: BLE001
-            return
-
-    with contextlib.suppress(Exception):
-        asyncio.run(_go())
-
-
 def _autoRegisterCwd() -> None:
-    """Best-effort auto-register of the cwd's project. Swallows collisions."""
     cfg_path = Path("taskmux.toml")
     if not cfg_path.exists():
         return
@@ -281,112 +271,68 @@ def _autoRegisterCwd() -> None:
             console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle — all routed through ipc_client.
+# ---------------------------------------------------------------------------
+
+
 @app.command()
 def start(
     tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
     monitor: bool = typer.Option(  # noqa: B008
-        False, "-m", "--monitor", help="Stay running, auto-restart per restart_policy"
+        False, "-m", "--monitor", help="(deprecated; daemon always supervises)"
     ),
     daemon: bool = typer.Option(  # noqa: B008
-        False, "-d", "--daemon", help="Spawn detached daemon for auto-restart + WS API"
+        False, "-d", "--daemon", help="(deprecated; daemon always runs)"
     ),
 ):
-    """Start tasks (all auto_start tasks if none specified).
-
-    Starts tasks in dependency order, waiting for each dependency's health check
-    to pass before starting dependents. With --monitor, stays in the foreground
-    and auto-restarts tasks according to their restart_policy (no/on-failure/always),
-    respecting health_retries, max_restarts, and exponential backoff. With --daemon,
-    spawns a detached background daemon that does the same plus a WebSocket API.
-    """
-    import time
-
+    """Start tasks (all auto_start tasks if none specified)."""
+    _ = monitor, daemon  # back-compat no-ops
     cli = TaskmuxCLI()
+    _ensure_session_known(cli.config.name, cli.config_path)
     if tasks:
-        results = [cli.tmux.start_task(t) for t in tasks]
+        results = [_call_session("start", cli.config.name, task=t) for t in tasks]
         _handle_results(results)
     else:
-        result = cli.tmux.start_all()
-        _handle_result(result)
-
-    # Auto-register cwd project with the registry (idempotent, swallows collisions).
-    try:
-        registerProject(cli.config.name, cli.config_path)
-    except TaskmuxError as e:
-        if not is_json_mode():
-            console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
-
-    _notify_daemon_resync(cli.config.name)
-
-    if daemon or cli.config.auto_daemon:
-        pid = _spawn_detached_daemon()
-        if not is_json_mode():
-            if pid:
-                console.print(f"Daemon started (pid {pid})")
-            else:
-                console.print("Daemon failed to start", style="red")
-
-    if monitor:
-        if not is_json_mode():
-            console.print("Monitoring tasks (Ctrl+C to stop)...")
-        try:
-            while True:
-                time.sleep(30)
-                cli.tmux.auto_restart_tasks()
-        except KeyboardInterrupt:
-            if not is_json_mode():
-                console.print("\nStopped monitoring")
+        _handle_result(_call_session("start_all", cli.config.name))
 
 
 @app.command()
 def stop(
     tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
 ):
-    """Stop tasks (all if none specified).
-
-    Uses signal escalation: C-c → SIGTERM → SIGKILL. Waits stop_grace_period
-    seconds (default 5) after C-c before escalating. Stopped tasks are marked
-    as manually stopped and will not be auto-restarted even with restart_policy="always".
-    """
+    """Stop tasks (all if none specified). Signal escalation: SIGINT → SIGTERM → SIGKILL."""
     cli = TaskmuxCLI()
+    _ensure_session_known(cli.config.name, cli.config_path)
     if tasks:
-        results = [cli.tmux.stop_task(t) for t in tasks]
+        results = [_call_session("stop", cli.config.name, task=t) for t in tasks]
         _handle_results(results)
     else:
-        _handle_result(cli.tmux.stop_all())
-    _notify_daemon_resync(cli.config.name)
+        _handle_result(_call_session("stop_all", cli.config.name))
 
 
 @app.command()
 def restart(
     tasks: list[str] = typer.Argument(None, help="Task names (omit for all)"),  # noqa: B008
 ):
-    """Restart tasks (all if none specified).
-
-    Full stop with signal escalation, port cleanup, then restart.
-    Clears the manually-stopped flag so auto-restart policies resume.
-    """
+    """Restart tasks (all if none specified). Full stop with escalation, then start."""
     cli = TaskmuxCLI()
+    _ensure_session_known(cli.config.name, cli.config_path)
     if tasks:
-        results = [cli.tmux.restart_task(t) for t in tasks]
+        results = [_call_session("restart", cli.config.name, task=t) for t in tasks]
         _handle_results(results)
     else:
-        _handle_result(cli.tmux.restart_all())
-    _notify_daemon_resync(cli.config.name)
+        _handle_result(_call_session("restart_all", cli.config.name))
 
 
 @app.command()
 def kill(
     task: str = typer.Argument(..., help="Task name to kill"),
 ):
-    """Kill a specific task (SIGKILL + destroy window).
-
-    Unlike stop, kill is immediate with no grace period. The tmux window is
-    destroyed. The task is marked as manually stopped (no auto-restart).
-    """
+    """Kill a specific task (SIGKILL, no grace)."""
     cli = TaskmuxCLI()
-    _handle_result(cli.tmux.kill_task(task))
-    _notify_daemon_resync(cli.config.name)
+    _ensure_session_known(cli.config.name, cli.config_path)
+    _handle_result(_call_session("kill", cli.config.name, task=task))
 
 
 @app.command()
@@ -400,51 +346,86 @@ def logs(
         None, "--since", help="Show logs since time (e.g. '5m', '1h', '2d', or ISO timestamp)"
     ),
 ):
-    """Show logs for a task, or interleaved logs from all tasks.
-
-    Reads from persistent log files when available (with timestamps, survives
-    session kill). Falls back to tmux scrollback. Use --since to filter by time,
-    -g to grep, -f to follow live. Logs are stored at ~/.taskmux/logs/.
-    """
+    """Show logs for a task, or interleaved logs from all tasks."""
+    _ = context  # not yet plumbed through IPC
     cli = TaskmuxCLI()
-    if is_json_mode() and not follow:
-        # Return logs as JSON
 
-        if task:
-            log_path = cli.tmux.getLogPath(task)
-            if log_path:
-                output = cli.tmux._read_log_file(log_path, lines, grep, since)
-                print_result({"task": task, "lines": output})
-            else:
-                print_result({"task": task, "lines": []})
+    if follow:
+        # Daemon writes log files; client tails them directly.
+        if task is not None:
+            _follow_one(cli.config.name, task, grep)
         else:
-            tasks_logs: dict[str, list[str]] = {}
-            for name in cli.config.tasks:
-                log_path = cli.tmux.getLogPath(name)
-                if log_path:
-                    tasks_logs[name] = cli.tmux._read_log_file(log_path, lines, grep, since)
-                else:
-                    tasks_logs[name] = []
-            print_result({"tasks": tasks_logs})
+            _follow_all(cli.config.name, list(cli.config.tasks.keys()), grep)
         return
-    cli.tmux.show_logs(task, follow, lines, grep=grep, context=context, since=since)
+
+    _ensure_session_known(cli.config.name, cli.config_path)
+
+    if task is not None:
+        resp = ipc_client.call(
+            "logs",
+            params={
+                "session": cli.config.name,
+                "task": task,
+                "lines": lines,
+                "grep": grep,
+                "since": since,
+            },
+        )
+        out = resp.get("lines", [])
+        if is_json_mode():
+            print_result({"task": task, "lines": out})
+        else:
+            for line in out:
+                print(line)
+        return
+
+    resp = ipc_client.call(
+        "logs",
+        params={
+            "session": cli.config.name,
+            "lines": lines,
+            "grep": grep,
+            "since": since,
+        },
+    )
+    tasks_logs = resp.get("tasks", {})
+    if is_json_mode():
+        print_result({"tasks": tasks_logs})
+    else:
+        from rich.markup import escape
+
+        for i, (name, ls) in enumerate(tasks_logs.items()):
+            color = TASK_COLORS[i % len(TASK_COLORS)]
+            for line in ls:
+                console.print(f"[{color}][{escape(name)}][/{color}] {escape(line)}")
+
+
+def _follow_one(session: str, task: str, grep: str | None) -> None:
+    log_path = taskLogPath(session, task)
+    if not log_path.exists():
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.touch()
+    ipc_client.follow_log_file(log_path, grep=grep)
+
+
+def _follow_all(session: str, task_names: list[str], grep: str | None) -> None:
+    triples: list[tuple[str, Path, str]] = []
+    for i, name in enumerate(task_names):
+        log_path = taskLogPath(session, name)
+        if not log_path.exists():
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch()
+        triples.append((name, log_path, TASK_COLORS[i % len(TASK_COLORS)]))
+    ipc_client.follow_log_files(triples, grep=grep)
 
 
 @app.command(name="logs-clean")
 def logs_clean(
     task: str | None = typer.Argument(None, help="Task name (omit for all)"),
 ):
-    """Delete persistent log files.
-
-    Removes log files from ~/.taskmux/projects/{session}/logs/. Specify a task
-    name to clean only that task's logs, or omit to clean all logs for the
-    current session.
-    """
-    from .paths import projectLogsDir
-
+    """Delete persistent log files."""
     cli = TaskmuxCLI()
     log_dir = projectLogsDir(cli.config.name)
-
     if not log_dir.exists():
         if is_json_mode():
             print_result({"ok": True, "deleted": 0})
@@ -475,18 +456,14 @@ def logs_clean(
 def inspect(
     task: str = typer.Argument(..., help="Task name to inspect"),
 ):
-    """Inspect task state as JSON.
-
-    Returns detailed info: name, command, restart_policy, running/healthy status,
-    pid, pane command, cwd, window/pane IDs, health_check, and depends_on.
-    """
+    """Inspect task state as JSON."""
     cli = TaskmuxCLI()
-    data = cli.tmux.inspect_task(task)
-    # inspect always outputs JSON regardless of --json flag
+    _ensure_session_known(cli.config.name, cli.config_path)
+    data = _call_session("inspect", cli.config.name, task=task)
     if is_json_mode():
         print_result(data)
     else:
-        console.print_json(json.dumps(data))
+        console.print_json(json.dumps(data, default=str))
 
 
 @app.command()
@@ -524,10 +501,9 @@ def remove(
 ):
     """Remove a task from taskmux.toml (kills it first if running)."""
     cli = TaskmuxCLI()
-
-    if cli.tmux.session_exists():
-        cli.tmux.kill_task(task)
-
+    if ipc_client.is_daemon_running():
+        with contextlib.suppress(Exception):
+            ipc_client.call("kill", params={"session": cli.config.name, "task": task}, ensure=False)
     _, removed = removeTask(None, task)
     if is_json_mode():
         print_result({"ok": removed, "task": task, "action": "removed"})
@@ -538,44 +514,42 @@ def remove(
 
 
 def _status():
-    """Show session and task status.
-
-    Lists all tasks with health indicators, running state, ports, restart policy
-    (if non-default), working directory, and dependencies. Aliases: list, ls.
-    """
+    """Show session and task status."""
     cli = TaskmuxCLI()
-    data = cli.tmux.list_tasks()
+    _ensure_session_known(cli.config.name, cli.config_path)
+    resp = ipc_client.call("list_tasks", params={"session": cli.config.name})
+    data = resp.get("data", {})
     daemon_pid = get_daemon_pid()
     data["daemon_pid"] = daemon_pid
+
     if is_json_mode():
         print_result(data)
         return
 
-    # Human-readable output
-    session = data["session"]
-    running = data["running"]
+    from .models import RestartPolicy
+
+    session = data.get("session", cli.config.name)
+    running = data.get("running", False)
     console.print(f"Session '{session}': {'Running' if running else 'Stopped'}")
     if running:
-        console.print(f"Active tasks: {data['active_tasks']}")
-
-    from .models import RestartPolicy
+        console.print(f"Active tasks: {data.get('active_tasks', 0)}")
 
     if daemon_pid:
         console.print(f"Auto-restart: active (pid {daemon_pid})", style="green")
     else:
         any_restart = any(
             t.get("restart_policy") and t["restart_policy"] != str(RestartPolicy.NO)
-            for t in data["tasks"]
+            for t in data.get("tasks", [])
         )
         if any_restart:
             console.print(
-                "Auto-restart: inactive — run 'taskmux daemon' or 'taskmux start -d' to enable",
+                "Auto-restart: inactive — daemon offline",
                 style="yellow",
             )
 
     console.print("-" * 70)
 
-    if not data["tasks"]:
+    if not data.get("tasks"):
         console.print("No tasks configured")
         return
 
@@ -596,10 +570,7 @@ def _status():
         console.print(f"{line}{auto}{extras}")
         last = t.get("last_health")
         if last and not last.get("ok") and last.get("reason"):
-            console.print(
-                f"    fail: {last['method']} — {last['reason']}",
-                style="red",
-            )
+            console.print(f"    fail: {last['method']} — {last['reason']}", style="red")
 
 
 app.command(name="status")(_status)
@@ -613,35 +584,26 @@ def health(
         False, "-v", "--verbose", help="Show probe method and failure reasons"
     ),
 ):
-    """Check health of all tasks.
-
-    Runs each task's probe (health_url → health_check → tcp(port) → pane-alive).
-    Displays a table with health status for every configured task.
-    """
+    """Check health of all tasks via the daemon."""
     cli = TaskmuxCLI()
-
-    if not cli.tmux.session_exists():
-        if is_json_mode():
-            print_result({"healthy_count": 0, "total_count": 0, "tasks": []})
-        else:
-            console.print("No session running", style="yellow")
-        return
+    _ensure_session_known(cli.config.name, cli.config_path)
 
     healthy_count = 0
     total_count = len(cli.config.tasks)
     tasks_health: list[dict] = []
-
     for task_name in cli.config.tasks:
-        result = cli.tmux.check_health(task_name)
+        resp = ipc_client.call("health", params={"session": cli.config.name, "task": task_name})
+        result = resp.get("result", {})
+        ok = bool(result.get("ok"))
         tasks_health.append(
             {
                 "name": task_name,
-                "healthy": result.ok,
-                "method": result.method,
-                "reason": result.reason,
+                "healthy": ok,
+                "method": result.get("method", "none"),
+                "reason": result.get("reason"),
             }
         )
-        if result.ok:
+        if ok:
             healthy_count += 1
 
     if is_json_mode():
@@ -680,13 +642,9 @@ def events(
     since: str | None = typer.Option(None, "--since", help="Time filter (e.g. 10m, 1h, 2d)"),
     limit: int = typer.Option(50, "-n", "--limit", help="Max events to show"),
 ):
-    """Show recent lifecycle events.
-
-    Displays task start/stop/restart/kill events, health check failures,
-    auto-restarts, and config reloads. Stored at ~/.taskmux/events.jsonl.
-    """
+    """Show recent lifecycle events."""
     from .events import queryEvents
-    from .tmux_manager import _parseSince
+    from .supervisor import _parseSince
 
     since_dt = _parseSince(since) if since else None
     results = queryEvents(task=task, since=since_dt, limit=limit)
@@ -740,22 +698,22 @@ def url(
 
 @app.command()
 def watch():
-    """Watch taskmux.toml for changes and reload on edit.
-
-    Stays in the foreground. When the config file changes, reloads it and
-    restarts affected tasks.
-    """
+    """Watch taskmux.toml for changes and reload on edit (foreground, no daemon)."""
     cli = TaskmuxCLI()
     watcher = SimpleConfigWatcher(cli)
     watcher.watch_config()
+
+
+# ---------------------------------------------------------------------------
+# Daemon sub-app
+# ---------------------------------------------------------------------------
 
 
 daemon_app = typer.Typer(
     name="daemon",
     help=(
         "Daemon lifecycle: start, stop, status, restart.\n\n"
-        "Bare 'taskmux daemon' runs a foreground daemon (WS API + health monitor + "
-        "config watcher). Use 'daemon start' to spawn detached."
+        "Bare 'taskmux daemon' runs a foreground daemon. Use 'daemon start' to spawn detached."
     ),
     no_args_is_help=False,
     invoke_without_command=True,
@@ -769,11 +727,7 @@ def daemon(
         None, "--port", help="WebSocket API port (overrides ~/.taskmux/config.toml)"
     ),
 ):
-    """Run a foreground daemon when no subcommand is given.
-
-    Health-check cadence and default API port come from ~/.taskmux/config.toml
-    (see `taskmux config show`). `--port` overrides the config value.
-    """
+    """Run a foreground daemon when no subcommand is given."""
     if ctx.invoked_subcommand is not None:
         return
     _warn_unprivileged_daemon()
@@ -782,7 +736,6 @@ def daemon(
 
 
 def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
-    """Poll until pid is no longer running or timeout elapses. Returns True if exited."""
     import os
     import time as _t
 
@@ -806,11 +759,7 @@ def daemon_start(
         None, "--port", help="WebSocket API port (overrides ~/.taskmux/config.toml)"
     ),
 ):
-    """Spawn the global detached daemon (idempotent).
-
-    Auto-registers cwd's project if a `taskmux.toml` is present. Logs go to
-    `~/.taskmux/daemon.log`.
-    """
+    """Spawn the global detached daemon (idempotent)."""
     existing = get_daemon_pid()
     if existing is not None:
         _autoRegisterCwd()
@@ -836,11 +785,7 @@ def daemon_start(
 
 @daemon_app.command("pid")
 def daemon_pid():
-    """Print the daemon PID (just the integer; empty if not running).
-
-    Useful for scripting: `kill $(taskmux daemon pid)` or
-    `lsof -p $(taskmux daemon pid)`. Exits 1 if no daemon is running.
-    """
+    """Print the daemon PID. Exits 1 if no daemon is running."""
     pid = get_daemon_pid()
     if pid is None:
         if is_json_mode():
@@ -969,18 +914,15 @@ def daemon_list(
     table = Table(show_header=True, header_style="bold")
     table.add_column("Session")
     table.add_column("State", justify="left")
-    table.add_column("Tmux", justify="left")
     table.add_column("Tasks", justify="right")
     table.add_column("Config")
     for entry in registered:
         info = live.get(entry["session"], {})
         state = info.get("state", "[dim]unmanaged[/dim]" if pid is None else "ok")
-        tmux_state = "[green]up[/green]" if info.get("session_exists") else "[dim]down[/dim]"
         task_count = info.get("task_count", "?")
         table.add_row(
             entry["session"],
             str(state),
-            tmux_state,
             str(task_count),
             entry["config_path"],
         )
@@ -1003,12 +945,7 @@ def daemon_register(
         help="Overwrite an existing registration with a different config path.",
     ),
 ):
-    """Add a project to the registry. Daemon (if running) picks it up live.
-
-    A registry slot bound to a path that no longer exists on disk is
-    auto-healed (no flag needed). Use --force when both paths still exist
-    and you want the new one to win.
-    """
+    """Add a project to the registry. Daemon (if running) picks it up live."""
     cfg_path = Path(config).expanduser() if config else Path("taskmux.toml")
     if not cfg_path.exists():
         if is_json_mode():
@@ -1044,28 +981,11 @@ def daemon_unregister(
 
 def _query_live_projects(port: int = 8765, timeout: float = 1.0) -> dict[str, dict]:
     """Best-effort WS query of the live daemon. Returns {} on any failure."""
-    try:
-        import websockets
-    except ImportError:
+    resp = ipc_client.call_no_ensure("list_projects", port=port, timeout=timeout)
+    if resp is None:
         return {}
-
-    async def _go() -> dict[str, dict]:
-        try:
-            async with websockets.connect(
-                f"ws://localhost:{port}", open_timeout=timeout, close_timeout=timeout
-            ) as ws:
-                await ws.send(json.dumps({"command": "list_projects"}))
-                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                resp = json.loads(raw)
-                projects = resp.get("projects", [])
-                return {p["session"]: p for p in projects}
-        except Exception:  # noqa: BLE001
-            return {}
-
-    try:
-        return asyncio.run(_go())
-    except Exception:  # noqa: BLE001
-        return {}
+    projects = resp.get("projects", [])
+    return {p["session"]: p for p in projects}
 
 
 app.add_typer(daemon_app)
@@ -1203,7 +1123,7 @@ app.add_typer(ca_app)
 
 
 # ---------------------------------------------------------------------------
-# DNS sub-app — manage in-process DNS server delegation
+# DNS sub-app
 # ---------------------------------------------------------------------------
 
 dns_app = typer.Typer(
@@ -1215,11 +1135,7 @@ dns_app = typer.Typer(
 
 @dns_app.command("install")
 def dns_install_cmd():
-    """Install OS-level DNS delegation for the configured TLD.
-
-    Writes /etc/resolver/<tld> on macOS, systemd-resolved drop-in on Linux,
-    or NRPT rule on Windows. Requires root/Admin. Idempotent.
-    """
+    """Install OS-level DNS delegation for the configured TLD."""
     from . import dns_install
     from .global_config import loadGlobalConfig
 

@@ -866,6 +866,7 @@ class TaskmuxDaemon:
             "proxy_routes",
             "url",
             "resync",
+            "sync_registry",
             "ping",
         }
     )
@@ -879,6 +880,10 @@ class TaskmuxDaemon:
 
         if command == "ping":
             return {"command": command, "ok": True}
+
+        if command == "sync_registry":
+            await self._sync_with_registry()
+            return {"command": command, "ok": True, "count": len(self.projects)}
 
         if command == "list_projects":
             return {"command": command, "projects": await self._list_projects()}
