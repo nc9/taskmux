@@ -35,11 +35,12 @@ publish:
 
 release: check
 	@if [ -n "$$(git status --porcelain)" ]; then echo "ERROR: dirty working tree" && exit 1; fi
-	uv version --bump $(BUMP)
-	$(eval VERSION := $(shell uv version --short))
-	git add pyproject.toml uv.lock
-	git commit -m "chore(release): v$(VERSION)"
-	git tag "v$(VERSION)"
+	@set -e; \
+	uv version --bump $(BUMP); \
+	VERSION=$$(uv version --short); \
+	git add pyproject.toml uv.lock; \
+	git commit -m "chore(release): v$$VERSION"; \
+	git tag "v$$VERSION"; \
 	git push && git push --tags
 	$(MAKE) publish
 
