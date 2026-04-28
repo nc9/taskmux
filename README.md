@@ -1,6 +1,6 @@
 # Taskmux
 
-Tmux session manager for development environments. Define tasks in `taskmux.toml`, start them in dependency order, monitor health, auto-restart on failure, read persistent timestamped logs. Every command supports `--json` for agents and scripts.
+Daemon-supervised task manager for development environments. Define tasks in `taskmux.toml`, start them in dependency order, monitor health, auto-restart on failure, read persistent timestamped logs. Every command supports `--json` for agents and scripts.
 
 Designed to pair well with coding agents like Claude Code, Codex, and OpenCode — `taskmux init` injects usage instructions into their context files, and the JSON output + WebSocket API give agents a clean, machine-readable surface for managing dev environments.
 
@@ -17,12 +17,11 @@ Designed to pair well with coding agents like Claude Code, Codex, and OpenCode �
 - **Dynamic DNS** — optional in-process DNS server resolves any `*.localhost` to `127.0.0.1` (no `/etc/hosts` churn, no daemon restart when adding hosts)
 - **Port cleanup** — kills orphaned listeners before starting
 - **Agent context** — `taskmux init` injects a thin pointer + project task table into Claude/Codex/OpenCode context files; install the [taskmux skill](#claude-code-skill) for richer Claude Code guidance loaded on demand
-- **Daemon mode** — WebSocket API + config watching + health monitoring
-- **Tmux native** — `tmux attach` to see live output, interact with tasks
+- **Daemon-owned processes** — every task runs under the daemon as its own process group on a PTY (so colors + `isatty()` keep working). Daemon shutdown signal-cascades into every task; CLI commands are thin RPC over a local WebSocket.
 
 ## Install
 
-Requires [tmux](https://github.com/tmux/tmux) and Python 3.11+.
+Requires Python 3.11+. No tmux dependency.
 
 ```bash
 uv tool install taskmux
@@ -47,12 +46,11 @@ All commands support `--json` for machine-readable output.
 # Lifecycle
 taskmux start                    # start all auto_start tasks in dependency order
 taskmux start <task> [task2...]  # start specific tasks
-taskmux start -m                 # start + monitor health + auto-restart
-taskmux stop                     # graceful stop all (C-c → SIGTERM → SIGKILL)
+taskmux stop                     # graceful stop all (SIGINT → SIGTERM → SIGKILL on process group)
 taskmux stop <task> [task2...]   # stop specific tasks
 taskmux restart                  # restart all
 taskmux restart <task>           # restart specific tasks
-taskmux kill <task>              # hard-kill (SIGKILL + destroy window)
+taskmux kill <task>              # hard-kill (SIGKILL on the task's process group)
 
 # Info
 taskmux status                   # task overview (aliases: list, ls)
@@ -105,8 +103,8 @@ Setup (one time):
 brew install mkcert nss      # macOS; see mkcert install guide for other OSes
 taskmux ca install            # trusts the local CA in your system store
 sudo taskmux daemon           # binds :443 as root, then drops to your user.
-                              # Everything after the bind (tmux, certs, state)
-                              # runs as you, not root.
+                              # Everything after the bind (task processes,
+                              # certs, state) runs as you, not root.
 ```
 
 In your `taskmux.toml`, replace `port = 3000` style fields with `host = "web"` and read `$PORT` from the env in your command:
@@ -172,11 +170,11 @@ proxy_bind = "127.0.0.1"        # loopback only by default — set to "0.0.0.0" 
 
 ### stop vs kill vs restart
 
-| Command | Signal | Window | Auto-restart |
-|---------|--------|--------|--------------|
-| `stop` | C-c → SIGTERM → SIGKILL | Stays alive | Blocked |
-| `kill` | SIGKILL | Destroyed | Blocked |
-| `restart` | Full stop + restart | Reused | Re-enabled |
+| Command | Signal | Auto-restart |
+|---------|--------|--------------|
+| `stop` | SIGINT → SIGTERM → SIGKILL on the task's process group | Blocked |
+| `kill` | SIGKILL on the task's process group | Blocked |
+| `restart` | Full stop + spawn fresh process | Re-enabled |
 
 `stop` and `kill` mark tasks as manually stopped — no auto-restart even with `restart_policy = "always"`. `restart` or `start` clears this flag.
 
@@ -251,9 +249,9 @@ On `taskmux start`: db starts first → migrate + worker wait for db health → 
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `name` | `"taskmux"` | tmux session name |
-| `auto_start` | `true` | global toggle — `false` creates session but launches nothing |
-| `auto_daemon` | `false` | when `true`, `taskmux start` also spawns a detached daemon (auto-restart + WS API) |
+| `name` | `"taskmux"` | project / session name (DNS-safe; used in proxy URLs) |
+| `auto_start` | `true` | global toggle — `false` registers project but launches nothing |
+| `auto_daemon` | `false` | (legacy) the daemon now starts implicitly on `taskmux start` |
 | `hooks.*` | — | `before_start`, `after_start`, `before_stop`, `after_stop` |
 | **Task fields** | | |
 | `command` | required | shell command to run |
@@ -268,7 +266,7 @@ On `taskmux start`: db starts first → migrate + worker wait for db health → 
 | `health_interval` | `10` | seconds between checks |
 | `health_timeout` | `5` | seconds before check times out |
 | `health_retries` | `3` | consecutive failures before restart |
-| `stop_grace_period` | `5` | seconds after C-c before SIGTERM |
+| `stop_grace_period` | `5` | seconds after SIGINT before SIGTERM |
 | `restart_policy` | `"on-failure"` | `"no"`, `"on-failure"`, `"always"` |
 | `max_restarts` | `5` | max restarts before giving up (resets after 60s healthy) |
 | `restart_backoff` | `2.0` | exponential backoff base (capped 60s) |
@@ -313,7 +311,7 @@ Probe precedence (first match wins):
 1. **`health_url`** — HTTP GET via stdlib. Pass when status matches `health_expected_status` (default 200) and, if set, body matches `health_expected_body` (regex). No curl dependency.
 2. **`health_check`** — arbitrary shell command, exit 0 = healthy.
 3. **TCP probe** — when `host` is set, probes `localhost:$PORT` (the port taskmux assigned to the task). Pass when the port accepts a connection.
-4. **fallback** — pane-alive check (foreground command is not a shell).
+4. **fallback** — process-alive check (the daemon's tracked subprocess hasn't exited).
 
 Must fail `health_retries` consecutive times before triggering restart.
 
@@ -337,10 +335,10 @@ Used by:
 
 ## Daemon
 
-A single global daemon manages every registered project on the host. Projects auto-register on `taskmux start`, and the daemon picks them up live via a registry watcher. Auto-restart only fires when the daemon (or `start --monitor`) is running.
+A single global daemon owns every task process on the host (docker-style — daemon shutdown signal-cascades into all tasks). The CLI is a thin client that auto-spawns the daemon on first use and auto-registers the cwd's project; the daemon picks projects up live via a registry watcher.
 
 ```bash
-taskmux start -d        # start tasks AND spawn the global daemon (auto-registers cwd)
+taskmux start           # auto-spawns the daemon if needed, then RPCs in
 taskmux daemon          # run foreground daemon (Ctrl+C to stop)
 ```
 
@@ -409,18 +407,18 @@ taskmux config path              # print path
     logs/{task}.log[.N]               # per-task output
 ```
 
-`taskmux status` shows `Auto-restart: active (pid …)` when a daemon is detected, otherwise `Auto-restart: inactive` so you don't silently miss restarts. Set `auto_daemon = true` at the top of `taskmux.toml` to spawn one on every `taskmux start`.
+`taskmux status` shows `Auto-restart: active (pid …)` when a daemon is detected.
 
 ## Persistent Logs
 
-Task output is piped to `~/.taskmux/projects/{session}/logs/{task}.log` with UTC timestamps:
+The daemon attaches a PTY to each task and drains it line-by-line into `~/.taskmux/projects/{session}/logs/{task}.log` with UTC timestamps:
 
 ```
 2024-01-01T14:00:00.123 Server started on port 3000
 2024-01-01T14:00:01.456 GET /health 200 2ms
 ```
 
-Logs survive session kill. Rotated at `log_max_size` (default 10MB), keeping `log_max_files` (default 3). Filter with `--since`:
+Logs survive task restart and daemon shutdown. Rotated at `log_max_size` (default 10MB), keeping `log_max_files` (default 3). Filter with `--since`:
 
 ```bash
 taskmux logs server --since 5m
@@ -469,14 +467,21 @@ ws.send(JSON.stringify({ command: "restart", params: { task: "server" } }));
 ws.send(JSON.stringify({ command: "logs", params: { task: "server", lines: 50 } }));
 ```
 
-## Tmux
+## Architecture
 
-Taskmux creates standard tmux sessions:
-
-```bash
-tmux attach-session -t myproject   # attach to see live output
-# Ctrl+b 1/2/3 switch windows, Ctrl+b d detach
 ```
+┌────────────┐  WebSocket   ┌──────────────────────────────────┐
+│ taskmux …  │ ───────────▶ │ taskmux daemon                   │
+│ (CLI       │              │  ├─ Supervisor[project A]        │
+│  client)   │ ◀─────────── │  │   ├─ task: api  (PTY + setsid)│
+└────────────┘   one-shot   │  │   └─ task: web  (PTY + setsid)│
+                  RPC       │  ├─ Supervisor[project B] …      │
+                            │  ├─ HTTPS proxy on :443          │
+                            │  └─ optional in-process DNS      │
+                            └──────────────────────────────────┘
+```
+
+Each task runs as a child of the daemon, in its own process group, with a PTY attached so `isatty()` keeps returning true and ANSI colors survive into log files. `taskmux daemon stop` (or any clean SIGTERM) signal-cascades into every task's process group.
 
 ## Links
 
