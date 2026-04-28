@@ -245,3 +245,79 @@ class TestRemoveCommand:
             result = runner.invoke(app, ["remove", "server"])
             assert result.exit_code == 0
             mock_rm.assert_called_once_with(None, "server")
+
+
+class TestStatusProxyWarning:
+    """Status renders a top-level warning when the proxy listener isn't bound."""
+
+    def _list_tasks_payload(self, *, proxy_bound: bool) -> dict:
+        return {
+            "session": "demo",
+            "project": "demo",
+            "worktree": None,
+            "running": True,
+            "active_tasks": 1,
+            "tasks": [
+                {
+                    "name": "api",
+                    "running": True,
+                    "healthy": proxy_bound,
+                    "command": "bun dev",
+                    "auto_start": True,
+                    "host": "api",
+                    "url": "https://api.demo.localhost",
+                    "port": 5000,
+                    "restart_policy": "on-failure",
+                    "cwd": None,
+                    "depends_on": [],
+                    "last_health": (
+                        {"ok": True, "method": "tcp", "reason": None, "at": 0.0}
+                        if proxy_bound
+                        else {
+                            "ok": False,
+                            "method": "proxy",
+                            "reason": (
+                                "proxy listener not bound on 127.0.0.1:443 "
+                                "— run `sudo taskmux daemon`"
+                            ),
+                            "at": 0.0,
+                        }
+                    ),
+                }
+            ],
+            "proxy": {
+                "bound": proxy_bound,
+                "port": 443,
+                "reason": (
+                    None
+                    if proxy_bound
+                    else "proxy listener not bound on 127.0.0.1:443 — run `sudo taskmux daemon`"
+                ),
+            },
+        }
+
+    @patch("taskmux.cli.get_daemon_pid", return_value=12345)
+    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_warning_shown_when_proxy_unbound(
+        self, mock_load, mock_tmux, mock_pid, sample_toml: Path
+    ):
+        mock_load.return_value = _identity()
+        mock_tmux.return_value.list_tasks.return_value = self._list_tasks_payload(proxy_bound=False)
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        assert "Proxy:" in result.output
+        assert "not bound" in result.output
+        assert "sudo taskmux daemon" in result.output
+        # Per-task fail line also rendered
+        assert "fail: proxy" in result.output
+
+    @patch("taskmux.cli.get_daemon_pid", return_value=12345)
+    @patch("taskmux.cli.TmuxManager")
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_no_warning_when_proxy_bound(self, mock_load, mock_tmux, mock_pid, sample_toml: Path):
+        mock_load.return_value = _identity()
+        mock_tmux.return_value.list_tasks.return_value = self._list_tasks_payload(proxy_bound=True)
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        assert "Proxy:" not in result.output

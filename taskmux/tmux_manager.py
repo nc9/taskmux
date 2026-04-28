@@ -401,11 +401,11 @@ class TmuxManager:
         except Exception as e:
             return HealthResult(False, "http", f"{type(e).__name__}: {e}", now)
 
-    def _probe_tcp(self, port: int, timeout: float) -> HealthResult:
-        """Open a TCP connection to localhost:port; pass if accepted within timeout."""
+    def _probe_tcp(self, port: int, timeout: float, host: str = "localhost") -> HealthResult:
+        """Open a TCP connection to host:port; pass if accepted within timeout."""
         now = time.time()
         try:
-            with socket.create_connection(("localhost", port), timeout=timeout):
+            with socket.create_connection((host, port), timeout=timeout):
                 return HealthResult(True, "tcp", None, now)
         except (TimeoutError, OSError) as e:
             return HealthResult(False, "tcp", f"connect refused: {e}", now)
@@ -1234,16 +1234,38 @@ class TmuxManager:
         exists = self.session_exists()
         windows = self.list_windows() if exists else []
 
+        any_host = any(tc.host is not None for tc in self.config.tasks.values())
+        proxy_info = self._proxy_listener_status() if any_host else None
+
         tasks = []
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
             last = self.restart_tracker.last_health(task_name)
             url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
+            healthy = bool(status["healthy"])
+            last_health = last.to_dict() if last else None
+
+            # Public URL is gated on the daemon's proxy listener AND a registered
+            # route for this project+host. If upstream was healthy but either is
+            # missing, the URL is unreachable — flip healthy=false with a
+            # method=proxy reason so status doesn't silently lie. Real upstream
+            # failures take priority and pass through unchanged.
+            if task_cfg.host is not None and proxy_info is not None and healthy:
+                proxy_reason = self._task_proxy_reason(task_cfg.host, proxy_info)
+                if proxy_reason is not None:
+                    healthy = False
+                    last_health = {
+                        "ok": False,
+                        "method": "proxy",
+                        "reason": proxy_reason,
+                        "at": time.time(),
+                    }
+
             tasks.append(
                 {
                     "name": task_name,
                     "running": status["running"],
-                    "healthy": status["healthy"],
+                    "healthy": healthy,
                     "command": task_cfg.command,
                     "auto_start": task_cfg.auto_start,
                     "host": task_cfg.host,
@@ -1252,11 +1274,11 @@ class TmuxManager:
                     "restart_policy": str(task_cfg.restart_policy),
                     "cwd": task_cfg.cwd,
                     "depends_on": task_cfg.depends_on,
-                    "last_health": last.to_dict() if last else None,
+                    "last_health": last_health,
                 }
             )
 
-        return {
+        result: dict = {
             "session": self.project_id,
             "project": self.config.name,
             "worktree": self.worktree_id,
@@ -1264,6 +1286,124 @@ class TmuxManager:
             "active_tasks": len(windows),
             "tasks": tasks,
         }
+        if proxy_info is not None:
+            # Don't leak the routes map (per-project cache) into status output.
+            result["proxy"] = {k: v for k, v in proxy_info.items() if k != "routes"}
+        return result
+
+    def _task_proxy_reason(self, host: str, proxy_info: dict) -> str | None:
+        """Return the per-task reason string when the proxy can't serve `host`,
+        or None when the route is good. `proxy_info` is the dict returned by
+        `_proxy_listener_status()`.
+        """
+        if not proxy_info["bound"]:
+            return proxy_info["reason"]
+        routes = proxy_info.get("routes")
+        if routes is not None and host not in routes:
+            port = proxy_info["port"]
+            return (
+                f"proxy on :{port} has no route for {host}.{self.project_id}.localhost — "
+                f"run `taskmux start` to register"
+            )
+        return None
+
+    def _proxy_listener_status(self) -> dict:
+        """Authoritative-when-possible status of the HTTPS proxy listener.
+
+        Prefers the daemon's `proxy_routes` API (knows whether *taskmux* owns
+        the port and which project/host routes are registered). Falls back to
+        a TCP probe of the bind address when the daemon is unreachable.
+
+        Returns {"bound": bool, "port": int, "reason": str | None,
+                 "routes": dict[str, int] | None}.
+        `routes` is the host->port mapping for THIS project, or None when the
+        daemon view isn't available.
+        """
+        from .global_config import loadGlobalConfig
+
+        gc = loadGlobalConfig()
+        port = gc.proxy_https_port
+        if not gc.proxy_enabled:
+            return {
+                "bound": False,
+                "port": port,
+                "reason": "proxy disabled in ~/.taskmux/config.toml (proxy_enabled = false)",
+                "routes": None,
+            }
+
+        daemon_view = self._query_daemon_proxy_routes(timeout=0.5)
+        if daemon_view is not None:
+            if not daemon_view.get("running"):
+                return {
+                    "bound": False,
+                    "port": port,
+                    "reason": (
+                        f"daemon is up but proxy isn't running on :{port} — "
+                        f"run `sudo taskmux daemon` (privileged port needs root)"
+                    ),
+                    "routes": None,
+                }
+            project_routes = daemon_view.get("routes", {}).get(self.project_id, {}) or {}
+            return {"bound": True, "port": port, "reason": None, "routes": project_routes}
+
+        # Daemon WS unreachable. Fall back to a TCP probe so we still catch
+        # the "nothing listening on :443" case (the original OddJob bug).
+        result = self._probe_tcp(port, timeout=0.5, host=gc.proxy_bind)
+        if result.ok:
+            return {"bound": True, "port": port, "reason": None, "routes": None}
+        return {
+            "bound": False,
+            "port": port,
+            "reason": (
+                f"proxy listener not bound on {gc.proxy_bind}:{port} — "
+                f"run `sudo taskmux daemon` (privileged port needs root)"
+            ),
+            "routes": None,
+        }
+
+    def _query_daemon_proxy_routes(self, timeout: float) -> dict | None:
+        """Query the daemon's WS API for `proxy_routes`. Returns the response
+        dict (with keys `running` and `routes`) or None if the daemon isn't
+        reachable, the WS handshake fails, or the response is malformed.
+        """
+        from .daemon import get_daemon_pid
+
+        if get_daemon_pid() is None:
+            return None
+        try:
+            import asyncio
+
+            import websockets
+
+            from .global_config import loadGlobalConfig
+        except Exception:  # noqa: BLE001
+            return None
+
+        api_port = loadGlobalConfig().api_port
+
+        async def _go() -> dict | None:
+            try:
+                async with websockets.connect(
+                    f"ws://localhost:{api_port}",
+                    open_timeout=timeout,
+                    close_timeout=timeout,
+                ) as ws:
+                    await ws.send(json.dumps({"command": "proxy_routes"}))
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            except Exception:  # noqa: BLE001
+                return None
+            try:
+                msg = json.loads(raw)
+            except (ValueError, TypeError):
+                return None
+            if not isinstance(msg, dict) or msg.get("command") != "proxy_routes":
+                return None
+            return msg
+
+        try:
+            return asyncio.run(_go())
+        except Exception:  # noqa: BLE001
+            return None
 
     def check_task_health(self, task_name: str) -> bool:
         """Check if a task is healthy"""

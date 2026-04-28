@@ -587,6 +587,10 @@ def _status():
                 style="yellow",
             )
 
+    proxy = data.get("proxy")
+    if proxy and not proxy.get("bound"):
+        console.print(f"Proxy: {proxy['reason']}", style="yellow")
+
     console.print("-" * 70)
 
     if not data["tasks"]:

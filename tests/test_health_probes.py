@@ -200,11 +200,239 @@ class TestLastHealthRecorded:
         mgr = _make_manager(cfg)
         mgr.assigned_ports["web"] = port
         mgr.check_health("web")
-        data = mgr.list_tasks()
+        with patch.object(
+            mgr, "_proxy_listener_status", return_value={"bound": True, "port": 443, "reason": None}
+        ):
+            data = mgr.list_tasks()
         task = data["tasks"][0]
         assert task["last_health"] is not None
         assert task["last_health"]["method"] == "tcp"
         assert task["last_health"]["ok"] is True
+
+
+class TestProxyListenerEnrichment:
+    """list_tasks() flips healthy=false when a host-routed task's proxy isn't bound."""
+
+    def _running_manager(self, cfg: TaskmuxConfig) -> TmuxManager:
+        """Return a manager that pretends the session + task pane are alive,
+        so list_tasks() observes status['healthy']=True from the upstream
+        probe and the proxy-override branch is reachable.
+        """
+        mgr = _make_manager(cfg)
+        # Stub out session/window/pane checks — list_tasks uses these to
+        # decide running/healthy before we ever get to the proxy override.
+        mgr.session_exists = lambda: True  # type: ignore[method-assign]
+        mgr.list_windows = lambda: list(cfg.tasks.keys())  # type: ignore[method-assign]
+        mgr._is_pane_alive = lambda _name: True  # type: ignore[method-assign]
+        return mgr
+
+    def test_proxy_unbound_overrides_healthy(self, http_server):
+        port, _ = http_server
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        mgr = self._running_manager(cfg)
+        mgr.assigned_ports["web"] = port
+        with patch.object(
+            mgr,
+            "_proxy_listener_status",
+            return_value={
+                "bound": False,
+                "port": 443,
+                "reason": "proxy listener not bound on 127.0.0.1:443 — run `sudo taskmux daemon`",
+            },
+        ):
+            data = mgr.list_tasks()
+        task = data["tasks"][0]
+        assert task["healthy"] is False
+        assert task["last_health"]["method"] == "proxy"
+        assert "not bound" in task["last_health"]["reason"]
+        assert data["proxy"]["bound"] is False
+
+    def test_proxy_bound_passes_through(self, http_server):
+        port, _ = http_server
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        mgr = self._running_manager(cfg)
+        mgr.assigned_ports["web"] = port
+        with patch.object(
+            mgr, "_proxy_listener_status", return_value={"bound": True, "port": 443, "reason": None}
+        ):
+            data = mgr.list_tasks()
+        task = data["tasks"][0]
+        assert task["healthy"] is True
+        assert task["last_health"]["method"] == "tcp"
+        assert data["proxy"]["bound"] is True
+
+    def test_no_proxy_check_when_no_host(self):
+        cfg = _make_config(tasks={"web": {"command": "echo"}})
+        mgr = _make_manager(cfg)
+        with patch.object(mgr, "_is_pane_alive", return_value=True):
+            data = mgr.list_tasks()
+        # No host-routed task → no proxy block in output.
+        assert "proxy" not in data
+
+    def test_upstream_failure_takes_priority(self):
+        # If upstream itself is down, the proxy override should NOT replace
+        # the real upstream-failure reason.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        closed_port = s.getsockname()[1]
+        s.close()
+
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        mgr = self._running_manager(cfg)
+        mgr.assigned_ports["web"] = closed_port
+        with patch.object(
+            mgr,
+            "_proxy_listener_status",
+            return_value={"bound": False, "port": 443, "reason": "proxy down"},
+        ):
+            data = mgr.list_tasks()
+        task = data["tasks"][0]
+        assert task["healthy"] is False
+        # Real failure preserved — method stays "tcp", not "proxy"
+        assert task["last_health"]["method"] == "tcp"
+
+    def test_route_missing_flips_healthy(self, http_server):
+        # Proxy is bound and the daemon view is available, but THIS project's
+        # host route isn't registered — the public URL would 502.
+        port, _ = http_server
+        cfg = _make_config(
+            name="demo",
+            tasks={"api": {"command": "echo", "host": "api"}},
+        )
+        mgr = self._running_manager(cfg)
+        mgr.assigned_ports["api"] = port
+        with patch.object(
+            mgr,
+            "_proxy_listener_status",
+            return_value={"bound": True, "port": 443, "reason": None, "routes": {}},
+        ):
+            data = mgr.list_tasks()
+        task = data["tasks"][0]
+        assert task["healthy"] is False
+        assert task["last_health"]["method"] == "proxy"
+        assert "no route" in task["last_health"]["reason"]
+        assert data["proxy"]["bound"] is True
+        # The per-project routes map should NOT leak into status output.
+        assert "routes" not in data["proxy"]
+
+    def test_route_present_passes_through(self, http_server):
+        port, _ = http_server
+        cfg = _make_config(
+            name="demo",
+            tasks={"api": {"command": "echo", "host": "api"}},
+        )
+        mgr = self._running_manager(cfg)
+        mgr.assigned_ports["api"] = port
+        with patch.object(
+            mgr,
+            "_proxy_listener_status",
+            return_value={
+                "bound": True,
+                "port": 443,
+                "reason": None,
+                "routes": {"api": port},
+            },
+        ):
+            data = mgr.list_tasks()
+        task = data["tasks"][0]
+        assert task["healthy"] is True
+        assert task["last_health"]["method"] == "tcp"
+
+
+class TestProxyListenerStatusInternals:
+    """_proxy_listener_status() prefers the daemon view, falls back to TCP."""
+
+    def test_daemon_view_running_with_route(self):
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with patch.object(
+            mgr,
+            "_query_daemon_proxy_routes",
+            return_value={
+                "command": "proxy_routes",
+                "running": True,
+                "routes": {"demo": {"api": 5000}},
+            },
+        ):
+            info = mgr._proxy_listener_status()
+        assert info["bound"] is True
+        assert info["routes"] == {"api": 5000}
+
+    def test_daemon_view_proxy_not_running(self):
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with patch.object(
+            mgr,
+            "_query_daemon_proxy_routes",
+            return_value={"command": "proxy_routes", "running": False, "routes": {}},
+        ):
+            info = mgr._proxy_listener_status()
+        assert info["bound"] is False
+        assert "isn't running" in (info["reason"] or "")
+
+    def test_daemon_view_unknown_project_returns_empty_routes(self):
+        # Daemon proxy is up but knows nothing about this project — surfaces
+        # as bound=True with empty routes so list_tasks can flag the missing
+        # route per task.
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with patch.object(
+            mgr,
+            "_query_daemon_proxy_routes",
+            return_value={
+                "command": "proxy_routes",
+                "running": True,
+                "routes": {"other": {"api": 1234}},
+            },
+        ):
+            info = mgr._proxy_listener_status()
+        assert info["bound"] is True
+        assert info["routes"] == {}
+
+    def test_daemon_unreachable_falls_back_to_tcp_success(self, http_server):
+        port, _ = http_server
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with (
+            patch.object(mgr, "_query_daemon_proxy_routes", return_value=None),
+            patch("taskmux.global_config.loadGlobalConfig") as mock_cfg,
+        ):
+            mock_cfg.return_value.proxy_enabled = True
+            mock_cfg.return_value.proxy_https_port = port
+            mock_cfg.return_value.proxy_bind = "127.0.0.1"
+            info = mgr._proxy_listener_status()
+        assert info["bound"] is True
+        assert info["routes"] is None  # unknown — daemon view wasn't available
+
+    def test_daemon_unreachable_falls_back_to_tcp_failure(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        closed_port = s.getsockname()[1]
+        s.close()
+
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with (
+            patch.object(mgr, "_query_daemon_proxy_routes", return_value=None),
+            patch("taskmux.global_config.loadGlobalConfig") as mock_cfg,
+        ):
+            mock_cfg.return_value.proxy_enabled = True
+            mock_cfg.return_value.proxy_https_port = closed_port
+            mock_cfg.return_value.proxy_bind = "127.0.0.1"
+            info = mgr._proxy_listener_status()
+        assert info["bound"] is False
+        assert "not bound" in (info["reason"] or "")
+
+    def test_proxy_disabled(self):
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with patch("taskmux.global_config.loadGlobalConfig") as mock_cfg:
+            mock_cfg.return_value.proxy_enabled = False
+            mock_cfg.return_value.proxy_https_port = 443
+            mock_cfg.return_value.proxy_bind = "127.0.0.1"
+            info = mgr._proxy_listener_status()
+        assert info["bound"] is False
+        assert "disabled" in (info["reason"] or "")
 
 
 class TestIsHealthyBackcompat:
