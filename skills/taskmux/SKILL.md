@@ -1,10 +1,12 @@
 ---
 name: taskmux
-version: 0.6.2
+version: 0.6.3
 description: Manage long-running dev tasks (servers, watchers, build processes) via taskmux — a tmux-backed task runner driven by `taskmux.toml`. TRIGGER when cwd has `taskmux.toml`, when the user mentions taskmux, or when the user wants to start/stop/inspect/tail-logs of long-running processes in a project that has taskmux configured. SKIP for one-shot commands (tests, builds) and for projects without `taskmux.toml`.
 ---
 
 # taskmux
+
+Long-running dev tasks (servers, watchers, builds) need persistent logs, auto-restart, and stable URLs — backgrounded shells (`npm run dev &`) give you none. Taskmux does.
 
 Tmux-backed task runner. Tasks are declared in `taskmux.toml`; taskmux runs each in its own tmux window, mirrors output to a persistent timestamped log, and (when a daemon or `--monitor` is up) auto-restarts per `restart_policy`. Every command takes `--json`.
 
@@ -46,11 +48,22 @@ taskmux url <task>                  # print proxy URL
 
 # Logs (persistent, timestamped, ~/.taskmux/projects/{project_id}/logs/)
 taskmux logs [<task>] [-f] [-n N] [-g PATTERN] [-C N] [--since 5m]
-taskmux logs-clean [<task>]
+taskmux logs-clean [<task>]                 # alias for `clean --logs`
 
 # Config
-taskmux add <task> "<cmd>" [--host api]   # adds to taskmux.toml
+taskmux add <task> "<cmd>" [--host api]     # adds to taskmux.toml
 taskmux remove <task>
+
+# Aliases — proxy a non-taskmux port (Docker, external dev server)
+taskmux alias add <name> <port> [--host h]  # https://h.{project}.localhost
+taskmux alias list
+taskmux alias remove <name>
+
+# Cleanup
+taskmux clean                       # current project: logs+state+certs+registry
+taskmux clean --logs|--events|--certs|--all [--dry-run] [--yes] [--force]
+taskmux prune                       # report orphans (stray sessions, leaked ports)
+taskmux prune --apply               # actually clean
 
 # Daemon (auto-restart + WebSocket API on api_port)
 taskmux daemon [start|stop|status|restart|list]
@@ -92,6 +105,11 @@ Result shape: `{"ok": true|false, ...}`. Error: `{"ok": false, "error": "..."}`.
 | `"*"` (wildcard) | catch-all for `*.{project}.localhost` | one per project; URL displayed as `https://*.{project}.localhost` (display only) |
 
 Slug + apex + wildcard can coexist; specific hosts win over wildcard. Duplicate slugs/apex/wildcard rejected at config-validation time.
+
+How proxy serves a request:
+1. Daemon binds `:443` (configurable) and a per-process `state.json` records each task's `$PORT`.
+2. On `taskmux start`, a task with `host = "api"` registers its assigned port; `taskmux alias add` registers external ports the same way.
+3. Browser hits `https://api.{project}.localhost` → daemon SNI-matches the cert → proxies to `127.0.0.1:$PORT`.
 
 The daemon's proxy listener is configurable via `~/.taskmux/config.toml`:
 
@@ -149,10 +167,13 @@ Daemon picks up changes via file watcher.
 ```
 ~/.taskmux/
   projects/{project_id}/logs/{task}.log[.N]   # rotated, timestamped
+  projects/{project_id}/state.json            # per-project assigned ports
+  projects/{project_id}/aliases.json          # external proxy routes (taskmux alias)
   events.jsonl                                # cross-project lifecycle
   registry.json                               # daemon-managed projects
+  certs/{project_id}/                         # minted *.localhost certs
   daemon.pid, daemon.log
-  config.toml                                 # global host config
+  config.toml                                 # global host config (preserved by `clean --all`)
 ```
 
 `{project_id}` includes the worktree suffix on linked worktrees.

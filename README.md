@@ -72,7 +72,7 @@ taskmux logs -g "error"          # grep all tasks
 taskmux logs -g "err" -C 5      # grep with context
 taskmux logs --since 5m          # last 5 minutes
 taskmux logs --since "2024-01-01T14:00"
-taskmux logs-clean [task]        # delete log files
+taskmux logs-clean [task]        # delete log files (alias for `clean --logs`)
 
 # Config
 taskmux add <task> "<command>"   # add task to taskmux.toml
@@ -82,9 +82,25 @@ taskmux init                     # create taskmux.toml + inject agent context
 taskmux init --defaults          # non-interactive
 
 # URLs / proxy
-taskmux url <task>               # print proxy URL for a task
+taskmux url <name>               # print proxy URL for a task or alias
 taskmux ca install               # install local CA into system trust store (one-time)
 taskmux ca mint                  # mint cert for the current project
+
+# Aliases — proxy a non-taskmux port (Docker, external dev server)
+taskmux alias add db 5432        # → https://db.{project}.localhost
+taskmux alias add cache 6379 --host redis
+taskmux alias list
+taskmux alias remove db
+
+# Cleanup
+taskmux clean                    # current project: logs + state + certs + registry
+taskmux clean --logs             # logs only
+taskmux clean --events           # truncate events.jsonl
+taskmux clean --certs            # remove minted *.localhost certs
+taskmux clean --all              # wipe ~/.taskmux/ except config.toml
+taskmux clean --dry-run          # report only, no deletes
+taskmux prune                    # report orphans (stray sessions, leaked ports)
+taskmux prune --apply            # actually clean up
 
 # Monitoring
 taskmux watch                    # watch config, reload on change
