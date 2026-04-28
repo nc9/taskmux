@@ -510,6 +510,35 @@ class TestLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Concurrency guard (R-002 regression)
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrencyGuards:
+    """Per-task lock prevents duplicate spawns under concurrent RPCs."""
+
+    def test_concurrent_start_for_same_task(self, tmp_path):
+        cfg = _make_config(tasks={"sleeper": {"command": "sleep 30", "stop_grace_period": 1}})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            r1, r2 = await asyncio.gather(
+                sup.start_task("sleeper"), sup.start_task("sleeper")
+            )
+            await sup.stop_all()
+            return r1, r2
+
+        try:
+            r1, r2 = _run(_go())
+            # Exactly one succeeds; the other gets TASK_ALREADY_RUNNING.
+            outcomes = sorted([r1.get("ok", False), r2.get("ok", False)])
+            assert outcomes == [False, True]
+        finally:
+            _stop_log_redirect(sup)
+
+
+# ---------------------------------------------------------------------------
 # Auto-restart state machine
 # ---------------------------------------------------------------------------
 
@@ -518,7 +547,7 @@ class TestAutoRestart:
     def test_skips_when_policy_no(self, tmp_path):
         cfg = _make_config(tasks={"a": {"command": "echo", "restart_policy": RestartPolicy.NO}})
         sup = _make_supervisor(cfg, tmp_path)
-        with patch.object(sup, "restart_task") as m:
+        with patch.object(sup, "_restart_task_locked") as m:
             _run(sup.auto_restart_tasks())
             m.assert_not_called()
 
@@ -526,7 +555,7 @@ class TestAutoRestart:
         cfg = _make_config(tasks={"a": {"command": "echo", "restart_policy": RestartPolicy.ALWAYS}})
         sup = _make_supervisor(cfg, tmp_path)
         sup.restart_tracker.mark_manually_stopped("a")
-        with patch.object(sup, "restart_task") as m:
+        with patch.object(sup, "_restart_task_locked") as m:
             _run(sup.auto_restart_tasks())
             m.assert_not_called()
 
@@ -539,7 +568,7 @@ class TestAutoRestart:
         async def _ok(_name):
             return {"ok": True}
 
-        with patch.object(sup, "restart_task", side_effect=_ok) as m:
+        with patch.object(sup, "_restart_task_locked", side_effect=_ok) as m:
             _run(sup.auto_restart_tasks())
             m.assert_called_once_with("a")
 
@@ -555,7 +584,7 @@ class TestAutoRestart:
         )
         sup = _make_supervisor(cfg, tmp_path)
         sup.restart_tracker._data["a"] = {"count": 2.0, "last": 0.0}
-        with patch.object(sup, "restart_task") as m:
+        with patch.object(sup, "_restart_task_locked") as m:
             _run(sup.auto_restart_tasks())
             m.assert_not_called()
 

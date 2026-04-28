@@ -410,3 +410,36 @@ def test_ping(isolated):
                 await asyncio.wait_for(server_task, timeout=1.0)
 
     asyncio.run(run())
+
+
+def test_config_missing_then_recreate_recovers(isolated):
+    """R-001 — a config that disappears and reappears must re-register."""
+    port = _free_port()
+    bogus = isolated / "missing" / "taskmux.toml"
+    reg.registerProject("ghost", bogus)  # path doesn't exist yet
+
+    async def run():
+        daemon = daemon_mod.TaskmuxDaemon(api_port=port)
+        server_task = asyncio.create_task(daemon.start())
+        try:
+            await _wait_for_port(port)
+            # Initially config_missing.
+            resp = await _ws_request(port, {"command": "list_projects"})
+            row = next(p for p in resp["projects"] if p["session"] == "ghost")
+            assert row["state"] == "config_missing"
+
+            # Create the config; sync_registry must re-register it as ok.
+            bogus.parent.mkdir(parents=True, exist_ok=True)
+            bogus.write_text('name = "ghost"\n[tasks.web]\ncommand = "echo hi"\n')
+            await daemon._sync_with_registry()
+
+            resp = await _ws_request(port, {"command": "list_projects"})
+            row = next(p for p in resp["projects"] if p["session"] == "ghost")
+            assert row["state"] == "ok", f"expected ok after recreate, got {row}"
+        finally:
+            daemon.stop()
+            server_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError, SystemExit):
+                await asyncio.wait_for(server_task, timeout=1.0)
+
+    asyncio.run(run())

@@ -271,10 +271,21 @@ class PosixSupervisor:
         self.config = config
         self.config_dir = config_dir
         self._tasks: dict[str, TaskProcess] = {}
+        # Per-task lock — serializes start/stop/restart/kill for the same task
+        # so two concurrent RPCs can't both pass the "not running" check and
+        # spawn duplicate processes. See review R-002.
+        self._task_locks: dict[str, asyncio.Lock] = {}
         self.task_health: dict = {}
         self.restart_tracker = RestartTracker()
         self.assigned_ports: dict[str, int] = self._load_state()
         self.on_task_route_change: Callable[[str, str, str, int | None], None] | None = None
+
+    def _lock_for(self, task_name: str) -> asyncio.Lock:
+        lock = self._task_locks.get(task_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._task_locks[task_name] = lock
+        return lock
 
     def _resolve_cwd(self, cwd: str | None) -> str | None:
         if not cwd:
@@ -542,6 +553,10 @@ class PosixSupervisor:
         return self.is_task_healthy(task_name)
 
     async def start_task(self, task_name: str) -> dict:
+        async with self._lock_for(task_name):
+            return await self._start_task_locked(task_name)
+
+    async def _start_task_locked(self, task_name: str) -> dict:
         self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
@@ -581,6 +596,10 @@ class PosixSupervisor:
         return result
 
     async def stop_task(self, task_name: str) -> dict:
+        async with self._lock_for(task_name):
+            return await self._stop_task_locked(task_name)
+
+    async def _stop_task_locked(self, task_name: str) -> dict:
         self.restart_tracker.mark_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
@@ -601,6 +620,10 @@ class PosixSupervisor:
         return {"ok": True, "task": task_name, "action": "stopped"}
 
     async def restart_task(self, task_name: str) -> dict:
+        async with self._lock_for(task_name):
+            return await self._restart_task_locked(task_name)
+
+    async def _restart_task_locked(self, task_name: str) -> dict:
         self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
@@ -626,6 +649,10 @@ class PosixSupervisor:
         return {"ok": True, "task": task_name, "action": "restarted"}
 
     async def kill_task(self, task_name: str) -> dict:
+        async with self._lock_for(task_name):
+            return await self._kill_task_locked(task_name)
+
+    async def _kill_task_locked(self, task_name: str) -> dict:
         self.restart_tracker.mark_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
@@ -687,18 +714,25 @@ class PosixSupervisor:
             if skip:
                 continue
 
-            runHook(task_cfg.hooks.before_start, task_name)
+            # Per-task lock so a concurrent start_task RPC for the same name
+            # can't race with us spawning here.
+            async with self._lock_for(task_name):
+                if task_name in self._tasks:
+                    warnings.append(f"Task '{task_name}' already running, skipped")
+                    continue
 
-            prior_port = self.assigned_ports.get(task_name)
-            if prior_port is not None:
-                self._cleanup_port(prior_port)
+                runHook(task_cfg.hooks.before_start, task_name)
 
-            await self._spawn(task_name)
+                prior_port = self.assigned_ports.get(task_name)
+                if prior_port is not None:
+                    self._cleanup_port(prior_port)
 
-            runHook(task_cfg.hooks.after_start, task_name)
-            if task_cfg.host is not None:
-                self._emit_route(task_name, self.assigned_ports.get(task_name))
-            started.append(task_name)
+                await self._spawn(task_name)
+
+                runHook(task_cfg.hooks.after_start, task_name)
+                if task_cfg.host is not None:
+                    self._emit_route(task_name, self.assigned_ports.get(task_name))
+                started.append(task_name)
 
         runHook(self.config.hooks.after_start)
         recordEvent("session_started", session=self.config.name, tasks=started)
@@ -982,7 +1016,8 @@ class PosixSupervisor:
 
             reason = "process_exited" if not proc_alive else "health_retries_exceeded"
             recordEvent("auto_restart", session=self.config.name, task=task_name, reason=reason)
-            await self.restart_task(task_name)
+            async with self._lock_for(task_name):
+                await self._restart_task_locked(task_name)
             self.restart_tracker.record(task_name)
             self.restart_tracker.reset_health_failures(task_name)
 

@@ -352,14 +352,17 @@ class TaskmuxDaemon:
     async def _sync_with_registry(self) -> None:
         async with self._lock:
             on_disk = readRegistry()
-            current = set(self.projects.keys()) | set(self.config_paths.keys())
+            # Treat config_missing/error as "needs retry" rather than "current",
+            # so a recreated taskmux.toml can re-register on the next sync.
+            healthy = {s for s in self.projects if self.project_states.get(s) == "ok"}
+            known = set(self.projects.keys()) | set(self.config_paths.keys())
             wanted = set(on_disk.keys())
 
-            for session in wanted - current:
+            for session in wanted - healthy:
                 entry = on_disk[session]
                 self._register_locked(session, Path(entry["config_path"]))
 
-            for session in current - wanted:
+            for session in known - wanted:
                 self._unregister_locked(session)
 
     def _register_locked(self, session: str, config_path: Path) -> None:
