@@ -84,14 +84,25 @@ class TaskConfig(_StrictConfig):
     @field_validator("host")
     @classmethod
     def _validate_host(cls, v: str | None) -> str | None:
+        """Accept None, a DNS slug, `@` (apex, normalised to ""), or `*` (wildcard).
+
+        Apex is stored as the empty string internally so every downstream
+        lookup (`(project, host)` route key, FQDN composition, URL display)
+        stays trivially consistent — there's only one representation.
+        """
         if v is None:
+            return v
+        if v == "@":
+            return ""
+        if v == "*":
             return v
         if not _DNS_SLUG.match(v):
             raise TaskmuxError(
                 ErrorCode.CONFIG_VALIDATION,
                 detail=(
-                    f"Invalid host {v!r}. Must be DNS-safe: lowercase letters, digits, "
-                    "and hyphens (not at start/end). E.g. 'api', 'web-1'."
+                    f"Invalid host {v!r}. Must be one of: a DNS-safe slug "
+                    "(lowercase letters, digits, hyphens; not at start/end, "
+                    "e.g. 'api', 'web-1'), '@' for apex, or '*' for wildcard."
                 ),
             )
         return v
@@ -114,6 +125,16 @@ class TaskConfig(_StrictConfig):
         )
 
 
+class WorktreeConfig(_StrictConfig):
+    """Git worktree behaviour. When taskmux runs inside a linked worktree it
+    derives a worktree_id and composes `project_id = name-{worktree_id}` so
+    each worktree has its own session, state, ports, and URL namespace."""
+
+    enabled: bool = True
+    separator: str = "-"
+    main_branches: list[str] = ["main", "master"]
+
+
 class TaskmuxConfig(_StrictConfig):
     """Top-level taskmux.toml schema."""
 
@@ -121,6 +142,7 @@ class TaskmuxConfig(_StrictConfig):
     auto_start: bool = True
     auto_daemon: bool = False
     hooks: HookConfig = HookConfig()
+    worktree: WorktreeConfig = WorktreeConfig()
     tasks: dict[str, TaskConfig] = {}
 
     @field_validator("name")
@@ -139,17 +161,25 @@ class TaskmuxConfig(_StrictConfig):
 
     @model_validator(mode="after")
     def _validate_unique_hosts(self) -> "TaskmuxConfig":
+        """Reject duplicate host entries.
+
+        A project may have at most one apex (`""`, written as `@`), at most
+        one wildcard (`"*"`), and unique specific subdomains.
+        """
         seen: dict[str, str] = {}
         for name, cfg in self.tasks.items():
             if cfg.host is None:
                 continue
             if cfg.host in seen:
-                raise TaskmuxError(
-                    ErrorCode.CONFIG_VALIDATION,
-                    detail=(
-                        f"Duplicate host {cfg.host!r} on tasks {seen[cfg.host]!r} and {name!r}"
-                    ),
-                )
+                if cfg.host == "":
+                    detail = f"Duplicate apex host (`@`) on tasks {seen[cfg.host]!r} and {name!r}"
+                elif cfg.host == "*":
+                    detail = (
+                        f"Duplicate wildcard host (`*`) on tasks {seen[cfg.host]!r} and {name!r}"
+                    )
+                else:
+                    detail = f"Duplicate host {cfg.host!r} on tasks {seen[cfg.host]!r} and {name!r}"
+                raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=detail)
             seen[cfg.host] = name
         return self
 

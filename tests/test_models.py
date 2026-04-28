@@ -117,6 +117,16 @@ class TestTaskConfig:
                 TaskConfig(command="x", host=h)
             assert exc_info.value.code == ErrorCode.CONFIG_VALIDATION
 
+    def test_host_apex_normalised_to_empty(self):
+        """`@` is sugar for the apex; we normalise to "" so downstream
+        lookups have a single representation."""
+        t = TaskConfig(command="x", host="@")
+        assert t.host == ""
+
+    def test_host_wildcard_kept_as_star(self):
+        t = TaskConfig(command="x", host="*")
+        assert t.host == "*"
+
     def test_old_port_key_rejected(self):
         with pytest.raises(TaskmuxError) as exc_info:
             TaskConfig(command="x", port=8000)  # type: ignore[call-arg]
@@ -223,6 +233,40 @@ class TestTaskmuxConfig:
                 }
             )
         assert exc_info.value.code == ErrorCode.CONFIG_VALIDATION
+
+    def test_duplicate_apex_rejected(self):
+        with pytest.raises(TaskmuxError) as exc_info:
+            TaskmuxConfig(
+                tasks={
+                    "a": TaskConfig(command="echo a", host="@"),
+                    "b": TaskConfig(command="echo b", host="@"),
+                }
+            )
+        assert exc_info.value.code == ErrorCode.CONFIG_VALIDATION
+        assert "apex" in str(exc_info.value.message).lower()
+
+    def test_duplicate_wildcard_rejected(self):
+        with pytest.raises(TaskmuxError) as exc_info:
+            TaskmuxConfig(
+                tasks={
+                    "a": TaskConfig(command="echo a", host="*"),
+                    "b": TaskConfig(command="echo b", host="*"),
+                }
+            )
+        assert exc_info.value.code == ErrorCode.CONFIG_VALIDATION
+        assert "wildcard" in str(exc_info.value.message).lower()
+
+    def test_apex_wildcard_and_specific_coexist(self):
+        c = TaskmuxConfig(
+            tasks={
+                "website": TaskConfig(command="echo w", host="@"),
+                "frontloader": TaskConfig(command="echo f", host="*"),
+                "api": TaskConfig(command="echo a", host="api"),
+            }
+        )
+        assert c.tasks["website"].host == ""
+        assert c.tasks["frontloader"].host == "*"
+        assert c.tasks["api"].host == "api"
 
     def test_depends_on_three_node_cycle(self):
         with pytest.raises(TaskmuxError) as exc_info:

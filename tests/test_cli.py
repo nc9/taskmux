@@ -6,9 +6,24 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from taskmux.cli import app
-from taskmux.config import loadConfig
+from taskmux.config import ProjectIdentity
+from taskmux.models import TaskmuxConfig
 
 runner = CliRunner()
+
+
+def _identity(project: str = "demo", config: TaskmuxConfig | None = None) -> ProjectIdentity:
+    cfg = config if config is not None else TaskmuxConfig(name=project)
+    return ProjectIdentity(
+        config=cfg,
+        config_path=Path(f"/tmp/{project}/taskmux.toml"),
+        project=project,
+        worktree_id=None,
+        project_id=project,
+        branch=None,
+        worktree_path=None,
+        primary_worktree_path=None,
+    )
 
 
 def _ok_result(action: str, task: str | None = None, session: str | None = None) -> dict:
@@ -89,11 +104,9 @@ def _ipc_dispatch(command, params=None, **_):
 
 class TestStartCommand:
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_start_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["start"])
@@ -102,11 +115,9 @@ class TestStartCommand:
         assert "start_all" in commands
 
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_start_task(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["start", "server"])
@@ -115,11 +126,9 @@ class TestStartCommand:
         assert ("start", "server") in called
 
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_start_multiple(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["start", "api", "web"])
@@ -131,11 +140,9 @@ class TestStartCommand:
 
 class TestStopCommand:
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_stop_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["stop"])
@@ -144,11 +151,9 @@ class TestStopCommand:
         assert "stop_all" in commands
 
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_stop_task(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["stop", "server"])
@@ -159,11 +164,9 @@ class TestStopCommand:
 
 class TestRestartCommand:
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_restart_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["restart"])
@@ -172,11 +175,9 @@ class TestRestartCommand:
         assert "restart_all" in commands
 
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_restart_task(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["restart", "server"])
@@ -187,11 +188,9 @@ class TestRestartCommand:
 
 class TestInspectCommand:
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_inspect_calls_ipc(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["inspect", "server"])
@@ -202,11 +201,9 @@ class TestInspectCommand:
 
 class TestLogsCommand:
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_logs_with_grep(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch) as m:
             result = runner.invoke(app, ["logs", "server", "--grep", "error"])
@@ -216,11 +213,9 @@ class TestLogsCommand:
         assert any(p.get("grep") == "error" for p in params_calls)
 
     @patch("taskmux.cli.registerProject")
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     def test_logs_all(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig(name="demo")
+        mock_load.return_value = _identity("demo")
         monkeypatch.chdir(sample_toml.parent)
         with _patch_ipc(_ipc_dispatch):
             result = runner.invoke(app, ["logs"])
@@ -229,10 +224,7 @@ class TestLogsCommand:
 
 class TestAddCommand:
     def test_add_creates_task(self, sample_toml: Path):
-        with (
-            patch("taskmux.cli.loadConfig", side_effect=lambda: loadConfig(sample_toml)),
-            patch("taskmux.cli.addTask") as mock_add,
-        ):
+        with patch("taskmux.cli.addTask") as mock_add:
             result = runner.invoke(app, ["add", "web", "npm start"])
             assert result.exit_code == 0
             mock_add.assert_called_once_with(
@@ -240,10 +232,7 @@ class TestAddCommand:
             )
 
     def test_add_with_options(self, sample_toml: Path):
-        with (
-            patch("taskmux.cli.loadConfig", side_effect=lambda: loadConfig(sample_toml)),
-            patch("taskmux.cli.addTask") as mock_add,
-        ):
+        with patch("taskmux.cli.addTask") as mock_add:
             result = runner.invoke(
                 app,
                 [
@@ -295,12 +284,10 @@ class TestUrlCommand:
 
 
 class TestRemoveCommand:
-    @patch("taskmux.cli.loadConfig")
+    @patch("taskmux.cli.loadProjectIdentity")
     @patch("taskmux.cli.ipc_client.is_daemon_running", return_value=False)
     def test_remove_calls_removeTask(self, _mock_running, mock_load, sample_toml: Path):
-        from taskmux.models import TaskmuxConfig
-
-        mock_load.return_value = TaskmuxConfig()
+        mock_load.return_value = _identity()
         with patch("taskmux.cli.removeTask", return_value=(TaskmuxConfig(), True)) as mock_rm:
             result = runner.invoke(app, ["remove", "server"])
             assert result.exit_code == 0

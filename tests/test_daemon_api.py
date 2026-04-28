@@ -19,9 +19,16 @@ from taskmux import registry as reg
 class FakeSupervisor:
     """Minimal stand-in for PosixSupervisor — no real processes."""
 
-    def __init__(self, config, config_dir=None):  # noqa: ARG002
+    def __init__(
+        self,
+        config,
+        config_dir=None,  # noqa: ARG002
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+    ):
         self.config = config
-        self.config_dir = config_dir
+        self.project_id = project_id or config.name
+        self.worktree_id = worktree_id
         self.assigned_ports: dict[str, int] = {}
         self.on_task_route_change = None
         self._exists = False
@@ -37,7 +44,7 @@ class FakeSupervisor:
         from taskmux.paths import projectStatePath
 
         try:
-            data = json.loads(projectStatePath(self.config.name).read_text())
+            data = json.loads(projectStatePath(self.config.name, self.worktree_id).read_text())
             ports = data.get("assigned_ports", {})
             self.assigned_ports = {k: int(v) for k, v in ports.items()}
         except Exception:  # noqa: BLE001

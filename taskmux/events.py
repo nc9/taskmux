@@ -54,6 +54,8 @@ def _maybeRotate() -> None:
 def queryEvents(
     task: str | None = None,
     session: str | None = None,
+    project: str | None = None,
+    worktree: str | None = None,
     since: datetime | None = None,
     limit: int = 50,
 ) -> list[dict]:
@@ -72,6 +74,10 @@ def queryEvents(
         if task and entry.get("task") != task:
             continue
         if session and entry.get("session") != session:
+            continue
+        if project and entry.get("project") != project:
+            continue
+        if worktree and entry.get("worktree") != worktree:
             continue
         if since:
             try:

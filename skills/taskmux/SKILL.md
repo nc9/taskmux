@@ -1,5 +1,6 @@
 ---
 name: taskmux
+version: 0.6.2
 description: Manage long-running dev tasks (servers, watchers, build processes) via taskmux — a tmux-backed task runner driven by `taskmux.toml`. TRIGGER when cwd has `taskmux.toml`, when the user mentions taskmux, or when the user wants to start/stop/inspect/tail-logs of long-running processes in a project that has taskmux configured. SKIP for one-shot commands (tests, builds) and for projects without `taskmux.toml`.
 ---
 
@@ -9,7 +10,7 @@ Tmux-backed task runner. Tasks are declared in `taskmux.toml`; taskmux runs each
 
 ## When to invoke
 
-- `taskmux.toml` exists in repo root → use taskmux for any long-running process (dev server, watcher, queue, db). Do NOT run those commands directly.
+- `taskmux.toml` exists in repo root → use taskmux for any long-running process. Do NOT run those commands directly.
 - User says "start the server", "tail logs", "what's running", "restart the watcher", "is X healthy" in a taskmux project.
 - User asks to add/remove a task, or to debug a crash/restart loop.
 
@@ -18,141 +19,164 @@ Skip for: one-shot commands (`pytest`, `bun build`, `cargo test`), projects with
 ## Detection
 
 ```bash
-test -f taskmux.toml && echo "taskmux project"
+test -f taskmux.toml && taskmux --json status
 ```
 
-Also check `taskmux status --json` — if `running: false` you may need to start tasks first.
+If `running: false`, start tasks first.
 
 ## CLI cheat sheet
 
-Global flag: `--json` on every command for machine-readable output.
+`--json` works on every command.
 
 ```bash
 # Lifecycle
-taskmux start                       # all auto_start tasks, dependency-ordered
-taskmux start <task> [<task>...]    # specific tasks
+taskmux start [<task>...]           # all auto_start, dep-ordered; or specific
 taskmux start -m                    # + monitor (auto-restart, foreground)
 taskmux start -d                    # + spawn detached daemon
 taskmux stop [<task>...]            # graceful: C-c → SIGTERM → SIGKILL
-taskmux restart [<task>...]         # full stop + start, clears manual-stop flag
-taskmux kill <task>                 # SIGKILL + destroy window (blocks auto-restart)
+taskmux restart [<task>...]         # full stop + start, clears manual-stop
+taskmux kill <task>                 # SIGKILL + destroy window (blocks restart)
 
 # Inspect
 taskmux status                      # overview (aliases: list, ls)
 taskmux health                      # health-check table (-v for probe details)
-taskmux inspect <task>              # full task state (always JSON-friendly)
-taskmux events                      # lifecycle events (--task X, --since 1h)
+taskmux inspect <task>              # full task state
+taskmux events [--task X --since 1h]
+taskmux url <task>                  # print proxy URL
 
-# Logs (persistent, timestamped, at ~/.taskmux/projects/{session}/logs/)
-taskmux logs                        # interleaved across all tasks
-taskmux logs <task>                 # single task
-taskmux logs -f [<task>]            # follow live
-taskmux logs -n 200 <task>          # last N lines
-taskmux logs -g "error"             # grep all tasks
-taskmux logs -g "err" -C 5          # grep with context
-taskmux logs --since 5m             # last 5 minutes
-taskmux logs-clean [<task>]         # delete log files
+# Logs (persistent, timestamped, ~/.taskmux/projects/{project_id}/logs/)
+taskmux logs [<task>] [-f] [-n N] [-g PATTERN] [-C N] [--since 5m]
+taskmux logs-clean [<task>]
 
 # Config
-taskmux add <task> "<cmd>"          # add to taskmux.toml
-taskmux add api "next dev" --host api   # + proxy URL
-taskmux remove <task>               # remove (kills if running)
+taskmux add <task> "<cmd>" [--host api]   # adds to taskmux.toml
+taskmux remove <task>
 
-# Daemon (auto-restart + WebSocket API)
-taskmux daemon start | stop | status | restart | list
-taskmux daemon register             # add cwd's project to global registry
+# Daemon (auto-restart + WebSocket API on api_port)
+taskmux daemon [start|stop|status|restart|list]
+taskmux daemon register [--force]   # register cwd in global registry
+
+# Proxy / certs
+taskmux ca install                  # one-time mkcert root install
+taskmux dns install|uninstall|flush|query <name>
 ```
 
 ## JSON patterns
 
 ```bash
-# Quick status
-taskmux status --json | jq '.tasks[] | {name, state, healthy}'
+# Status with proxy reachability
+taskmux status --json | jq '{tasks: [.tasks[] | {name, healthy, url, last_health}], proxy}'
 
-# Find unhealthy tasks
-taskmux health --json | jq '.tasks[] | select(.healthy == false)'
+# Find unhealthy (proxy-down counts here too — last_health.method == "proxy")
+taskmux status --json | jq '.tasks[] | select(.healthy == false)'
 
 # Why did a task fail?
 taskmux inspect <task> --json
-taskmux events --task <task> --json | jq '.events[-5:]'
+taskmux events --task <task> --since 1h --json | jq '.events[-5:]'
 taskmux logs <task> --since 10m -g "error|exception|fatal"
 
-# Did anything restart recently?
-taskmux events --since 1h --json | jq '.events[] | select(.event == "auto_restart" or .event == "max_restarts_reached")'
+# Recent restarts
+taskmux events --since 1h --json | jq '.events[] | select(.event | test("auto_restart|max_restarts_reached"))'
 ```
 
-Result shape: `{"ok": true|false, ...}`. On error: `{"ok": false, "error": "..."}`.
+Result shape: `{"ok": true|false, ...}`. Error: `{"ok": false, "error": "..."}`.
+
+## Hosts (HTTPS proxy)
+
+`host` on a task exposes it via the daemon's HTTPS proxy. Three forms:
+
+| `host` value | URL | Notes |
+|--------------|-----|-------|
+| `"api"` (slug) | `https://api.{project}.localhost` | most common |
+| `"@"` (apex)   | `https://{project}.localhost` | one per project |
+| `"*"` (wildcard) | catch-all for `*.{project}.localhost` | one per project; URL displayed as `https://*.{project}.localhost` (display only) |
+
+Slug + apex + wildcard can coexist; specific hosts win over wildcard. Duplicate slugs/apex/wildcard rejected at config-validation time.
+
+The daemon's proxy listener is configurable via `~/.taskmux/config.toml`:
+
+```toml
+proxy_enabled = true
+proxy_https_port = 443             # change to >=1024 to run unprivileged
+proxy_bind = "127.0.0.1"           # "0.0.0.0" exposes to LAN (be deliberate)
+```
+
+`taskmux status` flips host-routed tasks to `healthy: false` when the proxy listener isn't bound or this project's host route isn't registered. The reason is in `last_health.reason`; the top-level `proxy: {bound, port, reason}` summarises overall state.
+
+## Worktrees
+
+Linked git worktrees get an auto-suffixed `project_id` (e.g. `myproject-feat-foo`) so logs, registry entries, and proxy URLs (`https://api.myproject-feat-foo.localhost`) don't collide with the primary checkout. The user-facing `name` in `taskmux.toml` stays the same; everything routed by `project_id` namespaces automatically.
 
 ## Common workflows
 
 ### "Server died, what happened?"
-1. `taskmux status --json` → confirm task state.
-2. `taskmux events --task <task> --since 1h --json` → look for `health_check_failed`, `auto_restart`, `max_restarts_reached`.
+1. `taskmux status --json` → confirm task state + `proxy.bound`.
+2. `taskmux events --task <task> --since 1h --json` → `health_check_failed`, `auto_restart`, `max_restarts_reached`.
 3. `taskmux logs <task> --since 30m -g "error|panic|exception"` → root cause.
-4. `taskmux inspect <task> --json` → restart count, last failure reason.
+4. `taskmux inspect <task> --json` → restart count, last failure.
+
+### "URL says healthy but my browser can't reach it"
+- Check `taskmux status --json | jq .proxy` — `bound: false` means daemon proxy isn't listening (run `sudo taskmux daemon` or set `proxy_https_port` >=1024).
+- Check `last_health.method == "proxy"` on the task — reason text says exactly which gate failed.
 
 ### "Add a new dev task"
 ```bash
 taskmux add worker "celery -A app worker -l info"
-taskmux start worker
-taskmux logs -f worker
+taskmux add api "next dev -p $PORT" --host api    # adds proxy URL
+taskmux start worker api
 ```
-For HTTP-style tasks behind the proxy, add `--host api` so it gets `https://api.{project}.localhost`.
 
 ### "Change restart behavior"
-Edit `taskmux.toml` directly:
+Edit `taskmux.toml`:
 ```toml
 [tasks.worker]
-restart_policy = "always"   # "no" | "on-failure" (default) | "always"
+restart_policy = "always"          # "no" | "on-failure" (default) | "always"
 max_restarts = 10
 restart_backoff = 3.0
 ```
-Then `taskmux restart worker`. The daemon picks up config changes via the file watcher.
-
-### "Run something long that's not in config"
-Don't. Add it as a task first (`taskmux add`), then `taskmux start <name>`. This is the whole point — persistent logs, restarts, and dependency ordering only work for declared tasks.
+Daemon picks up changes via file watcher.
 
 ## Anti-patterns — DO NOT
 
-- ❌ `npm run dev &` / `cargo watch ... &` — backgrounded shell processes have no logs, no restart, no visibility. Use `taskmux start <task>`.
-- ❌ `kill -9 <pid>` of a taskmux-managed pane — bypasses manual-stop tracking; auto-restart will re-spawn it. Use `taskmux stop <task>` or `taskmux kill <task>`.
-- ❌ Reading raw tmux pane output (`tmux capture-pane`) for log analysis — use `taskmux logs <task> --grep` against the persistent log files.
-- ❌ Editing `taskmux.toml` while expecting hot-reload without a daemon — the watcher only runs in `taskmux daemon` or `start --monitor`.
-- ❌ Running `taskmux init` in a repo that already has `taskmux.toml` — it's a no-op and will print "Config already exists".
+- ❌ `npm run dev &` / `cargo watch ... &` — backgrounded shell processes have no logs, no restart, no visibility.
+- ❌ `kill -9 <pid>` of a taskmux pane — bypasses manual-stop tracking; auto-restart re-spawns it. Use `taskmux stop`/`kill`.
+- ❌ `tmux capture-pane` for log analysis — use `taskmux logs <task> --grep` against persistent logs.
+- ❌ Editing `taskmux.toml` without a daemon running — file watcher only runs in `taskmux daemon` or `start --monitor`.
+- ❌ `taskmux init` on a project that already has `taskmux.toml` — no-op.
 
 ## Filesystem
 
 ```
 ~/.taskmux/
-  projects/{session}/logs/{task}.log[.N]   # rotated, timestamped
-  events.jsonl                             # cross-project lifecycle events
-  registry.json                            # daemon-managed projects
+  projects/{project_id}/logs/{task}.log[.N]   # rotated, timestamped
+  events.jsonl                                # cross-project lifecycle
+  registry.json                               # daemon-managed projects
   daemon.pid, daemon.log
-  config.toml                              # global host config (optional)
+  config.toml                                 # global host config
 ```
 
-Read these directly when CLI doesn't expose what you need (e.g. tailing a log file from a different process).
+`{project_id}` includes the worktree suffix on linked worktrees.
 
-## Config reference (top-level)
+## Config quick-ref (top-level)
 
 ```toml
 name = "myproject"
-auto_start = true        # global toggle
-auto_daemon = false      # spawn daemon on `taskmux start`
+auto_start = true
+auto_daemon = false
 
 [tasks.<name>]
-command = "..."           # required
+command = "..."
 auto_start = true
-cwd = "..."               # relative to taskmux.toml dir
-host = "api"              # → https://api.{name}.localhost; $PORT injected
+cwd = "..."                 # relative to taskmux.toml dir
+host = "api" | "@" | "*"    # → proxy URL; $PORT injected
 depends_on = []
 health_url = "http://localhost:$PORT/health"
 health_expected_status = 200
-health_expected_body = "..."   # regex; catches dev-server "200 with error page"
-health_check = "..."           # shell, exit 0 = healthy (used if no health_url)
+health_expected_body = "..."   # regex; catches "200 with error page"
+health_check = "..."           # shell, exit 0 = healthy
 health_interval = 10
 health_retries = 3
-restart_policy = "on-failure"  # "no" | "on-failure" | "always"
+restart_policy = "on-failure"
 max_restarts = 5
 restart_backoff = 2.0
 stop_grace_period = 5
@@ -168,4 +192,4 @@ log_max_files = 3
 | `kill`    | SIGKILL                 | Destroyed  | Blocked      |
 | `restart` | Full stop + start       | Reused     | Re-enabled   |
 
-`stop`/`kill` set a manual-stop flag — restart policy is suppressed until `start` or `restart` clears it.
+`stop`/`kill` set a manual-stop flag — restart policy suppressed until `start`/`restart` clears it.

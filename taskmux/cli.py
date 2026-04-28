@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import ipc_client
-from .config import addTask, loadConfig, removeTask
+from .config import ProjectIdentity, addTask, loadProjectIdentity, removeTask
 from .daemon import (
     SimpleConfigWatcher,
     TaskmuxDaemon,
@@ -116,14 +116,24 @@ def _handle_results(results: list[dict]) -> None:
 
 
 class TaskmuxCLI:
-    """Thin handle on the cwd's taskmux.toml — resolves session name + paths."""
+    """Thin handle on the cwd's taskmux.toml — resolves project_id + paths."""
 
     def __init__(self, config_path: Path | None = None):
         self.config_path: Path = (config_path or Path("taskmux.toml")).expanduser().resolve()
-        self.config: TaskmuxConfig = loadConfig(self.config_path)
+        self.identity: ProjectIdentity = loadProjectIdentity(self.config_path)
+        self.config: TaskmuxConfig = self.identity.config
+
+    @property
+    def project_id(self) -> str:
+        return self.identity.project_id
+
+    @property
+    def worktree_id(self) -> str | None:
+        return self.identity.worktree_id
 
     def reload_config(self) -> None:
-        self.config = loadConfig(self.config_path)
+        self.identity = loadProjectIdentity(self.config_path)
+        self.config = self.identity.config
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +275,7 @@ def _autoRegisterCwd() -> None:
     except Exception:  # noqa: BLE001
         return
     try:
-        registerProject(cli_local.config.name, cli_local.config_path)
+        registerProject(cli_local.project_id, cli_local.config_path)
     except TaskmuxError as e:
         if not is_json_mode():
             console.print(f"[yellow]Auto-register skipped:[/yellow] {e.message}")
@@ -289,12 +299,12 @@ def start(
     """Start tasks (all auto_start tasks if none specified)."""
     _ = monitor, daemon  # back-compat no-ops
     cli = TaskmuxCLI()
-    _ensure_session_known(cli.config.name, cli.config_path)
+    _ensure_session_known(cli.project_id, cli.config_path)
     if tasks:
-        results = [_call_session("start", cli.config.name, task=t) for t in tasks]
+        results = [_call_session("start", cli.project_id, task=t) for t in tasks]
         _handle_results(results)
     else:
-        _handle_result(_call_session("start_all", cli.config.name))
+        _handle_result(_call_session("start_all", cli.project_id))
 
 
 @app.command()
@@ -303,12 +313,12 @@ def stop(
 ):
     """Stop tasks (all if none specified). Signal escalation: SIGINT → SIGTERM → SIGKILL."""
     cli = TaskmuxCLI()
-    _ensure_session_known(cli.config.name, cli.config_path)
+    _ensure_session_known(cli.project_id, cli.config_path)
     if tasks:
-        results = [_call_session("stop", cli.config.name, task=t) for t in tasks]
+        results = [_call_session("stop", cli.project_id, task=t) for t in tasks]
         _handle_results(results)
     else:
-        _handle_result(_call_session("stop_all", cli.config.name))
+        _handle_result(_call_session("stop_all", cli.project_id))
 
 
 @app.command()
@@ -317,12 +327,12 @@ def restart(
 ):
     """Restart tasks (all if none specified). Full stop with escalation, then start."""
     cli = TaskmuxCLI()
-    _ensure_session_known(cli.config.name, cli.config_path)
+    _ensure_session_known(cli.project_id, cli.config_path)
     if tasks:
-        results = [_call_session("restart", cli.config.name, task=t) for t in tasks]
+        results = [_call_session("restart", cli.project_id, task=t) for t in tasks]
         _handle_results(results)
     else:
-        _handle_result(_call_session("restart_all", cli.config.name))
+        _handle_result(_call_session("restart_all", cli.project_id))
 
 
 @app.command()
@@ -331,8 +341,8 @@ def kill(
 ):
     """Kill a specific task (SIGKILL, no grace)."""
     cli = TaskmuxCLI()
-    _ensure_session_known(cli.config.name, cli.config_path)
-    _handle_result(_call_session("kill", cli.config.name, task=task))
+    _ensure_session_known(cli.project_id, cli.config_path)
+    _handle_result(_call_session("kill", cli.project_id, task=task))
 
 
 @app.command()
@@ -353,18 +363,18 @@ def logs(
     if follow:
         # Daemon writes log files; client tails them directly.
         if task is not None:
-            _follow_one(cli.config.name, task, grep)
+            _follow_one(cli.identity.project, cli.worktree_id, task, grep)
         else:
-            _follow_all(cli.config.name, list(cli.config.tasks.keys()), grep)
+            _follow_all(cli.identity.project, cli.worktree_id, list(cli.config.tasks.keys()), grep)
         return
 
-    _ensure_session_known(cli.config.name, cli.config_path)
+    _ensure_session_known(cli.project_id, cli.config_path)
 
     if task is not None:
         resp = ipc_client.call(
             "logs",
             params={
-                "session": cli.config.name,
+                "session": cli.project_id,
                 "task": task,
                 "lines": lines,
                 "grep": grep,
@@ -382,7 +392,7 @@ def logs(
     resp = ipc_client.call(
         "logs",
         params={
-            "session": cli.config.name,
+            "session": cli.project_id,
             "lines": lines,
             "grep": grep,
             "since": since,
@@ -400,18 +410,23 @@ def logs(
                 console.print(f"[{color}][{escape(name)}][/{color}] {escape(line)}")
 
 
-def _follow_one(session: str, task: str, grep: str | None) -> None:
-    log_path = taskLogPath(session, task)
+def _follow_one(project: str, worktree_id: str | None, task: str, grep: str | None) -> None:
+    log_path = taskLogPath(project, task, worktree_id)
     if not log_path.exists():
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.touch()
     ipc_client.follow_log_file(log_path, grep=grep)
 
 
-def _follow_all(session: str, task_names: list[str], grep: str | None) -> None:
+def _follow_all(
+    project: str,
+    worktree_id: str | None,
+    task_names: list[str],
+    grep: str | None,
+) -> None:
     triples: list[tuple[str, Path, str]] = []
     for i, name in enumerate(task_names):
-        log_path = taskLogPath(session, name)
+        log_path = taskLogPath(project, name, worktree_id)
         if not log_path.exists():
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.touch()
@@ -425,7 +440,7 @@ def logs_clean(
 ):
     """Delete persistent log files."""
     cli = TaskmuxCLI()
-    log_dir = projectLogsDir(cli.config.name)
+    log_dir = projectLogsDir(cli.identity.project, cli.worktree_id)
     if not log_dir.exists():
         if is_json_mode():
             print_result({"ok": True, "deleted": 0})
@@ -447,9 +462,9 @@ def logs_clean(
 
         shutil.rmtree(log_dir)
         if is_json_mode():
-            print_result({"ok": True, "session": cli.config.name, "action": "logs_cleaned"})
+            print_result({"ok": True, "session": cli.project_id, "action": "logs_cleaned"})
         else:
-            console.print(f"Deleted all logs for session '{cli.config.name}'")
+            console.print(f"Deleted all logs for session '{cli.project_id}'")
 
 
 @app.command()
@@ -458,8 +473,8 @@ def inspect(
 ):
     """Inspect task state as JSON."""
     cli = TaskmuxCLI()
-    _ensure_session_known(cli.config.name, cli.config_path)
-    data = _call_session("inspect", cli.config.name, task=task)
+    _ensure_session_known(cli.project_id, cli.config_path)
+    data = _call_session("inspect", cli.project_id, task=task)
     if is_json_mode():
         print_result(data)
     else:
@@ -503,7 +518,7 @@ def remove(
     cli = TaskmuxCLI()
     if ipc_client.is_daemon_running():
         with contextlib.suppress(Exception):
-            ipc_client.call("kill", params={"session": cli.config.name, "task": task}, ensure=False)
+            ipc_client.call("kill", params={"session": cli.project_id, "task": task}, ensure=False)
     _, removed = removeTask(None, task)
     if is_json_mode():
         print_result({"ok": removed, "task": task, "action": "removed"})
@@ -516,8 +531,8 @@ def remove(
 def _status():
     """Show session and task status."""
     cli = TaskmuxCLI()
-    _ensure_session_known(cli.config.name, cli.config_path)
-    resp = ipc_client.call("list_tasks", params={"session": cli.config.name})
+    _ensure_session_known(cli.project_id, cli.config_path)
+    resp = ipc_client.call("list_tasks", params={"session": cli.project_id})
     data = resp.get("data", {})
     daemon_pid = get_daemon_pid()
     data["daemon_pid"] = daemon_pid
@@ -528,7 +543,7 @@ def _status():
 
     from .models import RestartPolicy
 
-    session = data.get("session", cli.config.name)
+    session = data.get("session", cli.project_id)
     running = data.get("running", False)
     console.print(f"Session '{session}': {'Running' if running else 'Stopped'}")
     if running:
@@ -586,13 +601,13 @@ def health(
 ):
     """Check health of all tasks via the daemon."""
     cli = TaskmuxCLI()
-    _ensure_session_known(cli.config.name, cli.config_path)
+    _ensure_session_known(cli.project_id, cli.config_path)
 
     healthy_count = 0
     total_count = len(cli.config.tasks)
     tasks_health: list[dict] = []
     for task_name in cli.config.tasks:
-        resp = ipc_client.call("health", params={"session": cli.config.name, "task": task_name})
+        resp = ipc_client.call("health", params={"session": cli.project_id, "task": task_name})
         result = resp.get("result", {})
         ok = bool(result.get("ok"))
         tasks_health.append(
@@ -689,7 +704,7 @@ def url(
         else:
             console.print(f"Task '{task}' has no host set (not exposed via proxy)", style="yellow")
         sys.exit(1)
-    u = taskUrl(cli.config.name, cfg.host)
+    u = taskUrl(cli.project_id, cfg.host)
     if is_json_mode():
         print_result({"ok": True, "task": task, "url": u})
     else:
@@ -954,7 +969,7 @@ def daemon_register(
             console.print(f"Config not found: {cfg_path}", style="red")
         sys.exit(1)
     cli_local = TaskmuxCLI(config_path=cfg_path)
-    entry = registerProject(cli_local.config.name, cli_local.config_path, force=force)
+    entry = registerProject(cli_local.project_id, cli_local.config_path, force=force)
     if is_json_mode():
         print_result({"ok": True, "action": "registered", "entry": dict(entry)})
     else:
@@ -1105,7 +1120,7 @@ def ca_mint():
 
     cli = TaskmuxCLI()
     try:
-        cert, key = mintCert(cli.config.name)
+        cert, key = mintCert(cli.project_id)
     except MkcertMissing as e:
         if is_json_mode():
             print_result({"ok": False, "error": e.message})
@@ -1113,7 +1128,7 @@ def ca_mint():
             console.print(e.message, style="red")
         sys.exit(1)
     if is_json_mode():
-        print_result({"ok": True, "project": cli.config.name, "cert": str(cert), "key": str(key)})
+        print_result({"ok": True, "project": cli.project_id, "cert": str(cert), "key": str(key)})
     else:
         console.print(f"Cert: {cert}")
         console.print(f"Key:  {key}")
@@ -1245,6 +1260,126 @@ def dns_query_cmd(
 
 
 app.add_typer(dns_app)
+
+
+# ---------------------------------------------------------------------------
+# Worktree sub-app — inspect repo/worktree-scoped sessions
+# ---------------------------------------------------------------------------
+
+worktree_app = typer.Typer(
+    name="worktree",
+    help="Inspect git-worktree-scoped sessions for the current repo.",
+    no_args_is_help=True,
+)
+
+
+def _worktreeRowsForRepo(primary_path: Path | None) -> list[dict]:
+    """Cross-reference registry entries against a repo's primary worktree path."""
+    rows: list[dict] = []
+    for entry in listRegistered():
+        cfg_path = Path(entry["config_path"])
+        if not cfg_path.exists():
+            continue
+        try:
+            ident = loadProjectIdentity(cfg_path)
+        except Exception:  # noqa: BLE001
+            continue
+        if primary_path is not None and ident.primary_worktree_path != primary_path:
+            continue
+        rows.append(
+            {
+                "session": entry["session"],
+                "project": ident.project,
+                "worktree": ident.worktree_id,
+                "branch": ident.branch,
+                "path": str(ident.worktree_path) if ident.worktree_path else None,
+                "config_path": entry["config_path"],
+            }
+        )
+    return rows
+
+
+@worktree_app.command("status")
+def worktree_status():
+    """Show the current cwd's project/worktree identity."""
+    cli = TaskmuxCLI()
+    ident = cli.identity
+    payload = {
+        "project": ident.project,
+        "project_id": ident.project_id,
+        "worktree": ident.worktree_id,
+        "branch": ident.branch,
+        "worktree_path": str(ident.worktree_path) if ident.worktree_path else None,
+        "primary_worktree_path": (
+            str(ident.primary_worktree_path) if ident.primary_worktree_path else None
+        ),
+        "is_linked": ident.worktree_id is not None,
+        "config_path": str(ident.config_path),
+    }
+    if is_json_mode():
+        print_result(payload)
+        return
+    console.print(f"Project:    {payload['project']}")
+    console.print(f"Project ID: {payload['project_id']}")
+    console.print(f"Worktree:   {payload['worktree'] or '[dim](primary)[/dim]'}")
+    console.print(f"Branch:     {payload['branch'] or '[dim](detached)[/dim]'}")
+    console.print(f"Path:       {payload['worktree_path'] or '[dim](no repo)[/dim]'}")
+
+
+@worktree_app.command("list")
+def worktree_list():
+    """List all worktrees of the current repo with their session state."""
+    cli = TaskmuxCLI()
+    rows = _worktreeRowsForRepo(cli.identity.primary_worktree_path)
+    if is_json_mode():
+        print_result({"worktrees": rows, "count": len(rows)})
+        return
+    if not rows:
+        console.print("No registered worktrees for this repo.")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Session")
+    table.add_column("Worktree")
+    table.add_column("Branch")
+    table.add_column("Path")
+    for row in rows:
+        table.add_row(
+            row["session"],
+            row["worktree"] or "[dim](primary)[/dim]",
+            row["branch"] or "[dim]—[/dim]",
+            row["path"] or "[dim]—[/dim]",
+        )
+    console.print(table)
+
+
+@worktree_app.command("urls")
+def worktree_urls():
+    """Print proxy URLs for all hosted tasks in the current worktree."""
+    from .url import taskUrl
+
+    cli = TaskmuxCLI()
+    out: list[dict] = []
+    for task_name, task_cfg in cli.config.tasks.items():
+        if task_cfg.host is None:
+            continue
+        out.append(
+            {
+                "task": task_name,
+                "host": task_cfg.host,
+                "url": taskUrl(cli.project_id, task_cfg.host),
+            }
+        )
+    if is_json_mode():
+        print_result({"project_id": cli.project_id, "urls": out})
+        return
+    if not out:
+        console.print("No tasks with `host` set in config.")
+        return
+    for row in out:
+        console.print(f"{row['task']:15} {row['url']}")
+
+
+app.add_typer(worktree_app)
 
 
 def main():

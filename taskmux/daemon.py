@@ -366,7 +366,14 @@ class TaskmuxDaemon:
                 self._unregister_locked(session)
 
     def _register_locked(self, session: str, config_path: Path) -> None:
-        """Load config + create Supervisor. Caller holds self._lock."""
+        """Load config + create Supervisor. Caller holds self._lock.
+
+        `session` is the worktree-aware project_id stored in the registry.
+        We compose project_id locally too and verify they match — mismatch
+        means the registry is stale; we use the registry key.
+        """
+        from .config import loadProjectIdentity
+
         self.config_paths[session] = config_path
 
         if session in self.projects:
@@ -376,19 +383,25 @@ class TaskmuxDaemon:
             self.project_states[session] = "config_missing"
             return
         try:
-            cfg = loadConfig(config_path)
+            identity = loadProjectIdentity(config_path)
         except Exception as e:  # noqa: BLE001
             self.logger.error(f"Failed to load '{session}' from {config_path}: {e}")
             self.project_states[session] = "error"
             return
 
-        if cfg.name != session:
+        cfg = identity.config
+        if identity.project_id != session:
             self.logger.warning(
-                f"Registry session '{session}' != config name '{cfg.name}' "
+                f"Registry session '{session}' != project_id '{identity.project_id}' "
                 f"for {config_path}; using registry key"
             )
 
-        sup = make_supervisor(cfg, config_dir=config_path.parent)
+        sup = make_supervisor(
+            cfg,
+            config_dir=config_path.parent,
+            project_id=session,
+            worktree_id=identity.worktree_id,
+        )
         sup.on_task_route_change = self._on_task_route_change
 
         self.configs[session] = cfg
@@ -403,11 +416,15 @@ class TaskmuxDaemon:
                 )
         if self.host_resolver is not None:
             self._sync_hostnames()
-            new_hosts = [
-                f"{tc.host}.{cfg.name}.{self.global_config.dns_managed_tld}"
-                for tc in cfg.tasks.values()
-                if tc.host is not None
-            ]
+            tld = self.global_config.dns_managed_tld
+            new_hosts: list[str] = []
+            for tc in cfg.tasks.values():
+                if tc.host is None or tc.host == "*":
+                    continue
+                if tc.host == "":
+                    new_hosts.append(f"{session}.{tld}")
+                else:
+                    new_hosts.append(f"{tc.host}.{session}.{tld}")
             if new_hosts and self.host_resolver.name == "etc_hosts":
                 self.logger.info(
                     f"Project '{session}' added with hosts {new_hosts}. "
@@ -571,20 +588,36 @@ class TaskmuxDaemon:
         self.host_resolver = getResolver("dns_server", dns_server=srv)
 
     def _collect_host_mappings(self) -> list[tuple[str, str]]:
+        """Walk the registry; emit (fqdn, 127.0.0.1) for each task host.
+
+        Apex (`""`) emits `{project_id}.{tld}`. Wildcard (`"*"`) is skipped
+        for etc_hosts (no glob support); the `dns_server` resolver answers
+        wildcards in code.
+        """
+        from .config import loadProjectIdentity
+
         mappings: list[tuple[str, str]] = []
+        tld = self.global_config.dns_managed_tld
         for session, entry in readRegistry().items():
             cfg_path = Path(entry["config_path"])
             if not cfg_path.exists():
                 continue
             try:
-                cfg = loadConfig(cfg_path)
+                identity = loadProjectIdentity(cfg_path)
             except Exception as e:  # noqa: BLE001
                 self.logger.warning(f"Skipping host collection for {session!r}: {e}")
                 continue
-            for task_cfg in cfg.tasks.values():
+            project_id = session if session == identity.project_id else identity.project_id
+            for task_cfg in identity.config.tasks.values():
                 if task_cfg.host is None:
                     continue
-                fqdn = f"{task_cfg.host}.{cfg.name}.{self.global_config.dns_managed_tld}"
+                if task_cfg.host == "*":
+                    # Wildcard — only `dns_server` can answer; no static entry.
+                    continue
+                if task_cfg.host == "":
+                    fqdn = f"{project_id}.{tld}"
+                else:
+                    fqdn = f"{task_cfg.host}.{project_id}.{tld}"
                 mappings.append((fqdn, "127.0.0.1"))
         return mappings
 
@@ -995,7 +1028,7 @@ class TaskmuxDaemon:
 
         if command == "logs_clean":
             task = params.get("task")
-            log_dir = projectLogsDir(session)
+            log_dir = projectLogsDir(cfg.name, sup.worktree_id)
             if not log_dir.exists():
                 return {"command": command, "session": session, "deleted": 0}
             if task:

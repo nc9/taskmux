@@ -3,7 +3,13 @@
 from pathlib import Path
 
 from taskmux.config import addTask, configExists, loadConfig, removeTask, writeConfig
-from taskmux.models import HookConfig, RestartPolicy, TaskConfig, TaskmuxConfig
+from taskmux.models import (
+    HookConfig,
+    RestartPolicy,
+    TaskConfig,
+    TaskmuxConfig,
+    WorktreeConfig,
+)
 
 
 class TestConfigExists:
@@ -212,6 +218,92 @@ class TestWriteConfigNewFields:
         assert loaded.tasks["a"].restart_policy == RestartPolicy.NO
         assert loaded.tasks["b"].restart_policy == RestartPolicy.ALWAYS
         assert loaded.tasks["c"].restart_policy == RestartPolicy.ON_FAILURE
+
+
+class TestWriteConfigHostSentinels:
+    """R-001: apex (`@`) must round-trip back to `@` in TOML so the validator
+    accepts the rewritten file. Wildcard (`*`) round-trips trivially."""
+
+    def test_apex_round_trips(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="postpiece",
+            tasks={"website": TaskConfig(command="echo w", host="@")},
+        )
+        # In-memory: normalised to ""
+        assert cfg.tasks["website"].host == ""
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert 'host = "@"' in text
+        assert 'host = ""' not in text  # would fail load
+        loaded = loadConfig(p)
+        assert loaded.tasks["website"].host == ""
+
+    def test_wildcard_round_trips(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="postpiece",
+            tasks={"frontloader": TaskConfig(command="echo f", host="*")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.tasks["frontloader"].host == "*"
+
+    def test_apex_via_addTask_round_trips(self, sample_toml: Path):
+        from taskmux.config import addTask
+
+        addTask(sample_toml, "website", "echo w", host="@")
+        loaded = loadConfig(sample_toml)
+        assert loaded.tasks["website"].host == ""
+        # Sanity: file is itself reload-safe.
+        loadConfig(sample_toml)
+
+
+class TestWriteConfigWorktreeRoundtrip:
+    def test_omits_table_when_all_defaults(self, config_dir: Path):
+        cfg = TaskmuxConfig(name="x", tasks={"a": TaskConfig(command="echo a")})
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        assert "[worktree]" not in p.read_text()
+
+    def test_persists_disabled(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            worktree=WorktreeConfig(enabled=False),
+            tasks={"a": TaskConfig(command="echo a")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert "[worktree]" in text
+        assert "enabled = false" in text
+        loaded = loadConfig(p)
+        assert loaded.worktree.enabled is False
+
+    def test_persists_custom_separator_and_main_branches(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            worktree=WorktreeConfig(separator="--", main_branches=["trunk"]),
+            tasks={"a": TaskConfig(command="echo a")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.worktree.separator == "--"
+        assert loaded.worktree.main_branches == ["trunk"]
+
+    def test_addTask_preserves_worktree_disabled(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="x",
+            worktree=WorktreeConfig(enabled=False),
+            tasks={"a": TaskConfig(command="echo a")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        addTask(p, "new", "echo new")
+        reloaded = loadConfig(p)
+        assert reloaded.worktree.enabled is False
+        assert "new" in reloaded.tasks
 
 
 class TestAddTask:

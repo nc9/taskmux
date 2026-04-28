@@ -54,7 +54,7 @@ def _redirect_logs(sup: PosixSupervisor, tmp_path: Path) -> None:
     """Force log files into tmp_path so tests don't write to ~/.taskmux/."""
     import taskmux.supervisor as supmod
 
-    def fake(session: str, task: str, task_cfg) -> Path:  # type: ignore[no-untyped-def]
+    def fake(session, task, task_cfg, worktree_id=None) -> Path:  # type: ignore[no-untyped-def]
         if task_cfg.log_file:
             return Path(task_cfg.log_file).expanduser()
         return tmp_path / f"{session}__{task}.log"
@@ -523,9 +523,7 @@ class TestConcurrencyGuards:
         _redirect_logs(sup, tmp_path)
 
         async def _go():
-            r1, r2 = await asyncio.gather(
-                sup.start_task("sleeper"), sup.start_task("sleeper")
-            )
+            r1, r2 = await asyncio.gather(sup.start_task("sleeper"), sup.start_task("sleeper"))
             await sup.stop_all()
             return r1, r2
 

@@ -70,12 +70,17 @@ def _parseSince(since_str: str) -> datetime:
     return datetime.now(UTC) - timedelta(seconds=total_seconds)
 
 
-def _logPath(session_name: str, task_name: str, task_cfg: TaskConfig) -> Path:
+def _logPath(
+    project: str,
+    task_name: str,
+    task_cfg: TaskConfig,
+    worktree_id: str | None = None,
+) -> Path:
     if task_cfg.log_file:
         return Path(task_cfg.log_file).expanduser()
     from .paths import taskLogPath
 
-    return taskLogPath(session_name, task_name)
+    return taskLogPath(project, task_name, worktree_id)
 
 
 @dataclass(frozen=True)
@@ -234,6 +239,8 @@ class TaskProcess:
 class Supervisor(Protocol):
     config: TaskmuxConfig
     config_dir: Path | None
+    project_id: str
+    worktree_id: str | None
     assigned_ports: dict[str, int]
     restart_tracker: RestartTracker
     on_task_route_change: Callable[[str, str, str, int | None], None] | None
@@ -267,9 +274,21 @@ class PosixSupervisor:
     behavior than mac (where SIGKILL of the daemon orphans tasks).
     """
 
-    def __init__(self, config: TaskmuxConfig, config_dir: Path | None = None):
+    def __init__(
+        self,
+        config: TaskmuxConfig,
+        config_dir: Path | None = None,
+        project_id: str | None = None,
+        worktree_id: str | None = None,
+    ):
         self.config = config
         self.config_dir = config_dir
+        # `project_id` is the canonical session/registry/URL key. For primary
+        # worktrees it's `config.name`; for linked worktrees it's
+        # `config.name-{worktree_id}`. Defaulted to config.name for callers
+        # that haven't been worktree-aware'd yet.
+        self.project_id: str = project_id or config.name
+        self.worktree_id: str | None = worktree_id
         self._tasks: dict[str, TaskProcess] = {}
         # Per-task lock — serializes start/stop/restart/kill for the same task
         # so two concurrent RPCs can't both pass the "not running" check and
@@ -300,7 +319,7 @@ class PosixSupervisor:
     def _state_path(self) -> Path:
         from .paths import projectStatePath
 
-        return projectStatePath(self.config.name)
+        return projectStatePath(self.config.name, self.worktree_id)
 
     def _load_state(self) -> dict[str, int]:
         try:
@@ -316,7 +335,7 @@ class PosixSupervisor:
     def _save_state(self) -> None:
         from .paths import ensureProjectDir
 
-        ensureProjectDir(self.config.name)
+        ensureProjectDir(self.config.name, self.worktree_id)
         with contextlib.suppress(OSError):
             self._state_path().write_text(
                 json.dumps({"assigned_ports": self.assigned_ports}, indent=2)
@@ -345,7 +364,7 @@ class PosixSupervisor:
         if cfg is None or cfg.host is None:
             return
         with contextlib.suppress(Exception):
-            cb(self.config.name, task_name, cfg.host, port)
+            cb(self.project_id, task_name, cfg.host, port)
 
     def _wrap_command(self, task_name: str, command: str) -> str:
         cfg = self.config.tasks.get(task_name)
@@ -373,7 +392,7 @@ class PosixSupervisor:
     def getLogPath(self, task_name: str) -> Path | None:
         if task_name not in self.config.tasks:
             return None
-        path = _logPath(self.config.name, task_name, self.config.tasks[task_name])
+        path = _logPath(self.config.name, task_name, self.config.tasks[task_name], self.worktree_id)
         return path if path.exists() else None
 
     @staticmethod
@@ -423,7 +442,7 @@ class PosixSupervisor:
         except OSError:
             pgid = proc.pid
 
-        log_path = _logPath(self.config.name, task_name, task_cfg)
+        log_path = _logPath(self.config.name, task_name, task_cfg, self.worktree_id)
         log_writer = LogWriter(log_path, _parseSize(task_cfg.log_max_size), task_cfg.log_max_files)
 
         loop = asyncio.get_running_loop()
@@ -820,13 +839,13 @@ class PosixSupervisor:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
 
         task_cfg = self.config.tasks[task_name]
-        url = taskUrl(self.config.name, task_cfg.host) if task_cfg.host is not None else None
+        url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
         info: dict = {
             "name": task_name,
             "command": task_cfg.command,
             "auto_start": task_cfg.auto_start,
             "restart_policy": str(task_cfg.restart_policy),
-            "log_file": str(_logPath(self.config.name, task_name, task_cfg)),
+            "log_file": str(_logPath(self.config.name, task_name, task_cfg, self.worktree_id)),
             "cwd": task_cfg.cwd,
             "host": task_cfg.host,
             "url": url,
@@ -856,7 +875,7 @@ class PosixSupervisor:
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
             last = self.restart_tracker.last_health(task_name)
-            url = taskUrl(self.config.name, task_cfg.host) if task_cfg.host is not None else None
+            url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
             tasks.append(
                 {
                     "name": task_name,
@@ -1022,10 +1041,20 @@ class PosixSupervisor:
             self.restart_tracker.reset_health_failures(task_name)
 
 
-def make_supervisor(config: TaskmuxConfig, config_dir: Path | None = None) -> Supervisor:
+def make_supervisor(
+    config: TaskmuxConfig,
+    config_dir: Path | None = None,
+    project_id: str | None = None,
+    worktree_id: str | None = None,
+) -> Supervisor:
     sysname = platform.system()
     if sysname in ("Darwin", "Linux"):
-        return PosixSupervisor(config, config_dir=config_dir)
+        return PosixSupervisor(
+            config,
+            config_dir=config_dir,
+            project_id=project_id,
+            worktree_id=worktree_id,
+        )
     raise NotImplementedError(
         f"No Supervisor implementation for platform {sysname!r}. "
         "Posix is supported today; a WindowsSupervisor (ConPTY + Job Objects) "
