@@ -408,13 +408,19 @@ class TestProxyListenerStatusInternals:
         assert info["bound"] is False
         reason = info["reason"] or ""
         assert "isn't running" in reason
+        # Daemon is up; we shouldn't tell the user to "start" it (that hits the
+        # already-running guard). Instead point at restart + the daemon log.
+        assert "start it" not in reason
+        assert "daemon.log" in reason
         # Privileged port → suggest sudo and surface the config option.
         assert "sudo taskmux daemon" in reason
         assert "proxy_https_port" in reason
 
     def test_daemon_view_proxy_not_running_unpriv_port(self):
         # When the configured port is non-privileged the message should NOT
-        # tell the user to use sudo.
+        # tell the user to use sudo, and (since the daemon already responded)
+        # should not say "start it" — restarting + reading the log is the
+        # actual remediation.
         cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
         mgr = _make_manager(cfg)
         with (
@@ -432,7 +438,10 @@ class TestProxyListenerStatusInternals:
         reason = info["reason"] or ""
         assert "sudo" not in reason
         assert "privileged" not in reason
-        assert "taskmux daemon" in reason
+        assert "start it" not in reason
+        assert "restart the daemon" in reason
+        assert "daemon.log" in reason
+        assert "proxy_https_port" in reason
 
     def test_daemon_view_unknown_project_returns_empty_routes(self):
         # Daemon proxy is up but knows nothing about this project — surfaces
@@ -491,6 +500,8 @@ class TestProxyListenerStatusInternals:
         assert info["bound"] is True
 
     def test_daemon_unreachable_falls_back_to_tcp_failure(self):
+        # Daemon is NOT up — fallback path. The hint should tell the user to
+        # start the daemon (the inverse of the daemon-up restart hint).
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         closed_port = s.getsockname()[1]
@@ -507,7 +518,10 @@ class TestProxyListenerStatusInternals:
             mock_cfg.return_value.proxy_bind = "127.0.0.1"
             info = mgr._proxy_listener_status()
         assert info["bound"] is False
-        assert "not bound" in (info["reason"] or "")
+        reason = info["reason"] or ""
+        assert "not bound" in reason
+        assert "start it" in reason  # daemon-down → "start it" wording
+        assert "restart" not in reason
 
     def test_proxy_disabled(self):
         cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})

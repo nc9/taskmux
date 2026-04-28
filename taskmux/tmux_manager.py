@@ -154,20 +154,39 @@ def _find_new_lines(current: list[str], prev_tail: list[str]) -> list[str]:
     return current  # no match, prev scrolled away — return all
 
 
-def _proxyStartHint(port: int) -> str:
-    """Remediation suffix for proxy-down reasons. Tailors the suggestion to
-    whether the configured port is privileged: <1024 needs root, >=1024 just
-    needs the daemon process running. Either way we point at
-    `proxy_https_port` so the user knows the port is configurable.
+def _proxyStartHint(port: int, daemon_up: bool) -> str:
+    """Remediation suffix for proxy-down reasons.
+
+    Two axes:
+    - `port < 1024`: privileged port → suggest sudo; otherwise plain `taskmux daemon`.
+    - `daemon_up`: daemon already responded but proxy isn't running → tell the
+      user to *restart* (with `taskmux daemon` already running, `start` would
+      hit the existing-daemon guard) and to check the daemon log for the
+      bind/CA error. Otherwise the daemon isn't there → tell them to start it.
+    Either way we point at `proxy_https_port` so the user knows the port is
+    configurable.
     """
-    if port < 1024:
-        return (
-            f"run `sudo taskmux daemon` (privileged port :{port} needs root) "
-            f"or set `proxy_https_port` to >=1024 in ~/.taskmux/config.toml"
-        )
-    return (
-        "run `taskmux daemon` to start it (or change `proxy_https_port` in ~/.taskmux/config.toml)"
+    config_hint = (
+        "set `proxy_https_port` to >=1024 in ~/.taskmux/config.toml"
+        if port < 1024
+        else "change `proxy_https_port` in ~/.taskmux/config.toml"
     )
+    if daemon_up:
+        # Daemon answered the WS query but its proxy isn't running — the bind
+        # likely failed at startup. Restarting (after fixing the underlying
+        # issue) is the actual remediation; check the log for the cause.
+        if port < 1024:
+            action = (
+                f"stop the daemon then run `sudo taskmux daemon` "
+                f"(privileged port :{port} needs root); "
+                "check ~/.taskmux/daemon.log for the bind error"
+            )
+        else:
+            action = "restart the daemon and check ~/.taskmux/daemon.log for the bind error"
+        return f"{action} (or {config_hint})"
+    if port < 1024:
+        return f"run `sudo taskmux daemon` (privileged port :{port} needs root) or {config_hint}"
+    return f"run `taskmux daemon` to start it (or {config_hint})"
 
 
 def _probeAddressFor(bind: str) -> str:
@@ -1369,7 +1388,8 @@ class TmuxManager:
                     "bound": False,
                     "port": port,
                     "reason": (
-                        f"daemon is up but proxy isn't running on :{port} — {_proxyStartHint(port)}"
+                        f"daemon is up but proxy isn't running on :{port} — "
+                        f"{_proxyStartHint(port, daemon_up=True)}"
                     ),
                     "routes": None,
                 }
@@ -1388,7 +1408,10 @@ class TmuxManager:
         return {
             "bound": False,
             "port": port,
-            "reason": (f"proxy listener not bound on {bind}:{port} — {_proxyStartHint(port)}"),
+            "reason": (
+                f"proxy listener not bound on {bind}:{port} — "
+                f"{_proxyStartHint(port, daemon_up=False)}"
+            ),
             "routes": None,
         }
 
