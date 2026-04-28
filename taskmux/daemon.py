@@ -802,8 +802,10 @@ class TaskmuxDaemon:
                     snapshot = list(self.projects.items())
                 for session, sup in snapshot:
                     try:
-                        if sup.session_exists():
-                            await sup.auto_restart_tasks()
+                        # No session_exists guard: auto_restart_tasks must
+                        # also revive tasks whose process already exited
+                        # (otherwise they stay dead forever).
+                        await sup.auto_restart_tasks()
                     except Exception as e:  # noqa: BLE001
                         self.logger.error(f"Health check error for '{session}': {e}")
 
