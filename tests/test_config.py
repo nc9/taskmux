@@ -220,6 +220,45 @@ class TestWriteConfigNewFields:
         assert loaded.tasks["c"].restart_policy == RestartPolicy.ON_FAILURE
 
 
+class TestWriteConfigHostSentinels:
+    """R-001: apex (`@`) must round-trip back to `@` in TOML so the validator
+    accepts the rewritten file. Wildcard (`*`) round-trips trivially."""
+
+    def test_apex_round_trips(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="postpiece",
+            tasks={"website": TaskConfig(command="echo w", host="@")},
+        )
+        # In-memory: normalised to ""
+        assert cfg.tasks["website"].host == ""
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        text = p.read_text()
+        assert 'host = "@"' in text
+        assert 'host = ""' not in text  # would fail load
+        loaded = loadConfig(p)
+        assert loaded.tasks["website"].host == ""
+
+    def test_wildcard_round_trips(self, config_dir: Path):
+        cfg = TaskmuxConfig(
+            name="postpiece",
+            tasks={"frontloader": TaskConfig(command="echo f", host="*")},
+        )
+        p = config_dir / "taskmux.toml"
+        writeConfig(p, cfg)
+        loaded = loadConfig(p)
+        assert loaded.tasks["frontloader"].host == "*"
+
+    def test_apex_via_addTask_round_trips(self, sample_toml: Path):
+        from taskmux.config import addTask
+
+        addTask(sample_toml, "website", "echo w", host="@")
+        loaded = loadConfig(sample_toml)
+        assert loaded.tasks["website"].host == ""
+        # Sanity: file is itself reload-safe.
+        loadConfig(sample_toml)
+
+
 class TestWriteConfigWorktreeRoundtrip:
     def test_omits_table_when_all_defaults(self, config_dir: Path):
         cfg = TaskmuxConfig(name="x", tasks={"a": TaskConfig(command="echo a")})

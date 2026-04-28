@@ -617,11 +617,19 @@ class TaskmuxDaemon:
         self.host_resolver = getResolver("dns_server", dns_server=srv)
 
     def _collect_host_mappings(self) -> list[tuple[str, str]]:
-        """Walk the registry; return every (fqdn, 127.0.0.1) for tasks with host."""
+        """Walk the registry; return every (fqdn, 127.0.0.1) the resolver should know.
+
+        Apex (host == "") emits `{project_id}.{tld}`. Wildcard (host == "*") is
+        skipped — `EtcHostsResolver` can't express wildcards; `DnsServerResolver`
+        catch-alls anything in the managed TLD already. We log one warning per
+        sync when both are true (etc_hosts + a wildcard task) so the user knows
+        to switch resolver if they want wildcards to resolve in the browser.
+        """
         from .config import loadProjectIdentity
         from .registry import readRegistry
 
         mappings: list[tuple[str, str]] = []
+        wildcard_under_etc_hosts: list[str] = []
         for session, entry in readRegistry().items():
             cfg_path = Path(entry["config_path"])
             if not cfg_path.exists():
@@ -634,11 +642,25 @@ class TaskmuxDaemon:
             # Registry key is project_id (worktree-aware). Use the same id for
             # the fqdn so DNS / proxy routing match.
             project_id = session if session == identity.project_id else identity.project_id
+            tld = self.global_config.dns_managed_tld
             for task_cfg in identity.config.tasks.values():
                 if task_cfg.host is None:
                     continue
-                fqdn = f"{task_cfg.host}.{project_id}.{self.global_config.dns_managed_tld}"
+                if task_cfg.host == "*":
+                    wildcard_under_etc_hosts.append(project_id)
+                    continue
+                if task_cfg.host == "":
+                    fqdn = f"{project_id}.{tld}"
+                else:
+                    fqdn = f"{task_cfg.host}.{project_id}.{tld}"
                 mappings.append((fqdn, "127.0.0.1"))
+        if wildcard_under_etc_hosts and self.global_config.host_resolver == "etc_hosts":
+            projects = ", ".join(sorted(set(wildcard_under_etc_hosts)))
+            self.logger.warning(
+                f"Wildcard hosts on {projects} won't resolve under host_resolver='etc_hosts' "
+                f"(no wildcard support in /etc/hosts). Switch to host_resolver='dns_server' "
+                f"in ~/.taskmux/config.toml so unmapped subdomains catch-all to 127.0.0.1."
+            )
         return mappings
 
     def _sync_hostnames(self) -> None:

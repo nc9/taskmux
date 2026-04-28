@@ -36,16 +36,24 @@ _HOP_BY_HOP = frozenset(
 
 
 def _parseHost(host_header: str | None) -> tuple[str, str] | None:
-    """Parse '{host}.{project}.localhost[:port]' into (project, host)."""
+    """Parse a host header into (project, host).
+
+    Shapes accepted (all under `.localhost`):
+      - `{project}.localhost`            → (project, "")        # apex
+      - `{host}.{project}.localhost`     → (project, host)      # specific
+      - `a.b.{project}.localhost`        → (project, "a.b")     # multi-label
+    Returns None for `localhost` alone or empty input.
+    """
     if not host_header:
         return None
     bare = host_header.split(":", 1)[0].lower().rstrip(".")
     if not bare.endswith(".localhost"):
         return None
     labels = bare[: -len(".localhost")].split(".")
-    if len(labels) < 2:
+    # Empty bare ("" or ".localhost") would yield [""] — reject.
+    if not labels or labels == [""]:
         return None
-    # Last label = project, everything before it = host (allow 'web-1.api' too)
+    # Last label = project, everything before it = host. Apex → host is "".
     project = labels[-1]
     host = ".".join(labels[:-1])
     return project, host
@@ -174,12 +182,14 @@ class ProxyServer:
         if parsed is None:
             return web.Response(status=400, text="invalid host header\n")
         project, host = parsed
+        # Lookup precedence: exact (project, host) → wildcard (project, "*").
+        # Apex queries arrive with host == "" and never fall through to "*".
         port = self._routes.get((project, host))
+        if port is None and host != "":
+            port = self._routes.get((project, "*"))
         if port is None:
-            return web.Response(
-                status=502,
-                text=f"no upstream for {host}.{project}.localhost\n",
-            )
+            display = f"{host}.{project}.localhost" if host else f"{project}.localhost"
+            return web.Response(status=502, text=f"no upstream for {display}\n")
 
         # WebSocket upgrade?
         if request.headers.get("Upgrade", "").lower() == "websocket":

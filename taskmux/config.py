@@ -211,7 +211,10 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
         if task_cfg.cwd is not None:
             inner.add("cwd", task_cfg.cwd)
         if task_cfg.host is not None:
-            inner.add("host", task_cfg.host)
+            # Apex is stored as "" internally for cheap downstream lookups,
+            # but TOML must round-trip through the validator — `host = ""`
+            # is rejected on load. Write the user-facing sentinel.
+            inner.add("host", "@" if task_cfg.host == "" else task_cfg.host)
         if task_cfg.host_path != "/":
             inner.add("host_path", task_cfg.host_path)
         if task_cfg.health_check is not None:
