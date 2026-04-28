@@ -489,9 +489,7 @@ class TaskmuxDaemon:
             return
         needs_priv: list[str] = []
         if self.global_config.proxy_https_port < 1024:
-            needs_priv.append(
-                f"binding the proxy on :{self.global_config.proxy_https_port}"
-            )
+            needs_priv.append(f"binding the proxy on :{self.global_config.proxy_https_port}")
         if self.global_config.host_resolver in ("etc_hosts", "dns_server"):
             target = (
                 "/etc/hosts"
