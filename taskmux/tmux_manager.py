@@ -152,8 +152,13 @@ def _find_new_lines(current: list[str], prev_tail: list[str]) -> list[str]:
 class TmuxManager:
     """Manages tmux sessions and tasks using libtmux API."""
 
-    def __init__(self, config: TaskmuxConfig):
+    def __init__(self, config: TaskmuxConfig, config_dir: Path | None = None):
         self.config = config
+        # Directory of the taskmux.toml — used as the base for resolving
+        # relative `cwd` fields. Without this, cwd would be interpreted
+        # against the daemon's process cwd (or tmux server cwd), which is
+        # whatever directory `sudo taskmux daemon` happened to be run from.
+        self.config_dir = config_dir
         self.server = libtmux.Server()
         self.session: libtmux.Session | None = None
         self.task_health: dict = {}
@@ -161,6 +166,17 @@ class TmuxManager:
         self.assigned_ports: dict[str, int] = self._load_state()
         self.on_task_route_change: Callable[[str, str, str, int | None], None] | None = None
         self._refresh_session()
+
+    def _resolve_cwd(self, cwd: str | None) -> str | None:
+        """Make a task's cwd absolute, anchored at the config file's directory."""
+        if not cwd:
+            return cwd
+        p = Path(cwd).expanduser()
+        if p.is_absolute():
+            return str(p)
+        if self.config_dir is not None:
+            return str((self.config_dir / p).resolve())
+        return str(p)
 
     # ---- state persistence (assigned ports) ----
 
@@ -554,18 +570,19 @@ class TmuxManager:
         if len(sess.windows) == 1 and sess.windows[0].window_name != task_name:
             default = sess.windows[0]
             # Only reuse if it's the placeholder default window
+            cwd_abs = self._resolve_cwd(task_cfg.cwd)
             if default.window_name in ("bash", "zsh", "sh", "fish"):
                 default.rename_window(task_name)
                 pane = default.active_pane
                 if pane:
-                    if task_cfg.cwd:
-                        pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
+                    if cwd_abs:
+                        pane.send_keys(f"cd {shlex.quote(cwd_abs)}", enter=True)
                     pane.send_keys(wrapped, enter=True)
                     self._attach_log_pipe(pane, task_name)
             else:
-                self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
+                self._send_command_to_window(sess, task_name, wrapped, cwd_abs)
         else:
-            self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
+            self._send_command_to_window(sess, task_name, wrapped, self._resolve_cwd(task_cfg.cwd))
 
         runHook(task_cfg.hooks.after_start, task_name)
         runHook(self.config.hooks.after_start, task_name)
@@ -684,19 +701,20 @@ class TmuxManager:
 
             wrapped = self._wrap_command(task_name, task_cfg.command)
 
+            cwd_abs = self._resolve_cwd(task_cfg.cwd)
             if first and sess.windows:
                 # First task reuses default window
                 default_window = sess.windows[0]
                 default_window.rename_window(task_name)
                 pane = default_window.active_pane
                 if pane:
-                    if task_cfg.cwd:
-                        pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
+                    if cwd_abs:
+                        pane.send_keys(f"cd {shlex.quote(cwd_abs)}", enter=True)
                     pane.send_keys(wrapped, enter=True)
                     self._attach_log_pipe(pane, task_name)
                 first = False
             else:
-                self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
+                self._send_command_to_window(sess, task_name, wrapped, cwd_abs)
 
             runHook(task_cfg.hooks.after_start, task_name)
             if task_cfg.host is not None:
@@ -822,12 +840,13 @@ class TmuxManager:
                 self._cleanup_port(prior_port)
 
             wrapped = self._wrap_command(task_name, task_cfg.command)
+            cwd_abs = self._resolve_cwd(task_cfg.cwd)
 
             runHook(task_cfg.hooks.before_start, task_name)
             pane = window.active_pane
             if pane:
-                if task_cfg.cwd:
-                    pane.send_keys(f"cd {task_cfg.cwd}", enter=True)
+                if cwd_abs:
+                    pane.send_keys(f"cd {shlex.quote(cwd_abs)}", enter=True)
                 pane.send_keys(wrapped, enter=True)
                 self._attach_log_pipe(pane, task_name)
             runHook(task_cfg.hooks.after_start, task_name)
@@ -837,7 +856,7 @@ class TmuxManager:
                 self._cleanup_port(prior_port)
             wrapped = self._wrap_command(task_name, task_cfg.command)
             runHook(task_cfg.hooks.before_start, task_name)
-            self._send_command_to_window(sess, task_name, wrapped, task_cfg.cwd)
+            self._send_command_to_window(sess, task_name, wrapped, self._resolve_cwd(task_cfg.cwd))
             runHook(task_cfg.hooks.after_start, task_name)
 
         if task_cfg.host is not None:

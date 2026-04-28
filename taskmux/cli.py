@@ -91,7 +91,7 @@ class TaskmuxCLI:
     def __init__(self, config_path: Path | None = None):
         self.config_path: Path = (config_path or Path("taskmux.toml")).expanduser().resolve()
         self.config: TaskmuxConfig = loadConfig(self.config_path)
-        self.tmux = TmuxManager(self.config)
+        self.tmux = TmuxManager(self.config, config_dir=self.config_path.parent)
 
     def reload_config(self) -> None:
         """Reload config from self.config_path and rebind tmux manager."""

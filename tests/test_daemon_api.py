@@ -20,7 +20,7 @@ from taskmux import registry as reg
 class FakeTmuxManager:
     """Minimal stand-in for TmuxManager — no real tmux contact."""
 
-    def __init__(self, config):
+    def __init__(self, config, config_dir=None):  # noqa: ARG002
         self.config = config
         self.session = None
 
@@ -244,7 +244,7 @@ def test_resync_reconciles_routes_from_disk(isolated, tmp_path: Path):
         """Adds the assigned_ports + reload_state + window-list surface that
         real TmuxManager exposes — but no actual tmux contact."""
 
-        def __init__(self, config):
+        def __init__(self, config, config_dir=None):  # noqa: ARG002
             self.config = config
             self.assigned_ports: dict[str, int] = {}
             self._windows: list[str] = []
