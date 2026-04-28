@@ -210,6 +210,11 @@ class TestLastHealthRecorded:
         assert task["last_health"]["ok"] is True
 
 
+# Tests use a non-privileged port so they never depend on :443 being free
+# or root being available. Production default stays at 443.
+TEST_PROXY_PORT = 18443
+
+
 class TestProxyListenerEnrichment:
     """list_tasks() flips healthy=false when a host-routed task's proxy isn't bound."""
 
@@ -236,8 +241,12 @@ class TestProxyListenerEnrichment:
             "_proxy_listener_status",
             return_value={
                 "bound": False,
-                "port": 443,
-                "reason": "proxy listener not bound on 127.0.0.1:443 — run `sudo taskmux daemon`",
+                "port": TEST_PROXY_PORT,
+                "reason": (
+                    f"proxy listener not bound on 127.0.0.1:{TEST_PROXY_PORT} — "
+                    "run `taskmux daemon` to start it"
+                ),
+                "routes": None,
             },
         ):
             data = mgr.list_tasks()
@@ -253,7 +262,14 @@ class TestProxyListenerEnrichment:
         mgr = self._running_manager(cfg)
         mgr.assigned_ports["web"] = port
         with patch.object(
-            mgr, "_proxy_listener_status", return_value={"bound": True, "port": 443, "reason": None}
+            mgr,
+            "_proxy_listener_status",
+            return_value={
+                "bound": True,
+                "port": TEST_PROXY_PORT,
+                "reason": None,
+                "routes": None,
+            },
         ):
             data = mgr.list_tasks()
         task = data["tasks"][0]
@@ -283,7 +299,12 @@ class TestProxyListenerEnrichment:
         with patch.object(
             mgr,
             "_proxy_listener_status",
-            return_value={"bound": False, "port": 443, "reason": "proxy down"},
+            return_value={
+                "bound": False,
+                "port": TEST_PROXY_PORT,
+                "reason": "proxy down",
+                "routes": None,
+            },
         ):
             data = mgr.list_tasks()
         task = data["tasks"][0]
@@ -304,7 +325,12 @@ class TestProxyListenerEnrichment:
         with patch.object(
             mgr,
             "_proxy_listener_status",
-            return_value={"bound": True, "port": 443, "reason": None, "routes": {}},
+            return_value={
+                "bound": True,
+                "port": TEST_PROXY_PORT,
+                "reason": None,
+                "routes": {},
+            },
         ):
             data = mgr.list_tasks()
         task = data["tasks"][0]
@@ -328,7 +354,7 @@ class TestProxyListenerEnrichment:
             "_proxy_listener_status",
             return_value={
                 "bound": True,
-                "port": 443,
+                "port": TEST_PROXY_PORT,
                 "reason": None,
                 "routes": {"api": port},
             },
@@ -345,30 +371,68 @@ class TestProxyListenerStatusInternals:
     def test_daemon_view_running_with_route(self):
         cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
         mgr = _make_manager(cfg)
-        with patch.object(
-            mgr,
-            "_query_daemon_proxy_routes",
-            return_value={
-                "command": "proxy_routes",
-                "running": True,
-                "routes": {"demo": {"api": 5000}},
-            },
+        with (
+            patch.object(
+                mgr,
+                "_query_daemon_proxy_routes",
+                return_value={
+                    "command": "proxy_routes",
+                    "running": True,
+                    "routes": {"demo": {"api": 5000}},
+                },
+            ),
+            patch("taskmux.global_config.loadGlobalConfig") as mock_cfg,
         ):
+            mock_cfg.return_value.proxy_enabled = True
+            mock_cfg.return_value.proxy_https_port = TEST_PROXY_PORT
+            mock_cfg.return_value.proxy_bind = "127.0.0.1"
             info = mgr._proxy_listener_status()
         assert info["bound"] is True
         assert info["routes"] == {"api": 5000}
 
-    def test_daemon_view_proxy_not_running(self):
+    def test_daemon_view_proxy_not_running_priv_port(self):
         cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
         mgr = _make_manager(cfg)
-        with patch.object(
-            mgr,
-            "_query_daemon_proxy_routes",
-            return_value={"command": "proxy_routes", "running": False, "routes": {}},
+        with (
+            patch.object(
+                mgr,
+                "_query_daemon_proxy_routes",
+                return_value={"command": "proxy_routes", "running": False, "routes": {}},
+            ),
+            patch("taskmux.global_config.loadGlobalConfig") as mock_cfg,
         ):
+            mock_cfg.return_value.proxy_enabled = True
+            mock_cfg.return_value.proxy_https_port = 443
+            mock_cfg.return_value.proxy_bind = "127.0.0.1"
             info = mgr._proxy_listener_status()
         assert info["bound"] is False
-        assert "isn't running" in (info["reason"] or "")
+        reason = info["reason"] or ""
+        assert "isn't running" in reason
+        # Privileged port → suggest sudo and surface the config option.
+        assert "sudo taskmux daemon" in reason
+        assert "proxy_https_port" in reason
+
+    def test_daemon_view_proxy_not_running_unpriv_port(self):
+        # When the configured port is non-privileged the message should NOT
+        # tell the user to use sudo.
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with (
+            patch.object(
+                mgr,
+                "_query_daemon_proxy_routes",
+                return_value={"command": "proxy_routes", "running": False, "routes": {}},
+            ),
+            patch("taskmux.global_config.loadGlobalConfig") as mock_cfg,
+        ):
+            mock_cfg.return_value.proxy_enabled = True
+            mock_cfg.return_value.proxy_https_port = TEST_PROXY_PORT
+            mock_cfg.return_value.proxy_bind = "127.0.0.1"
+            info = mgr._proxy_listener_status()
+        reason = info["reason"] or ""
+        assert "sudo" not in reason
+        assert "privileged" not in reason
+        assert "taskmux daemon" in reason
 
     def test_daemon_view_unknown_project_returns_empty_routes(self):
         # Daemon proxy is up but knows nothing about this project — surfaces
@@ -376,15 +440,21 @@ class TestProxyListenerStatusInternals:
         # route per task.
         cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
         mgr = _make_manager(cfg)
-        with patch.object(
-            mgr,
-            "_query_daemon_proxy_routes",
-            return_value={
-                "command": "proxy_routes",
-                "running": True,
-                "routes": {"other": {"api": 1234}},
-            },
+        with (
+            patch.object(
+                mgr,
+                "_query_daemon_proxy_routes",
+                return_value={
+                    "command": "proxy_routes",
+                    "running": True,
+                    "routes": {"other": {"api": 1234}},
+                },
+            ),
+            patch("taskmux.global_config.loadGlobalConfig") as mock_cfg,
         ):
+            mock_cfg.return_value.proxy_enabled = True
+            mock_cfg.return_value.proxy_https_port = TEST_PROXY_PORT
+            mock_cfg.return_value.proxy_bind = "127.0.0.1"
             info = mgr._proxy_listener_status()
         assert info["bound"] is True
         assert info["routes"] == {}
@@ -403,6 +473,22 @@ class TestProxyListenerStatusInternals:
             info = mgr._proxy_listener_status()
         assert info["bound"] is True
         assert info["routes"] is None  # unknown — daemon view wasn't available
+
+    def test_wildcard_bind_probes_loopback(self, http_server):
+        # http_server listens on 127.0.0.1. With proxy_bind=0.0.0.0 (LAN
+        # exposure), we can't connect() to 0.0.0.0 — must probe loopback.
+        port, _ = http_server
+        cfg = _make_config(name="demo", tasks={"api": {"command": "echo", "host": "api"}})
+        mgr = _make_manager(cfg)
+        with (
+            patch.object(mgr, "_query_daemon_proxy_routes", return_value=None),
+            patch("taskmux.global_config.loadGlobalConfig") as mock_cfg,
+        ):
+            mock_cfg.return_value.proxy_enabled = True
+            mock_cfg.return_value.proxy_https_port = port
+            mock_cfg.return_value.proxy_bind = "0.0.0.0"
+            info = mgr._proxy_listener_status()
+        assert info["bound"] is True
 
     def test_daemon_unreachable_falls_back_to_tcp_failure(self):
         s = socket.socket()
@@ -428,7 +514,7 @@ class TestProxyListenerStatusInternals:
         mgr = _make_manager(cfg)
         with patch("taskmux.global_config.loadGlobalConfig") as mock_cfg:
             mock_cfg.return_value.proxy_enabled = False
-            mock_cfg.return_value.proxy_https_port = 443
+            mock_cfg.return_value.proxy_https_port = TEST_PROXY_PORT
             mock_cfg.return_value.proxy_bind = "127.0.0.1"
             info = mgr._proxy_listener_status()
         assert info["bound"] is False

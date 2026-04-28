@@ -154,6 +154,36 @@ def _find_new_lines(current: list[str], prev_tail: list[str]) -> list[str]:
     return current  # no match, prev scrolled away — return all
 
 
+def _proxyStartHint(port: int) -> str:
+    """Remediation suffix for proxy-down reasons. Tailors the suggestion to
+    whether the configured port is privileged: <1024 needs root, >=1024 just
+    needs the daemon process running. Either way we point at
+    `proxy_https_port` so the user knows the port is configurable.
+    """
+    if port < 1024:
+        return (
+            f"run `sudo taskmux daemon` (privileged port :{port} needs root) "
+            f"or set `proxy_https_port` to >=1024 in ~/.taskmux/config.toml"
+        )
+    return (
+        "run `taskmux daemon` to start it (or change `proxy_https_port` in ~/.taskmux/config.toml)"
+    )
+
+
+def _probeAddressFor(bind: str) -> str:
+    """Return the address to *connect* to when verifying a listener on `bind`.
+
+    Wildcard binds (0.0.0.0 / :: / empty) aren't valid connect targets — they
+    mean "any interface". Map them to the matching loopback so the probe still
+    confirms something is listening locally.
+    """
+    if bind in ("0.0.0.0", ""):
+        return "127.0.0.1"
+    if bind in ("::", "::0"):
+        return "::1"
+    return bind
+
+
 class TmuxManager:
     """Manages tmux sessions and tasks using libtmux API."""
 
@@ -1323,6 +1353,7 @@ class TmuxManager:
 
         gc = loadGlobalConfig()
         port = gc.proxy_https_port
+        bind = gc.proxy_bind
         if not gc.proxy_enabled:
             return {
                 "bound": False,
@@ -1338,8 +1369,7 @@ class TmuxManager:
                     "bound": False,
                     "port": port,
                     "reason": (
-                        f"daemon is up but proxy isn't running on :{port} — "
-                        f"run `sudo taskmux daemon` (privileged port needs root)"
+                        f"daemon is up but proxy isn't running on :{port} — {_proxyStartHint(port)}"
                     ),
                     "routes": None,
                 }
@@ -1347,17 +1377,18 @@ class TmuxManager:
             return {"bound": True, "port": port, "reason": None, "routes": project_routes}
 
         # Daemon WS unreachable. Fall back to a TCP probe so we still catch
-        # the "nothing listening on :443" case (the original OddJob bug).
-        result = self._probe_tcp(port, timeout=0.5, host=gc.proxy_bind)
+        # the "nothing listening on the proxy port" case (the original OddJob
+        # bug, which manifested with the default :443). When `bind` is a
+        # wildcard (0.0.0.0/::), we can't connect() to it directly — probe
+        # the matching loopback instead.
+        probe_addr = _probeAddressFor(bind)
+        result = self._probe_tcp(port, timeout=0.5, host=probe_addr)
         if result.ok:
             return {"bound": True, "port": port, "reason": None, "routes": None}
         return {
             "bound": False,
             "port": port,
-            "reason": (
-                f"proxy listener not bound on {gc.proxy_bind}:{port} — "
-                f"run `sudo taskmux daemon` (privileged port needs root)"
-            ),
+            "reason": (f"proxy listener not bound on {bind}:{port} — {_proxyStartHint(port)}"),
             "routes": None,
         }
 

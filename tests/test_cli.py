@@ -250,7 +250,14 @@ class TestRemoveCommand:
 class TestStatusProxyWarning:
     """Status renders a top-level warning when the proxy listener isn't bound."""
 
-    def _list_tasks_payload(self, *, proxy_bound: bool) -> dict:
+    # Use a non-priv test port so fixtures don't hard-code the production
+    # default of :443 (which requires root and would mask config drift).
+    TEST_PROXY_PORT = 18443
+
+    def _list_tasks_payload(self, *, proxy_bound: bool, port: int = TEST_PROXY_PORT) -> dict:
+        unbound_reason = (
+            f"proxy listener not bound on 127.0.0.1:{port} — run `taskmux daemon` to start it"
+        )
         return {
             "session": "demo",
             "project": "demo",
@@ -276,10 +283,7 @@ class TestStatusProxyWarning:
                         else {
                             "ok": False,
                             "method": "proxy",
-                            "reason": (
-                                "proxy listener not bound on 127.0.0.1:443 "
-                                "— run `sudo taskmux daemon`"
-                            ),
+                            "reason": unbound_reason,
                             "at": 0.0,
                         }
                     ),
@@ -287,12 +291,8 @@ class TestStatusProxyWarning:
             ],
             "proxy": {
                 "bound": proxy_bound,
-                "port": 443,
-                "reason": (
-                    None
-                    if proxy_bound
-                    else "proxy listener not bound on 127.0.0.1:443 — run `sudo taskmux daemon`"
-                ),
+                "port": port,
+                "reason": None if proxy_bound else unbound_reason,
             },
         }
 
@@ -308,7 +308,7 @@ class TestStatusProxyWarning:
         assert result.exit_code == 0
         assert "Proxy:" in result.output
         assert "not bound" in result.output
-        assert "sudo taskmux daemon" in result.output
+        assert "taskmux daemon" in result.output
         # Per-task fail line also rendered
         assert "fail: proxy" in result.output
 
