@@ -87,15 +87,21 @@ class TestConfigValidation:
         cfg = TaskConfig(command="bun dev", host="api", public_hostname=" API.example.com. ")
         assert cfg.public_hostname == "api.example.com"
 
-    def test_project_requires_zone_id_when_tunneling(self):
+    def test_project_zone_id_is_optional_when_tunneling(self):
+        # Cascade: project may omit zone_id; global default or auto-resolution
+        # from public_hostname covers it. Validation still passes.
         task = TaskConfig(
             command="bun dev",
             host="api",
             tunnel=TunnelKind.CLOUDFLARE,
             public_hostname="api.example.com",
         )
+        cfg = TaskmuxConfig(name="proj", tasks={"api": task})
+        assert cfg.tunnel.cloudflare.zone_id is None
+
+    def test_api_token_rejected_at_project_level(self):
         with pytest.raises(TaskmuxError):
-            TaskmuxConfig(name="proj", tasks={"api": task})
+            CloudflareTunnelProjectConfig(api_token="leaked")  # type: ignore[call-arg]
 
     def test_project_with_zone_id_validates(self):
         task = TaskConfig(

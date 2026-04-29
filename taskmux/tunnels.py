@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -46,6 +47,83 @@ from .paths import tunnelStateDir
 TunnelMapping = tuple[str, str, int]
 
 _CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
+
+
+@dataclass(frozen=True)
+class EffectiveCloudflareConfig:
+    """Cascade-resolved Cloudflare config + per-field provenance.
+
+    Field provenance maps to one of: ``"global"`` (~/.taskmux/config.toml),
+    ``"project"`` (taskmux.toml), ``"env"`` (only ``api_token`` via
+    ``api_token_env``), ``"auto"`` (zone resolved from the public_hostname
+    apex), or ``"default"`` (built-in fallback).
+    """
+
+    account_id: str | None
+    zone_id: str | None
+    tunnel_name: str
+    api_token: str | None
+    sources: dict[str, str]
+
+
+def resolveCloudflareConfig(
+    *,
+    global_cf,
+    project_cf,
+    project_id: str,
+    api_token_override: str | None = None,
+) -> EffectiveCloudflareConfig:
+    """Cascade global → project → env, returning the effective config + sources.
+
+    Token resolution order (first hit wins):
+      1. ``api_token_override`` (callers like the wizard pass a freshly-prompted token)
+      2. global ``api_token`` (embedded in ~/.taskmux/config.toml; mode 0600)
+      3. environment variable named by ``api_token_env`` (default CLOUDFLARE_API_TOKEN)
+    """
+    sources: dict[str, str] = {}
+
+    account_id = global_cf.account_id
+    if account_id is not None:
+        sources["account_id"] = "global"
+
+    zone_id = project_cf.zone_id
+    if zone_id is not None:
+        sources["zone_id"] = "project"
+    elif global_cf.zone_id is not None:
+        zone_id = global_cf.zone_id
+        sources["zone_id"] = "global"
+
+    if project_cf.tunnel_name:
+        tunnel_name = project_cf.tunnel_name
+        sources["tunnel_name"] = "project"
+    elif global_cf.tunnel_name:
+        tunnel_name = global_cf.tunnel_name
+        sources["tunnel_name"] = "global"
+    else:
+        tunnel_name = f"taskmux-{project_id}"
+        sources["tunnel_name"] = "default"
+
+    api_token: str | None = None
+    if api_token_override:
+        api_token = api_token_override
+        sources["api_token"] = "override"
+    elif global_cf.api_token:
+        api_token = global_cf.api_token
+        sources["api_token"] = "global"
+    else:
+        env_name = global_cf.api_token_env or "CLOUDFLARE_API_TOKEN"
+        env_val = os.environ.get(env_name)
+        if env_val:
+            api_token = env_val
+            sources["api_token"] = "env"
+
+    return EffectiveCloudflareConfig(
+        account_id=account_id,
+        zone_id=zone_id,
+        tunnel_name=tunnel_name,
+        api_token=api_token,
+        sources=sources,
+    )
 
 
 @runtime_checkable

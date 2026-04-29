@@ -7,11 +7,17 @@ Example ~/.taskmux/config.toml:
     health_check_interval = 30
     api_port = 8765
 
+    [tunnel.cloudflare]
+    account_id = "abcd..."
+    zone_id    = "ef56..."
+    api_token  = "cf-pat-..."     # OR api_token_env = "CLOUDFLARE_API_TOKEN"
+
 Schema is intentionally small — extend as new global knobs become useful.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 import warnings
@@ -28,6 +34,58 @@ from .paths import ensureTaskmuxDir, globalConfigPath
 # Deliberately strict — the value flows into /etc/resolver paths and
 # PowerShell command strings.
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+class CloudflareGlobalConfig(BaseModel):
+    """Cloudflare-Tunnel defaults shared by every project on this host.
+
+    Same shape as the per-project `[tunnel.cloudflare]` block — project values
+    override these one field at a time. Token never lives in project (git-tracked)
+    config; embed it here OR point at an env var.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    account_id: str | None = Field(
+        default=None,
+        description="Cloudflare account UUID. Required for any project that tunnels.",
+    )
+    zone_id: str | None = Field(
+        default=None,
+        description=(
+            "Default DNS zone for `public_hostname`. Per-project [tunnel.cloudflare] "
+            "or auto-resolution from the public_hostname's apex can override."
+        ),
+    )
+    tunnel_name: str | None = Field(
+        default=None,
+        description=(
+            "Default cfd_tunnel name. When unset, each project gets `taskmux-{project_id}`."
+        ),
+    )
+    api_token: str | None = Field(
+        default=None,
+        description=(
+            "Cloudflare API token, embedded. Requires ~/.taskmux/config.toml "
+            "to be mode 0600 — daemon refuses to read it otherwise. Prefer this "
+            "over api_token_env when running daemon under sudo (no `-E` needed)."
+        ),
+    )
+    api_token_env: str = Field(
+        default="CLOUDFLARE_API_TOKEN",
+        description=(
+            "Fallback when api_token is unset: name of the env var holding the token. "
+            "Token needs scopes `Account.Cloudflare Tunnel: Edit` and `Zone.DNS: Edit`."
+        ),
+    )
+
+
+class TunnelGlobalConfig(BaseModel):
+    """Container for per-backend defaults. One sub-block per supported provider."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    cloudflare: CloudflareGlobalConfig = Field(default_factory=lambda: CloudflareGlobalConfig())
 
 
 class GlobalConfig(BaseModel):
@@ -107,23 +165,9 @@ class GlobalConfig(BaseModel):
         ),
     )
 
-    cloudflare_account_id: str | None = Field(
-        default=None,
-        description=(
-            "Cloudflare account ID used for any project with "
-            '`tunnel = "cloudflare"`. Find it in dash.cloudflare.com → '
-            "any zone → right sidebar."
-        ),
-    )
-    cloudflare_api_token_env: str = Field(
-        default="CLOUDFLARE_API_TOKEN",
-        description=(
-            "Name of the environment variable holding the Cloudflare API token. "
-            "Token needs scopes `Account.Cloudflare Tunnel: Edit` and "
-            "`Zone.DNS: Edit` for the relevant zone(s). Read at daemon start; "
-            "if unset, the cloudflare backend is disabled and tunneled tasks "
-            "still serve locally."
-        ),
+    tunnel: TunnelGlobalConfig = Field(
+        default_factory=lambda: TunnelGlobalConfig(),
+        description="Default tunnel-provider settings. Project [tunnel.*] blocks override.",
     )
 
     @field_validator("dns_managed_tld")
@@ -154,6 +198,21 @@ def loadGlobalConfig(path: Path | None = None) -> GlobalConfig:
     except tomllib.TOMLDecodeError as e:
         raise TaskmuxError(ErrorCode.CONFIG_PARSE_ERROR, path=str(p), detail=str(e)) from e
 
+    # Backwards compat: pre-cascade flat keys (cloudflare_account_id /
+    # cloudflare_api_token_env) are folded into the nested [tunnel.cloudflare]
+    # block if present and not already set there.
+    if "cloudflare_account_id" in raw or "cloudflare_api_token_env" in raw:
+        legacy_account = raw.pop("cloudflare_account_id", None)
+        legacy_token_env = raw.pop("cloudflare_api_token_env", None)
+        tunnel_block = dict(raw.get("tunnel", {}) or {})
+        cf_block = dict(tunnel_block.get("cloudflare", {}) or {})
+        if legacy_account and not cf_block.get("account_id"):
+            cf_block["account_id"] = legacy_account
+        if legacy_token_env and not cf_block.get("api_token_env"):
+            cf_block["api_token_env"] = legacy_token_env
+        tunnel_block["cloudflare"] = cf_block
+        raw["tunnel"] = tunnel_block
+
     known = set(GlobalConfig.model_fields.keys())
     unknown = set(raw.keys()) - known
     if unknown:
@@ -168,27 +227,126 @@ def loadGlobalConfig(path: Path | None = None) -> GlobalConfig:
         raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=str(e)) from e
 
 
+def hasEmbeddedToken(config: GlobalConfig) -> bool:
+    """Whether the in-memory config carries a Cloudflare API token directly."""
+    return bool(config.tunnel.cloudflare.api_token)
+
+
+def globalConfigModeOk(path: Path | None = None) -> tuple[bool, int | None]:
+    """Return (ok, mode). True when reading the file is safe.
+
+    Reading is safe when either:
+      - the file doesn't exist, or
+      - the file does NOT embed a token (no secret to leak), or
+      - the file is mode 0600 or stricter.
+
+    Used as a safety rail by the daemon before reading an embedded token, and
+    by `taskmux tunnel config` for display.
+    """
+    p = path or globalConfigPath()
+    if not p.exists():
+        return True, None
+    try:
+        mode = p.stat().st_mode & 0o777
+    except OSError:
+        return True, None
+    try:
+        raw = tomllib.loads(p.read_text())
+    except (tomllib.TOMLDecodeError, OSError):
+        # If we can't parse it, defer to mode check — strict path.
+        return mode == 0o600, mode
+    has_token = bool(((raw.get("tunnel") or {}).get("cloudflare") or {}).get("api_token"))
+    if not has_token:
+        return True, mode
+    # Mask: only the user bits should be set; group/other read or write fails.
+    return (mode & 0o077) == 0, mode
+
+
+def _scrubNones(d: dict) -> dict:
+    """Recursively drop keys whose value is None — tomlkit can't represent them."""
+    out = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, dict):
+            scrubbed = _scrubNones(v)
+            out[k] = scrubbed
+        else:
+            out[k] = v
+    return out
+
+
+def _writeTunnelTable(tunnel: TunnelGlobalConfig):  # type: ignore[no-untyped-def]
+    cf = tunnel.cloudflare
+    cf_dump = _scrubNones(cf.model_dump())
+    # Suppress the api_token_env default — only emit when overridden.
+    if cf_dump.get("api_token_env") == "CLOUDFLARE_API_TOKEN" and "api_token" not in cf_dump:
+        cf_dump.pop("api_token_env", None)
+    if not cf_dump:
+        return None
+    outer = tomlkit.table()
+    inner = tomlkit.table()
+    for k, v in cf_dump.items():
+        inner.add(k, v)
+    outer.add("cloudflare", inner)
+    return outer
+
+
 def writeGlobalConfig(config: GlobalConfig, path: Path | None = None) -> Path:
-    """Write the config back to ~/.taskmux/config.toml (preserves formatting)."""
+    """Write the config back to ~/.taskmux/config.toml.
+
+    When the cloudflare api_token is embedded, the file is chmodded 0600 — the
+    daemon refuses to read it otherwise. Always write atomically via temp file.
+    """
     p = path or globalConfigPath()
     ensureTaskmuxDir()
     doc = tomlkit.document()
-    for field, value in config.model_dump().items():
-        # tomlkit can't represent `None`; defaults of None mean "unset", so skip.
+    flat = config.model_dump()
+    flat.pop("tunnel", None)
+    for field, value in flat.items():
         if value is None:
             continue
         doc.add(field, value)
-    p.write_text(tomlkit.dumps(doc))
+    tun_tbl = _writeTunnelTable(config.tunnel)
+    if tun_tbl is not None:
+        doc.add(tomlkit.nl())
+        doc.add("tunnel", tun_tbl)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(tomlkit.dumps(doc))
+    os.replace(tmp, p)
+    if hasEmbeddedToken(config):
+        with _suppress_oserror():
+            os.chmod(p, 0o600)
     return p
 
 
 def updateGlobalConfig(updates: dict[str, Any]) -> GlobalConfig:
-    """Read, merge updates, validate, write. Returns the new config."""
+    """Read, merge updates (dotted-path or top-level), validate, write.
+
+    `updates` may use dotted paths like {"tunnel.cloudflare.zone_id": "..."} or
+    nested dicts {"tunnel": {"cloudflare": {"zone_id": "..."}}}. Both are merged.
+    """
     current = loadGlobalConfig().model_dump()
-    current.update(updates)
+    for key, value in updates.items():
+        if "." in key:
+            target = current
+            parts = key.split(".")
+            for part in parts[:-1]:
+                target = target.setdefault(part, {})
+            target[parts[-1]] = value
+        elif isinstance(value, dict) and isinstance(current.get(key), dict):
+            current[key] = {**current[key], **value}
+        else:
+            current[key] = value
     try:
         new = GlobalConfig(**current)
     except ValidationError as e:
         raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=str(e)) from e
     writeGlobalConfig(new)
     return new
+
+
+def _suppress_oserror():
+    import contextlib as _c
+
+    return _c.suppress(OSError)

@@ -199,20 +199,35 @@ class WorktreeConfig(_StrictConfig):
 
 
 class CloudflareTunnelProjectConfig(_StrictConfig):
-    """Per-project Cloudflare Tunnel settings.
+    """Per-project Cloudflare Tunnel overrides.
 
-    Credentials (account_id, api_token) live in the host-wide global config so
-    one set of secrets covers every project. Per-project knobs: zone selection
-    and the tunnel name to create / reuse.
+    Every field falls back to the host-wide `[tunnel.cloudflare]` block in
+    `~/.taskmux/config.toml`. The API token never lives at project level —
+    `taskmux.toml` is git-tracked and a checked-in token is a security incident.
     """
 
     zone_id: str | None = None
-    """Cloudflare zone ID for `public_hostname` DNS routing. Required when any
-    task in this project sets `tunnel = "cloudflare"`."""
+    """Override the global default zone for this project's `public_hostname`s.
+    When unset, taskmux uses (in order): the global zone_id, or a zone
+    auto-resolved from the public_hostname's apex via the Cloudflare API."""
 
     tunnel_name: str | None = None
-    """Name for the cfd_tunnel created against the account. Defaults to the
-    project_id at sync time (so worktrees get their own tunnels)."""
+    """Override the cfd_tunnel name. Defaults to the global `tunnel_name` or,
+    when also unset, `taskmux-{project_id}` (so worktrees get distinct tunnels)."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_token_in_project(cls, values: dict) -> dict:
+        if isinstance(values, dict) and ("api_token" in values or "api_token_env" in values):
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    "Cloudflare api_token / api_token_env belong in "
+                    "~/.taskmux/config.toml under [tunnel.cloudflare], not in "
+                    "taskmux.toml — the project file is git-tracked."
+                ),
+            )
+        return values
 
 
 class TunnelProjectConfig(_StrictConfig):
@@ -271,23 +286,6 @@ class TaskmuxConfig(_StrictConfig):
                     detail = f"Duplicate host {cfg.host!r} on tasks {seen[cfg.host]!r} and {name!r}"
                 raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=detail)
             seen[cfg.host] = name
-        return self
-
-    @model_validator(mode="after")
-    def _validate_tunnel_credentials(self) -> "TaskmuxConfig":
-        """If any task uses `tunnel = "cloudflare"`, the project must declare
-        a Cloudflare zone the public hostname will land in. The actual API
-        token + account ID live in the host-wide global config."""
-        uses_cf = any(t.tunnel == TunnelKind.CLOUDFLARE for t in self.tasks.values())
-        if uses_cf and not self.tunnel.cloudflare.zone_id:
-            raise TaskmuxError(
-                ErrorCode.CONFIG_VALIDATION,
-                detail=(
-                    'A task uses `tunnel = "cloudflare"` but [tunnel.cloudflare] '
-                    "has no `zone_id`. Add the Cloudflare zone ID for the "
-                    "domain hosting your `public_hostname`."
-                ),
-            )
         return self
 
     @model_validator(mode="after")
