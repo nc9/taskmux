@@ -306,6 +306,52 @@ proxy_bind = "127.0.0.1"        # loopback only by default — "0.0.0.0" exposes
 
 `taskmux status` flips host-routed tasks to `healthy: false` when the proxy listener isn't bound or this project's host route isn't registered — see the top-level `proxy: {bound, port, reason}` block in `--json` output and the per-task `last_health.method == "proxy"` reason.
 
+### Public access (Cloudflare Tunnel)
+
+Local-only by default. To expose any host-routed task on the public internet — for webhooks, mobile testing, or remote agents — opt in per task:
+
+```toml
+[tasks.api]
+command = "bun run dev"
+host = "api"
+tunnel = "cloudflare"
+public_hostname = "api.example.com"
+
+[tunnel.cloudflare]
+zone_id = "abc123..."          # Cloudflare zone ID for example.com
+# tunnel_name = "taskmux-myproject"   # optional; defaults to taskmux-{project_id}
+```
+
+Local URL is unchanged: `https://api.myproject.localhost` still works. The public hostname is **additive** — `taskmux status` shows it in a separate `Public URL` column for tunneled tasks.
+
+One-time setup:
+
+```bash
+brew install cloudflared
+
+# In ~/.taskmux/config.toml:
+cloudflare_account_id = "your-account-id"
+cloudflare_api_token_env = "CLOUDFLARE_API_TOKEN"   # default
+
+# Token scopes required:
+#   Account → Cloudflare Tunnel → Edit
+#   Zone    → DNS               → Edit  (for the configured zone)
+
+export CLOUDFLARE_API_TOKEN="..."
+sudo -E taskmux daemon
+```
+
+The daemon creates a remote-managed `cfd_tunnel` on first sync, persists `(tunnel_id, token)` at `~/.taskmux/tunnels/cloudflare/<name>.json`, runs `cloudflared` as a child process, and rewrites ingress on every task lifecycle event. Public traffic enters the Cloudflare edge, lands on the local proxy on `127.0.0.1:443` with the right Host header, and routes to the upstream — no proxy code path changes.
+
+```bash
+taskmux tunnel status            # backend health, last sync, mappings
+taskmux tunnel logs cloudflare   # tail cloudflared
+```
+
+If the API token or account ID is missing, the daemon logs a clear error and disables the cloudflare backend; tunneled tasks still serve locally. Apex hosts (`host = "@"`) tunnel to `<project>.localhost`. Wildcard hosts (`host = "*"`) cannot be tunneled — there's no single FQDN to point at.
+
+> **Tailscale Funnel** and **ngrok** are deferred for now. Tailscale Funnel is one funnel per node and limits the public URL to your tailnet; ngrok's free tier blocks BYO domains. For self-hosted tunnels (frp, sish, Caddy), set `tunnel = "noop"` on a task — taskmux records the public hostname for display and you wire the actual exposure outside.
+
 ### stop vs kill vs restart
 
 | Command | Signal | Auto-restart |
