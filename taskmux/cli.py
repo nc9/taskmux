@@ -274,6 +274,25 @@ def _spawn_detached_daemon(port: int | None = None) -> int | None:
     return proc.pid
 
 
+def _reinjectAgentBlock() -> list[Path]:
+    """Re-patch CLAUDE.md / AGENTS.md after a task add/remove. Best-effort.
+
+    Reads the freshly-written taskmux.toml so the rendered task table
+    reflects the post-mutation state. Honors `auto_inject_agents` in both
+    project and global config.
+    """
+    from .agent import reinjectIfEnabled
+
+    cfg_path = Path("taskmux.toml")
+    if not cfg_path.exists():
+        return []
+    try:
+        cli_local = TaskmuxCLI(config_path=cfg_path)
+    except Exception:  # noqa: BLE001
+        return []
+    return reinjectIfEnabled(cfg_path.resolve().parent, cli_local.config)
+
+
 def _autoRegisterCwd() -> None:
     cfg_path = Path("taskmux.toml")
     if not cfg_path.exists():
@@ -666,10 +685,21 @@ def add(
         health_check=health_check,
         depends_on=depends_on,
     )
+    rewrote = _reinjectAgentBlock()
     if is_json_mode():
-        print_result({"ok": True, "task": task, "command": command, "action": "added"})
+        print_result(
+            {
+                "ok": True,
+                "task": task,
+                "command": command,
+                "action": "added",
+                "agent_files_rewritten": [str(p) for p in rewrote],
+            }
+        )
     else:
         console.print(f"Added task '{task}': {command}")
+        for p in rewrote:
+            console.print(f"  Updated {p.name}", style="dim")
 
 
 @app.command()
@@ -682,10 +712,20 @@ def remove(
         with contextlib.suppress(Exception):
             ipc_client.call("kill", params={"session": cli.project_id, "task": task}, ensure=False)
     _, removed = removeTask(None, task)
+    rewrote = _reinjectAgentBlock() if removed else []
     if is_json_mode():
-        print_result({"ok": removed, "task": task, "action": "removed"})
+        print_result(
+            {
+                "ok": removed,
+                "task": task,
+                "action": "removed",
+                "agent_files_rewritten": [str(p) for p in rewrote],
+            }
+        )
     elif removed:
         console.print(f"Removed task '{task}'")
+        for p in rewrote:
+            console.print(f"  Updated {p.name}", style="dim")
     else:
         console.print(f"Task '{task}' not found in config", style="red")
 
@@ -1723,15 +1763,50 @@ def _hoist_global_flags(argv: list[str]) -> list[str]:
     Typer rejects them with `No such option`. Hoisting (rather than stripping)
     means the existing `main_callback` still sees the flag and `set_json_mode`
     runs through its single source of truth.
+
+    Context-aware to avoid eating real argument values:
+      - skip after a `--` end-of-options marker (everything after is data),
+      - skip when the previous token is a known value-taking option (e.g.
+        `--grep --json` filters logs for the literal pattern `--json`).
     """
     GLOBAL = {"--json", "-V", "--version"}
+    # Long-and-short forms of every option in the CLI that takes a value.
+    # If `--json` appears immediately after one of these, treat it as the
+    # option's argument, not as a global flag.
+    VALUE_TAKING = {
+        "--grep",
+        "-g",
+        "--lines",
+        "-n",
+        "--context",
+        "-C",
+        "--since",
+        "--task",
+        "--limit",
+        "--cwd",
+        "--host",
+        "--health-check",
+        "--depends-on",
+        "--port",
+        "--config",
+        "-c",
+        "--type",
+    }
     hoisted: list[str] = []
     rest: list[str] = []
+    end_of_options = False
+    prev: str | None = None
     for arg in argv:
-        if arg in GLOBAL:
+        if end_of_options:
+            rest.append(arg)
+        elif arg == "--":
+            end_of_options = True
+            rest.append(arg)
+        elif arg in GLOBAL and prev not in VALUE_TAKING:
             hoisted.append(arg)
         else:
             rest.append(arg)
+        prev = arg
     return hoisted + rest
 
 

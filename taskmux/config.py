@@ -187,6 +187,8 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
         doc.add("auto_start", tomlkit.item(False))
     if config.auto_daemon:
         doc.add("auto_daemon", tomlkit.item(True))
+    if config.auto_inject_agents is not None:
+        doc.add("auto_inject_agents", tomlkit.item(config.auto_inject_agents))
 
     doc.add(tomlkit.nl())
 
@@ -281,14 +283,7 @@ def addTask(
     if depends_on:
         kwargs["depends_on"] = depends_on
     new_tasks[name] = TaskConfig(**kwargs)
-    cfg = TaskmuxConfig(
-        name=cfg.name,
-        auto_start=cfg.auto_start,
-        auto_daemon=cfg.auto_daemon,
-        hooks=cfg.hooks,
-        worktree=cfg.worktree,
-        tasks=new_tasks,
-    )
+    cfg = _rebuildWithTasks(cfg, new_tasks)
     writeConfig(path, cfg)
     return cfg
 
@@ -299,13 +294,27 @@ def removeTask(path: Path | None, name: str) -> tuple[TaskmuxConfig, bool]:
     if name not in cfg.tasks:
         return cfg, False
     new_tasks = {k: v for k, v in cfg.tasks.items() if k != name}
-    cfg = TaskmuxConfig(
+    cfg = _rebuildWithTasks(cfg, new_tasks)
+    writeConfig(path, cfg)
+    return cfg, True
+
+
+def _rebuildWithTasks(
+    cfg: TaskmuxConfig, new_tasks: dict[str, TaskConfig]
+) -> TaskmuxConfig:
+    """Build a fresh TaskmuxConfig with new_tasks, preserving every other field.
+
+    Uses the public constructor so model + field validators (DNS-safe name,
+    duplicate-host check, etc.) run against the new task set. Any field added
+    to TaskmuxConfig must be threaded here — a missing pass-through silently
+    drops the user's value on the next add/remove.
+    """
+    return TaskmuxConfig(
         name=cfg.name,
         auto_start=cfg.auto_start,
         auto_daemon=cfg.auto_daemon,
+        auto_inject_agents=cfg.auto_inject_agents,
         hooks=cfg.hooks,
         worktree=cfg.worktree,
         tasks=new_tasks,
     )
-    writeConfig(path, cfg)
-    return cfg, True

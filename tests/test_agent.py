@@ -12,6 +12,7 @@ from taskmux.agent import (
     detectContextFiles,
     detectInstalledAgents,
     injectIntoFile,
+    reinjectIfEnabled,
     skillInstalled,
 )
 from taskmux.models import TaskConfig, TaskmuxConfig
@@ -174,3 +175,72 @@ class TestInjectIntoFile:
         target = tmp_path / AGENTS_FILE
         injectIntoFile(target, TaskmuxConfig(name="test"))
         assert target.name == AGENTS_FILE
+
+
+class TestReinjectIfEnabled:
+    def test_rewrites_existing_files(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            "taskmux.global_config.loadGlobalConfig",
+            lambda: type("GC", (), {"auto_inject_agents": True})(),
+        )
+        (tmp_path / AGENTS_FILE).write_text("# notes\n")
+        injectIntoFile(tmp_path / AGENTS_FILE, TaskmuxConfig(name="orig"))
+
+        rewrote = reinjectIfEnabled(
+            tmp_path,
+            TaskmuxConfig(name="orig", tasks={"new": TaskConfig(command="bun dev")}),
+        )
+        assert rewrote == [tmp_path / AGENTS_FILE]
+        content = (tmp_path / AGENTS_FILE).read_text()
+        assert "bun dev" in content
+        assert "| new |" in content
+
+    def test_no_op_when_no_files_exist(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            "taskmux.global_config.loadGlobalConfig",
+            lambda: type("GC", (), {"auto_inject_agents": True})(),
+        )
+        rewrote = reinjectIfEnabled(tmp_path, TaskmuxConfig(name="x"))
+        assert rewrote == []
+
+    def test_disabled_per_project(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            "taskmux.global_config.loadGlobalConfig",
+            lambda: type("GC", (), {"auto_inject_agents": True})(),
+        )
+        (tmp_path / AGENTS_FILE).write_text("# notes\n")
+        injectIntoFile(tmp_path / AGENTS_FILE, TaskmuxConfig(name="orig"))
+        before = (tmp_path / AGENTS_FILE).read_text()
+
+        rewrote = reinjectIfEnabled(
+            tmp_path,
+            TaskmuxConfig(name="orig", auto_inject_agents=False),
+        )
+        assert rewrote == []
+        assert (tmp_path / AGENTS_FILE).read_text() == before
+
+    def test_disabled_globally(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(
+            "taskmux.global_config.loadGlobalConfig",
+            lambda: type("GC", (), {"auto_inject_agents": False})(),
+        )
+        (tmp_path / AGENTS_FILE).write_text("# notes\n")
+        injectIntoFile(tmp_path / AGENTS_FILE, TaskmuxConfig(name="orig"))
+        before = (tmp_path / AGENTS_FILE).read_text()
+
+        rewrote = reinjectIfEnabled(tmp_path, TaskmuxConfig(name="orig"))
+        assert rewrote == []
+        assert (tmp_path / AGENTS_FILE).read_text() == before
+
+    def test_per_project_overrides_global_disabled(self, tmp_path: Path, monkeypatch):
+        """auto_inject_agents=True in taskmux.toml beats global False."""
+        monkeypatch.setattr(
+            "taskmux.global_config.loadGlobalConfig",
+            lambda: type("GC", (), {"auto_inject_agents": False})(),
+        )
+        (tmp_path / AGENTS_FILE).write_text("# notes\n")
+        rewrote = reinjectIfEnabled(
+            tmp_path,
+            TaskmuxConfig(name="orig", auto_inject_agents=True),
+        )
+        assert rewrote == [tmp_path / AGENTS_FILE]

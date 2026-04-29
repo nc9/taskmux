@@ -86,6 +86,15 @@ class GlobalConfig(BaseModel):
             "mDNS (Bonjour, Brave, Chrome cast). Set to 53 if using NRPT on Windows."
         ),
     )
+    auto_inject_agents: bool = Field(
+        default=True,
+        description=(
+            "Re-patch the marked taskmux block in CLAUDE.md / AGENTS.md after "
+            "`taskmux add` / `taskmux remove` so agent context stays in sync "
+            "with the live task list. Per-project taskmux.toml can override "
+            "this with its own `auto_inject_agents = false`."
+        ),
+    )
     dns_managed_tld: str = Field(
         default="localhost",
         description=(

@@ -141,6 +141,9 @@ class TaskmuxConfig(_StrictConfig):
     name: str = "taskmux"
     auto_start: bool = True
     auto_daemon: bool = False
+    auto_inject_agents: bool | None = None
+    """Per-project override for the global `auto_inject_agents` knob.
+    None = inherit from ~/.taskmux/config.toml; True/False forces it."""
     hooks: HookConfig = HookConfig()
     worktree: WorktreeConfig = WorktreeConfig()
     tasks: dict[str, TaskConfig] = {}

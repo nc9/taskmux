@@ -50,6 +50,20 @@ npx skills add nc9/taskmux --skill taskmux -g     # global (~/.claude/skills/, ~
 - Neither exists → interactive prompt asks which to create (default: `AGENTS.md`, the cross-agent convention). With `--defaults`, creates `AGENTS.md`.
 - Re-running `taskmux init` (after `taskmux add`/`remove`) replaces the marked block in place — your other notes in the file are untouched.
 
+The block also re-renders automatically on every `taskmux add` / `taskmux remove`, so the agent context never drifts from the live task list. Disable per-project in `taskmux.toml`:
+
+```toml
+auto_inject_agents = false
+```
+
+…or globally in `~/.taskmux/config.toml` (project setting wins when both are present):
+
+```toml
+auto_inject_agents = false
+```
+
+Or via `taskmux config set auto_inject_agents false`.
+
 ## Commands
 
 All commands support `--json` for machine-readable output.

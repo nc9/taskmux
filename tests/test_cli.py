@@ -81,6 +81,46 @@ class TestJsonFlagHoist:
             "status",
         ]
 
+    def test_does_not_steal_option_values(self):
+        """`--grep --json` searches for literal `--json` — must not be hoisted."""
+        from taskmux.cli import _hoist_global_flags
+
+        assert _hoist_global_flags(["logs", "server", "--grep", "--json"]) == [
+            "logs",
+            "server",
+            "--grep",
+            "--json",
+        ]
+        assert _hoist_global_flags(["logs", "server", "-g", "--json"]) == [
+            "logs",
+            "server",
+            "-g",
+            "--json",
+        ]
+        # Boolean flags before --json still allow hoist:
+        assert _hoist_global_flags(["logs", "--follow", "--json"]) == [
+            "--json",
+            "logs",
+            "--follow",
+        ]
+
+    def test_respects_end_of_options_marker(self):
+        """Tokens after `--` are positional data — never hoist."""
+        from taskmux.cli import _hoist_global_flags
+
+        assert _hoist_global_flags(["start", "--", "--json"]) == [
+            "start",
+            "--",
+            "--json",
+        ]
+        # `--json` before `--` still hoists:
+        assert _hoist_global_flags(["--json", "start", "--", "--json"]) == [
+            "--json",
+            "start",
+            "--",
+            "--json",
+        ]
+
 
 class TestInitCommand:
     @patch("taskmux.cli.initProject")

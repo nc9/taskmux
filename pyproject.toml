@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: Terminals",
 ]
-keywords = ["tmux", "terminal", "session", "manager", "development", "daemon", "monitoring"]
+keywords = ["agent", "llm", "terminal", "session", "manager", "development", "daemon", "monitoring", "claude", "codex"]
 
 dependencies = [
     "watchdog>=3.0.0",

@@ -107,6 +107,37 @@ def buildContextBlock(config: TaskmuxConfig) -> str:
     return "\n".join(lines) + "\n"
 
 
+def reinjectIfEnabled(project_path: Path, config: TaskmuxConfig) -> list[Path]:
+    """Re-patch existing CLAUDE.md / AGENTS.md after a task add/remove.
+
+    Honors `config.auto_inject_agents` (per-project override) falling back to
+    the global `auto_inject_agents` knob. Only updates files that already
+    exist — first-time creation belongs to `taskmux init`. Best-effort: any
+    error is swallowed so a write failure never blocks the originating CLI op.
+
+    Returns the list of paths actually rewritten (empty when disabled or no
+    context files exist).
+    """
+    if config.auto_inject_agents is False:
+        return []
+    if config.auto_inject_agents is None:
+        try:
+            from .global_config import loadGlobalConfig
+
+            if not loadGlobalConfig().auto_inject_agents:
+                return []
+        except Exception:  # noqa: BLE001
+            return []
+    written: list[Path] = []
+    for target in detectContextFiles(project_path):
+        try:
+            injectIntoFile(target, config)
+            written.append(target)
+        except OSError:
+            continue
+    return written
+
+
 def injectIntoFile(target: Path, config: TaskmuxConfig) -> Path:
     """Write or update the marked taskmux block in `target`. Creates parent dirs.
 

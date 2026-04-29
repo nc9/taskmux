@@ -334,3 +334,39 @@ class TestRemoveTask:
     def test_nonexistent_returns_false(self, sample_toml: Path):
         _, removed = removeTask(sample_toml, "ghost")
         assert removed is False
+
+
+class TestAutoInjectAgentsRoundtrip:
+    """auto_inject_agents must survive add/remove via the CLI write path.
+
+    Regression: addTask/removeTask used to rebuild TaskmuxConfig without
+    threading auto_inject_agents through, so the per-project toggle was
+    silently lost on the next add/remove.
+    """
+
+    def test_false_survives_add(self, tmp_path: Path):
+        cfg_path = tmp_path / "taskmux.toml"
+        cfg_path.write_text(
+            'name = "demo"\nauto_inject_agents = false\n\n[tasks.api]\ncommand = "x"\n'
+        )
+        addTask(cfg_path, "new", "echo new")
+        reloaded = loadConfig(cfg_path)
+        assert reloaded.auto_inject_agents is False
+        assert "auto_inject_agents = false" in cfg_path.read_text()
+
+    def test_true_survives_remove(self, tmp_path: Path):
+        cfg_path = tmp_path / "taskmux.toml"
+        cfg_path.write_text(
+            'name = "demo"\nauto_inject_agents = true\n\n'
+            '[tasks.a]\ncommand = "x"\n[tasks.b]\ncommand = "y"\n'
+        )
+        removeTask(cfg_path, "a")
+        reloaded = loadConfig(cfg_path)
+        assert reloaded.auto_inject_agents is True
+
+    def test_unset_stays_unset(self, sample_toml: Path):
+        """Default (None) should not pollute the file with an explicit value."""
+        addTask(sample_toml, "new", "echo new")
+        text = sample_toml.read_text()
+        assert "auto_inject_agents" not in text
+        assert loadConfig(sample_toml).auto_inject_agents is None
