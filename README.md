@@ -308,47 +308,72 @@ proxy_bind = "127.0.0.1"        # loopback only by default — "0.0.0.0" exposes
 
 ### Public access (Cloudflare Tunnel)
 
-Local-only by default. To expose any host-routed task on the public internet — for webhooks, mobile testing, or remote agents — opt in per task:
+Local-only by default. To expose any host-routed task on the public internet — for webhooks, mobile testing, or remote agents — run the wizard:
+
+```bash
+brew install cloudflared
+taskmux tunnel enable
+```
+
+That's it. The wizard prompts for a Cloudflare API token, your account ID, picks the zone, sets up the tunnel, writes DNS, and updates `taskmux.toml`. Re-running is idempotent. Non-interactive callers (agents, CI):
+
+```bash
+taskmux tunnel enable --json \
+    --token "$CLOUDFLARE_API_TOKEN" \
+    --task api --public-hostname api=api.example.com \
+    --task web --public-hostname web=web.example.com
+```
+
+Once set up, the local URL is unchanged: `https://api.myproject.localhost` still works. The public hostname is **additive** — `taskmux status` shows it in a separate `Public URL` column for tunneled tasks.
+
+#### Cascading config
+
+`~/.taskmux/config.toml` holds the credentials shared by every project. Per-project `taskmux.toml` overrides any field one at a time. If `zone_id` is unset everywhere, taskmux auto-resolves it from the public hostname's apex.
 
 ```toml
+# ~/.taskmux/config.toml — host-wide defaults (chmod 0600 if api_token embedded)
+[tunnel.cloudflare]
+account_id = "abcd..."
+zone_id    = "ef56..."
+api_token  = "cf-pat-..."     # OR api_token_env = "CLOUDFLARE_API_TOKEN"
+```
+
+```toml
+# taskmux.toml — per-project (zone_id/tunnel_name optional, no token here)
+[tunnel.cloudflare]
+zone_id = "ghij..."           # only if this project uses a different zone
+
 [tasks.api]
 command = "bun run dev"
 host = "api"
 tunnel = "cloudflare"
 public_hostname = "api.example.com"
-
-[tunnel.cloudflare]
-zone_id = "abc123..."          # Cloudflare zone ID for example.com
-# tunnel_name = "taskmux-myproject"   # optional; defaults to taskmux-{project_id}
 ```
 
-Local URL is unchanged: `https://api.myproject.localhost` still works. The public hostname is **additive** — `taskmux status` shows it in a separate `Public URL` column for tunneled tasks.
+Token scopes required: `Account → Cloudflare Tunnel → Edit`, `Zone → DNS → Edit`.
 
-One-time setup:
-
-```bash
-brew install cloudflared
-
-# In ~/.taskmux/config.toml:
-cloudflare_account_id = "your-account-id"
-cloudflare_api_token_env = "CLOUDFLARE_API_TOKEN"   # default
-
-# Token scopes required:
-#   Account → Cloudflare Tunnel → Edit
-#   Zone    → DNS               → Edit  (for the configured zone)
-
-export CLOUDFLARE_API_TOKEN="..."
-sudo -E taskmux daemon
-```
-
-The daemon creates a remote-managed `cfd_tunnel` on first sync, persists `(tunnel_id, token)` at `~/.taskmux/tunnels/cloudflare/<name>.json`, runs `cloudflared` as a child process, and rewrites ingress on every task lifecycle event. Public traffic enters the Cloudflare edge, lands on the local proxy on `127.0.0.1:443` with the right Host header, and routes to the upstream — no proxy code path changes.
+#### Daily commands
 
 ```bash
+taskmux tunnel test              # preflight (token, scopes, zones, DNS collisions)
+taskmux tunnel config            # cascaded view + per-field source
+taskmux tunnel config-set --scope global zone_id=abc account_id=xyz
 taskmux tunnel status            # backend health, last sync, mappings
-taskmux tunnel logs cloudflare   # tail cloudflared
+taskmux tunnel logs cloudflare   # tail the cloudflared child process
+taskmux tunnel disable [--prune] # strip tunnel fields from every task
 ```
 
-If the API token or account ID is missing, the daemon logs a clear error and disables the cloudflare backend; tunneled tasks still serve locally. Apex hosts (`host = "@"`) tunnel to `<project>.localhost`. Wildcard hosts (`host = "*"`) cannot be tunneled — there's no single FQDN to point at.
+Every command takes `--json` and emits a stable schema for agent scripting.
+
+#### Safety rails
+
+- API token in `~/.taskmux/config.toml` is masked in `config show` and `tunnel config` (use `--reveal` to show plaintext).
+- Daemon refuses to read an embedded token if the file is wider than 0600.
+- `api_token` cannot be set in `taskmux.toml` (git-tracked) — validation rejects it.
+- DNS collision check refuses to overwrite an existing record at the public hostname unless it already points at this tunnel.
+- Missing `cloudflared` binary, missing token, missing zone, and missing scope all surface as preflight check failures with concrete `fix:` hints.
+
+If anything is missing the daemon logs the gap and disables the cloudflare backend — tunneled tasks still serve locally. Apex hosts (`host = "@"`) tunnel to `<project>.localhost`. Wildcard hosts (`host = "*"`) cannot be tunneled — there's no single FQDN to point at.
 
 > **Tailscale Funnel** and **ngrok** are deferred for now. Tailscale Funnel is one funnel per node and limits the public URL to your tailnet; ngrok's free tier blocks BYO domains. For self-hosted tunnels (frp, sish, Caddy), set `tunnel = "noop"` on a task — taskmux records the public hostname for display and you wire the actual exposure outside.
 
