@@ -111,6 +111,15 @@ How proxy serves a request:
 2. On `taskmux start`, a task with `host = "api"` registers its assigned port; `taskmux alias add` registers external ports the same way.
 3. Browser hits `https://api.{project}.localhost` → daemon SNI-matches the cert → proxies to `127.0.0.1:$PORT`.
 
+### `$PORT` injection — the gotcha that breaks host routing
+
+Taskmux assigns each task a random port and exports `PORT=<n>` **only into the task's command**. The dev command MUST listen on `$PORT` or the proxy routes to a port nothing is bound to (TCP probe → "connect refused", browser → 502).
+
+- ✅ `vite dev --port ${PORT:-9000}` / `next dev -p $PORT` / `os.environ.get("PORT", default)`
+- ❌ `vite dev --port 9000` (hardcoded — proxy can't reach it)
+- ❌ `port = 9000` in `taskmux.toml` — **rejected** (`E103: Unknown config key 'port'`); ports are dynamic in 0.7+. Migrate by deleting the key and updating the dev command to read `$PORT`.
+- ❌ `$PORT` in `health_url` / `health_check` — **NOT substituted**, passed verbatim. For host-routed tasks, just omit health config and taskmux TCP-probes the assigned port automatically.
+
 The daemon's proxy listener is configurable via `~/.taskmux/config.toml`:
 
 ```toml
@@ -189,9 +198,11 @@ auto_daemon = false
 command = "..."
 auto_start = true
 cwd = "..."                 # relative to taskmux.toml dir
-host = "api" | "@" | "*"    # → proxy URL; $PORT injected
+host = "api" | "@" | "*"    # → proxy URL; PORT exported into command only
 depends_on = []
-health_url = "http://localhost:$PORT/health"
+# Health: omit when `host` is set — taskmux TCP-probes assigned port.
+# $PORT is NOT substituted in these fields (passed verbatim to http/shell).
+health_url = "http://localhost:8080/health"
 health_expected_status = 200
 health_expected_body = "..."   # regex; catches "200 with error page"
 health_check = "..."           # shell, exit 0 = healthy
