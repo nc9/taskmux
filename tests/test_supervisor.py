@@ -20,6 +20,7 @@ from taskmux.supervisor import (
     LogWriter,
     PosixSupervisor,
     RestartTracker,
+    _make_log_annotator,
     _parseSince,
     _parseSize,
     make_supervisor,
@@ -206,6 +207,80 @@ class TestLogWriter:
             w.write(f"line-{i:04d}-padding-padding-padding\n".encode())
         w.close()
         assert (tmp_path / "out.log.1").exists()
+
+    def test_banner_emitted_first(self, tmp_path: Path):
+        log = tmp_path / "out.log"
+        w = LogWriter(log, max_bytes=1_000_000, max_files=3, banner="[taskmux] hello")
+        w.write(b"first\n")
+        w.close()
+        lines = log.read_text().splitlines()
+        assert lines[0].endswith(" [taskmux] hello")
+        assert lines[1].endswith(" first")
+
+    def test_banner_lands_in_active_log_when_existing_near_full(self, tmp_path: Path):
+        # Existing log near max_bytes: the banner must rotate the old file out
+        # *before* writing, so the active log contains the banner first.
+        log = tmp_path / "out.log"
+        log.write_text("x" * 180 + "\n")  # near the 200-byte cap
+        w = LogWriter(log, max_bytes=200, max_files=3, banner="[taskmux] hello")
+        w.close()
+        active = log.read_text().splitlines()
+        assert len(active) == 1
+        assert active[0].endswith(" [taskmux] hello")
+        assert (tmp_path / "out.log.1").exists()
+
+    def test_annotator_emits_followup(self, tmp_path: Path):
+        log = tmp_path / "out.log"
+        ann = _make_log_annotator("https://web.app.localhost", 1234, throttle_s=0.0)
+        w = LogWriter(log, max_bytes=1_000_000, max_files=3, annotator=ann)
+        w.write(b"vite ready at http://localhost:1234/\n")
+        w.write(b"unrelated noise\n")
+        w.close()
+        lines = log.read_text().splitlines()
+        assert len(lines) == 3
+        assert lines[0].endswith(" vite ready at http://localhost:1234/")
+        assert lines[1].endswith(" [taskmux] ↳ public URL: https://web.app.localhost")
+        assert lines[2].endswith(" unrelated noise")
+
+    def test_annotator_not_applied_to_synthetic_lines(self, tmp_path: Path):
+        log = tmp_path / "out.log"
+        # Banner + annotation must not themselves trigger another annotation
+        # (no recursion). Use a banner that contains the trigger substring.
+        ann = _make_log_annotator("https://web.app.localhost", 1234, throttle_s=0.0)
+        banner = "[taskmux] up on http://localhost:1234"
+        w = LogWriter(log, max_bytes=1_000_000, max_files=3, banner=banner, annotator=ann)
+        w.close()
+        lines = log.read_text().splitlines()
+        assert len(lines) == 1
+        assert lines[0].endswith(f" {banner}")
+
+
+class TestLogAnnotator:
+    def test_matches_localhost_and_port(self):
+        ann = _make_log_annotator("https://web.app.localhost", 1234, throttle_s=0.0)
+        assert ann("Local: http://localhost:1234/") is not None
+        assert ann("listening on localhost:1234") is not None
+        assert ann("nothing here") is None
+
+    def test_port_word_boundary(self):
+        # Port 123 should NOT match :1234 (avoid digit-prefix false positives).
+        ann = _make_log_annotator("https://x.localhost", 123, throttle_s=0.0)
+        assert ann("http://localhost:1234/") is None
+        assert ann("http://localhost:123/") is not None
+        assert ann("http://localhost:123") is not None
+
+    def test_throttle_suppresses_repeats(self):
+        ann = _make_log_annotator("https://x.localhost", 1234, throttle_s=30.0)
+        first = ann("localhost:1234")
+        second = ann("localhost:1234")
+        assert first is not None
+        assert second is None
+
+    def test_returned_string_contains_public_url(self):
+        ann = _make_log_annotator("https://api.app.localhost", 9999, throttle_s=0.0)
+        out = ann("ready: http://localhost:9999")
+        assert out is not None
+        assert "https://api.app.localhost" in out
 
 
 class TestReadLogFile:
@@ -398,6 +473,49 @@ class TestLifecycle:
             log_file = tmp_path / "test-session__hello.log"
             assert log_file.exists()
             assert "hello-from-task" in log_file.read_text()
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_host_bound_task_writes_banner(self, tmp_path):
+        cfg = _make_config(
+            name="myapp",
+            tasks={"web": {"command": "echo done", "host": "web"}},
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            await sup.start_task("web")
+            tp = sup._tasks.get("web")
+            if tp is not None:
+                await asyncio.wait_for(tp.proc.wait(), timeout=5)
+            await asyncio.sleep(0.3)
+
+        try:
+            _run(_go())
+            log_file = tmp_path / "myapp__web.log"
+            text = log_file.read_text()
+            assert "[taskmux] serving https://web.myapp.localhost" in text
+            assert "→ http://localhost:" in text
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_non_host_task_writes_no_banner(self, tmp_path):
+        cfg = _make_config(tasks={"plain": "echo nope"})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            await sup.start_task("plain")
+            tp = sup._tasks.get("plain")
+            if tp is not None:
+                await asyncio.wait_for(tp.proc.wait(), timeout=5)
+            await asyncio.sleep(0.3)
+
+        try:
+            _run(_go())
+            log_file = tmp_path / "test-session__plain.log"
+            assert "[taskmux]" not in log_file.read_text()
         finally:
             _stop_log_redirect(sup)
 

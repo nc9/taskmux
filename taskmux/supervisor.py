@@ -148,19 +148,60 @@ def rotateLogs(log_path: Path, max_files: int) -> None:
         log_path.rename(Path(f"{log_path}.1"))
 
 
+def _make_log_annotator(
+    public_url: str, port: int, throttle_s: float = 30.0
+) -> Callable[[str], str | None]:
+    """Return a per-line callback that emits a public-URL annotation.
+
+    Triggers when a line contains `localhost:{port}` (word-bounded — port `123`
+    won't match a `:1234` substring). Throttled so HMR / repeat prints don't
+    spam: at most one annotation per `throttle_s` seconds.
+    """
+    pattern = re.compile(rf"\blocalhost:{port}\b")
+    state = {"last": 0.0}
+    annotation = f"[taskmux] ↳ public URL: {public_url}"
+
+    def annotate(line: str) -> str | None:
+        if not pattern.search(line):
+            return None
+        now = time.monotonic()
+        if now - state["last"] < throttle_s:
+            return None
+        state["last"] = now
+        return annotation
+
+    return annotate
+
+
 class LogWriter:
     """Append PTY-drained bytes to a log file as timestamped lines.
 
     Buffers partial lines across writes; rotates when file size hits max_bytes.
+
+    Optional `banner` is emitted as a synthetic timestamped line at open time
+    (use it to surface the task's public URL before any program output). Optional
+    `annotator` is called with each real line; a non-None return is emitted as a
+    follow-up timestamped line. Synthetic lines (banner + annotation output) are
+    never themselves passed to the annotator.
     """
 
-    def __init__(self, path: Path, max_bytes: int, max_files: int):
+    def __init__(
+        self,
+        path: Path,
+        max_bytes: int,
+        max_files: int,
+        banner: str | None = None,
+        annotator: Callable[[str], str | None] | None = None,
+    ):
         self.path = path
         self.max_bytes = max_bytes
         self.max_files = max_files
         self._buf = bytearray()
+        self._annotator = annotator
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(path, "a")  # noqa: SIM115
+        if banner is not None:
+            self._emit(banner)
 
     def write(self, data: bytes) -> None:
         self._buf.extend(data)
@@ -173,16 +214,28 @@ class LogWriter:
             del self._buf[: idx + 1]
             self._write_line(line)
 
-    def _write_line(self, line: str) -> None:
+    def _emit(self, line: str) -> None:
         now = datetime.now(UTC)
         ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}"
-        self._fh.write(f"{ts} {line}\n")
-        self._fh.flush()
+        record = f"{ts} {line}\n"
+        # Pre-rotate when this record would cross max_bytes and the file is
+        # non-empty: ensures synthetic lines emitted at open (banner) land in
+        # the *active* log, not in `.log.1` if the existing log was near full.
         with contextlib.suppress(OSError):
-            if self._fh.tell() >= self.max_bytes:
+            current = self._fh.tell()
+            if current > 0 and current + len(record.encode("utf-8")) > self.max_bytes:
                 self._fh.close()
                 rotateLogs(self.path, self.max_files)
                 self._fh = open(self.path, "a")  # noqa: SIM115
+        self._fh.write(record)
+        self._fh.flush()
+
+    def _write_line(self, line: str) -> None:
+        self._emit(line)
+        if self._annotator is not None:
+            extra = self._annotator(line)
+            if extra is not None:
+                self._emit(extra)
 
     def flush_buffer(self) -> None:
         if self._buf:
@@ -373,6 +426,29 @@ class PosixSupervisor:
         port = self._ensure_port(task_name)
         return f"export PORT={port}; {command}"
 
+    def _build_log_decor(
+        self, task_name: str, task_cfg: TaskConfig
+    ) -> tuple[str | None, Callable[[str], str | None] | None]:
+        """Compose (banner, annotator) for a host-bound task's log file.
+
+        Non-host-bound tasks get (None, None) — logs read identically to today.
+        Wildcard hosts get the banner only (no fixed hostname to annotate).
+        """
+        if task_cfg.host is None:
+            return None, None
+        from .url import taskUrl
+
+        port = self.assigned_ports.get(task_name)
+        public_url = taskUrl(self.project_id, task_cfg.host)
+        suffix = " (wildcard subdomain match)" if task_cfg.host == "*" else ""
+        if port is None:
+            banner = f"[taskmux] serving {public_url}{suffix}"
+        else:
+            banner = f"[taskmux] serving {public_url}{suffix} → http://localhost:{port}"
+        if task_cfg.host == "*" or port is None:
+            return banner, None
+        return banner, _make_log_annotator(public_url, port)
+
     def _cleanup_port(self, port: int) -> None:
         try:
             result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True)
@@ -443,7 +519,14 @@ class PosixSupervisor:
             pgid = proc.pid
 
         log_path = _logPath(self.config.name, task_name, task_cfg, self.worktree_id)
-        log_writer = LogWriter(log_path, _parseSize(task_cfg.log_max_size), task_cfg.log_max_files)
+        banner, annotator = self._build_log_decor(task_name, task_cfg)
+        log_writer = LogWriter(
+            log_path,
+            _parseSize(task_cfg.log_max_size),
+            task_cfg.log_max_files,
+            banner=banner,
+            annotator=annotator,
+        )
 
         loop = asyncio.get_running_loop()
         loop.add_reader(master_fd, lambda: self._on_pty_data(task_name, master_fd, log_writer))
