@@ -142,6 +142,11 @@ def globalConfigPath() -> Path:
     return GLOBAL_CONFIG_PATH
 
 
+def tunnelStateDir(backend: str) -> Path:
+    """Per-backend tunnel state directory: ~/.taskmux/tunnels/<backend>/."""
+    return TASKMUX_DIR / "tunnels" / backend
+
+
 def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

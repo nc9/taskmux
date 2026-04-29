@@ -10,8 +10,10 @@ nss-myhostname but not always. So taskmux ships a pluggable resolver:
   - NoopResolver    — does nothing. Use if you handle resolution yourself
     (a tunnel, custom DNS, /etc/resolver, dnsmasq, etc.).
 
-Future implementations could add: DnsmasqResolver, CloudflareTunnelResolver,
-NgrokResolver, ResolverFileResolver (macOS /etc/resolver/<TLD>), …
+Future local-resolution backends could add: DnsmasqResolver,
+ResolverFileResolver (macOS /etc/resolver/<TLD>), … For *public* exposure
+via tunnels, see `taskmux.tunnels` (Cloudflare Tunnel etc.) — those run
+alongside the local resolver, not in place of it.
 
 The abstraction is intentionally name-agnostic: callers pass a list of
 `(fqdn, ip)` mappings, the resolver makes them resolvable. Nothing in this

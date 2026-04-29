@@ -107,6 +107,25 @@ class GlobalConfig(BaseModel):
         ),
     )
 
+    cloudflare_account_id: str | None = Field(
+        default=None,
+        description=(
+            "Cloudflare account ID used for any project with "
+            '`tunnel = "cloudflare"`. Find it in dash.cloudflare.com → '
+            "any zone → right sidebar."
+        ),
+    )
+    cloudflare_api_token_env: str = Field(
+        default="CLOUDFLARE_API_TOKEN",
+        description=(
+            "Name of the environment variable holding the Cloudflare API token. "
+            "Token needs scopes `Account.Cloudflare Tunnel: Edit` and "
+            "`Zone.DNS: Edit` for the relevant zone(s). Read at daemon start; "
+            "if unset, the cloudflare backend is disabled and tunneled tasks "
+            "still serve locally."
+        ),
+    )
+
     @field_validator("dns_managed_tld")
     @classmethod
     def _validate_dns_managed_tld(cls, v: str) -> str:
@@ -155,6 +174,9 @@ def writeGlobalConfig(config: GlobalConfig, path: Path | None = None) -> Path:
     ensureTaskmuxDir()
     doc = tomlkit.document()
     for field, value in config.model_dump().items():
+        # tomlkit can't represent `None`; defaults of None mean "unset", so skip.
+        if value is None:
+            continue
         doc.add(field, value)
     p.write_text(tomlkit.dumps(doc))
     return p

@@ -780,11 +780,15 @@ def _status():
         _print_alias_section(aliases)
         return
 
+    has_public = any(t.get("public_url") for t in tasks)
+
     table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
     table.add_column("", width=1, no_wrap=True)
     table.add_column("Status", style="cyan", no_wrap=True)
     table.add_column("Task", style="magenta", no_wrap=True)
     table.add_column("URL", no_wrap=True)
+    if has_public:
+        table.add_column("Public URL", no_wrap=True)
     table.add_column("Command", overflow="ellipsis", no_wrap=True)
     table.add_column("Notes", style="dim", no_wrap=True)
 
@@ -802,14 +806,18 @@ def _status():
             notes.append(f"cwd={t['cwd']}")
         if t.get("depends_on"):
             notes.append(f"deps=[{','.join(t['depends_on'])}]")
-        table.add_row(
+        if t.get("tunnel"):
+            notes.append(f"tunnel={t['tunnel']}")
+        row = [
             f"[{icon_style}]{health_icon}[/{icon_style}]",
             status_text,
             t["name"],
             t.get("url") or "",
-            t["command"],
-            " ".join(notes),
-        )
+        ]
+        if has_public:
+            row.append(t.get("public_url") or "")
+        row.extend([t["command"], " ".join(notes)])
+        table.add_row(*row)
         last = t.get("last_health")
         if last and not last.get("ok") and last.get("reason"):
             fail_rows.append((t["name"], last.get("method", ""), last.get("reason", "")))
@@ -959,8 +967,14 @@ def url(
             console.print(msg, style="yellow" if err == "no_host" else "red")
         sys.exit(1)
     u = taskUrl(cli.project_id, host)
+    public_url: str | None = None
+    if cfg is not None and cfg.public_hostname:
+        public_url = f"https://{cfg.public_hostname}/"
     if is_json_mode():
-        print_result({"ok": True, "task": task, "url": u})
+        out: dict = {"ok": True, "task": task, "url": u}
+        if public_url:
+            out["public_url"] = public_url
+        print_result(out)
     else:
         console.print(u)
         from .shell_env import clientTrustMissing
@@ -970,6 +984,8 @@ def url(
                 "Tip: Node/Python may reject this cert — run 'taskmux ca trust-clients' once.",
                 style="dim",
             )
+        if public_url:
+            console.print(f"public: {public_url}", style="cyan")
 
 
 @app.command()
@@ -1859,6 +1875,102 @@ def alias_remove(
 
 
 app.add_typer(alias_app)
+
+
+# ---------------------------------------------------------------------------
+# Tunnel sub-app
+# ---------------------------------------------------------------------------
+
+tunnel_app = typer.Typer(
+    name="tunnel",
+    help=(
+        'Inspect public-tunnel backends. Per-task `tunnel = "cloudflare"` '
+        "in taskmux.toml exposes the service via a Cloudflare Tunnel; this "
+        "command surfaces backend health and recent log lines."
+    ),
+    no_args_is_help=True,
+)
+
+
+@tunnel_app.command("status")
+def tunnel_status_cmd():
+    """Show health + last-sync state of every active tunnel backend."""
+    resp = ipc_client.call("tunnel_status")
+    entries = resp.get("tunnels", [])
+    if is_json_mode():
+        print_result({"ok": True, "tunnels": entries})
+        return
+    if not entries:
+        console.print("No tunnels active.")
+        return
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("Project", style="magenta", no_wrap=True)
+    table.add_column("Backend", style="cyan", no_wrap=True)
+    table.add_column("Tunnel", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Mappings", no_wrap=True)
+    table.add_column("Note", style="dim")
+    for e in entries:
+        status_text = "ok" if e.get("last_sync_ok") else "error"
+        status_style = "green" if e.get("last_sync_ok") else "red"
+        running = e.get("cloudflared_running")
+        if running is False:
+            status_text = "stopped"
+            status_style = "yellow"
+        table.add_row(
+            e.get("session", ""),
+            e.get("backend", ""),
+            e.get("tunnel_name") or "",
+            f"[{status_style}]{status_text}[/{status_style}]",
+            str(e.get("mappings", 0)),
+            e.get("last_error") or "",
+        )
+    console.print(table)
+
+
+@tunnel_app.command("logs")
+def tunnel_logs_cmd(
+    backend: str = typer.Argument("cloudflare", help="Backend name"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Tail the log file"),
+    lines: int = typer.Option(50, "--lines", "-n", help="Lines of history"),
+):
+    """Tail the cloudflared log for a project's tunnel."""
+    from .paths import tunnelStateDir
+
+    log_dir = tunnelStateDir(backend)
+    if not log_dir.exists():
+        if is_json_mode():
+            print_result({"ok": False, "error": "no_logs", "backend": backend})
+        else:
+            console.print(f"No logs for backend '{backend}' yet.", style="yellow")
+        return
+    log_files = sorted(log_dir.glob("*.log"))
+    if not log_files:
+        if is_json_mode():
+            print_result({"ok": False, "error": "no_logs", "backend": backend})
+        else:
+            console.print(f"No logs for backend '{backend}' yet.", style="yellow")
+        return
+    if is_json_mode():
+        print_result({"ok": True, "backend": backend, "files": [str(p) for p in log_files]})
+        return
+    if follow:
+        if len(log_files) == 1:
+            ipc_client.follow_log_file(log_files[0])
+        else:
+            tagged = [(p.stem, p, "cyan") for p in log_files]
+            ipc_client.follow_log_files(tagged)
+        return
+    for path in log_files:
+        console.print(f"==> {path} <==", style="dim")
+        with path.open("rb") as f:
+            data = f.read()
+        text = data.decode("utf-8", errors="replace").splitlines()
+        for line in text[-lines:]:
+            console.print(line)
+
+
+app.add_typer(tunnel_app)
 
 
 def _hoist_global_flags(argv: list[str]) -> list[str]:

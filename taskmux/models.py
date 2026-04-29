@@ -11,6 +11,18 @@ _SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3}
 
 _DNS_SLUG = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 
+# Per-label DNS validation for FQDNs (used for `public_hostname`). Each label
+# is 1–63 chars of [a-z0-9-], not starting or ending with a hyphen. Underscores
+# are valid in some records (e.g. SRV) but not for HTTPS names.
+_DNS_LABEL = re.compile(r"^(?=.{1,63}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+
+
+class TunnelKind(StrEnum):
+    """Per-task public-tunnel backend."""
+
+    CLOUDFLARE = "cloudflare"
+    NOOP = "noop"
+
 
 def slugify(value: str) -> str:
     """Make value DNS-label-safe: lowercase, only [a-z0-9-], no leading/trailing hyphens."""
@@ -64,6 +76,8 @@ class TaskConfig(_StrictConfig):
     cwd: str | None = None
     host: str | None = None
     host_path: str = "/"
+    tunnel: TunnelKind | None = None
+    public_hostname: str | None = None
     health_check: str | None = None
     health_url: str | None = None
     health_expected_status: int = 200
@@ -107,6 +121,55 @@ class TaskConfig(_StrictConfig):
             )
         return v
 
+    @field_validator("public_hostname")
+    @classmethod
+    def _validate_public_hostname(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().lower().rstrip(".")
+        if not v or "." not in v:
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=f"Invalid public_hostname {v!r}: must be a fully-qualified domain name.",
+            )
+        for label in v.split("."):
+            if not _DNS_LABEL.match(label):
+                raise TaskmuxError(
+                    ErrorCode.CONFIG_VALIDATION,
+                    detail=(
+                        f"Invalid public_hostname {v!r}: label {label!r} must be 1–63 "
+                        "lowercase letters/digits/hyphens, not starting or ending with a hyphen."
+                    ),
+                )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_tunnel_requires_host(self) -> "TaskConfig":
+        if self.tunnel is None:
+            return self
+        if self.host is None:
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    "Task with `tunnel` set must also set `host` — taskmux "
+                    "tunnels public traffic through the proxy, which routes by host."
+                ),
+            )
+        if self.host == "*":
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    "Wildcard host (`*`) cannot be tunneled: there's no single FQDN "
+                    "to point a public hostname at. Use a specific host or `@` (apex)."
+                ),
+            )
+        if self.tunnel == TunnelKind.CLOUDFLARE and not self.public_hostname:
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail='`tunnel = "cloudflare"` requires `public_hostname` to be set.',
+            )
+        return self
+
     @field_validator("log_max_size")
     @classmethod
     def _validate_log_max_size(cls, v: str) -> str:
@@ -135,6 +198,29 @@ class WorktreeConfig(_StrictConfig):
     main_branches: list[str] = ["main", "master"]
 
 
+class CloudflareTunnelProjectConfig(_StrictConfig):
+    """Per-project Cloudflare Tunnel settings.
+
+    Credentials (account_id, api_token) live in the host-wide global config so
+    one set of secrets covers every project. Per-project knobs: zone selection
+    and the tunnel name to create / reuse.
+    """
+
+    zone_id: str | None = None
+    """Cloudflare zone ID for `public_hostname` DNS routing. Required when any
+    task in this project sets `tunnel = "cloudflare"`."""
+
+    tunnel_name: str | None = None
+    """Name for the cfd_tunnel created against the account. Defaults to the
+    project_id at sync time (so worktrees get their own tunnels)."""
+
+
+class TunnelProjectConfig(_StrictConfig):
+    """Per-project tunnel block. One sub-block per supported backend."""
+
+    cloudflare: CloudflareTunnelProjectConfig = CloudflareTunnelProjectConfig()
+
+
 class TaskmuxConfig(_StrictConfig):
     """Top-level taskmux.toml schema."""
 
@@ -146,6 +232,7 @@ class TaskmuxConfig(_StrictConfig):
     None = inherit from ~/.taskmux/config.toml; True/False forces it."""
     hooks: HookConfig = HookConfig()
     worktree: WorktreeConfig = WorktreeConfig()
+    tunnel: TunnelProjectConfig = TunnelProjectConfig()
     tasks: dict[str, TaskConfig] = {}
 
     @field_validator("name")
@@ -184,6 +271,23 @@ class TaskmuxConfig(_StrictConfig):
                     detail = f"Duplicate host {cfg.host!r} on tasks {seen[cfg.host]!r} and {name!r}"
                 raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=detail)
             seen[cfg.host] = name
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tunnel_credentials(self) -> "TaskmuxConfig":
+        """If any task uses `tunnel = "cloudflare"`, the project must declare
+        a Cloudflare zone the public hostname will land in. The actual API
+        token + account ID live in the host-wide global config."""
+        uses_cf = any(t.tunnel == TunnelKind.CLOUDFLARE for t in self.tasks.values())
+        if uses_cf and not self.tunnel.cloudflare.zone_id:
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    'A task uses `tunnel = "cloudflare"` but [tunnel.cloudflare] '
+                    "has no `zone_id`. Add the Cloudflare zone ID for the "
+                    "domain hosting your `public_hostname`."
+                ),
+            )
         return self
 
     @model_validator(mode="after")
