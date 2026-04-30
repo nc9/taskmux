@@ -23,6 +23,7 @@ from taskmux.supervisor import (
     _make_log_annotator,
     _parseSince,
     _parseSize,
+    _public_internal_pair,
     make_supervisor,
     readLogFile,
     rotateLogs,
@@ -723,3 +724,103 @@ class TestFactory:
             pytest.raises(NotImplementedError),
         ):
             make_supervisor(cfg, config_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Public/internal port surface (so agents stop pairing url + internal port)
+# ---------------------------------------------------------------------------
+
+
+class TestPublicInternalPair:
+    def test_host_bound_with_port(self):
+        assert _public_internal_pair("api", 58353, 443) == (
+            443,
+            58353,
+            "http://127.0.0.1:58353",
+        )
+
+    def test_host_bound_no_port_yet(self):
+        assert _public_internal_pair("api", None, 443) == (443, None, None)
+
+    def test_non_host_keeps_internal_as_port(self):
+        assert _public_internal_pair(None, None, 443) == (None, None, None)
+
+    def test_custom_proxy_port(self):
+        assert _public_internal_pair("api", 9000, 8443) == (
+            8443,
+            9000,
+            "http://127.0.0.1:9000",
+        )
+
+
+def _patch_global(monkeypatch, proxy_port: int = 443):
+    from taskmux import global_config as gc
+    from taskmux import supervisor as supmod
+
+    fake = gc.GlobalConfig(proxy_https_port=proxy_port)
+    monkeypatch.setattr(supmod, "loadGlobalConfig", lambda: fake, raising=False)
+    # supervisor.py imports loadGlobalConfig lazily inside the methods, so also
+    # patch the source module to cover that import path.
+    monkeypatch.setattr(gc, "loadGlobalConfig", lambda *a, **kw: fake)
+
+
+class TestInspectPortShape:
+    def test_host_bound_emits_internal_fields(self, tmp_path, monkeypatch):
+        _patch_global(monkeypatch, proxy_port=443)
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.assigned_ports["web"] = 58353
+        info = sup.inspect_task("web")
+        assert info["url"] == "https://web.test-session.localhost"
+        assert info["port"] == 443
+        assert info["internal_port"] == 58353
+        assert info["internal_url"] == "http://127.0.0.1:58353"
+
+    def test_host_bound_before_start_has_null_internal(self, tmp_path, monkeypatch):
+        _patch_global(monkeypatch, proxy_port=443)
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        sup = _make_supervisor(cfg, tmp_path)
+        info = sup.inspect_task("web")
+        assert info["port"] == 443
+        assert info["internal_port"] is None
+        assert info["internal_url"] is None
+
+    def test_non_host_unchanged(self, tmp_path, monkeypatch):
+        _patch_global(monkeypatch, proxy_port=443)
+        cfg = _make_config(tasks={"job": "echo"})
+        sup = _make_supervisor(cfg, tmp_path)
+        info = sup.inspect_task("job")
+        assert info["url"] is None
+        assert info["port"] is None
+        assert info["internal_port"] is None
+        assert info["internal_url"] is None
+
+    def test_custom_proxy_port_propagates(self, tmp_path, monkeypatch):
+        _patch_global(monkeypatch, proxy_port=8443)
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.assigned_ports["web"] = 9000
+        info = sup.inspect_task("web")
+        assert info["port"] == 8443
+        assert info["internal_port"] == 9000
+
+
+class TestListTasksPortShape:
+    def test_per_task_shape(self, tmp_path, monkeypatch):
+        _patch_global(monkeypatch, proxy_port=443)
+        cfg = _make_config(
+            tasks={
+                "web": {"command": "echo", "host": "web"},
+                "job": "echo",
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.assigned_ports["web"] = 58353
+        out = sup.list_tasks()
+        rows = {t["name"]: t for t in out["tasks"]}
+        assert rows["web"]["port"] == 443
+        assert rows["web"]["internal_port"] == 58353
+        assert rows["web"]["internal_url"] == "http://127.0.0.1:58353"
+        assert rows["job"]["port"] is None
+        assert rows["job"]["internal_port"] is None
+        assert rows["job"]["internal_url"] is None

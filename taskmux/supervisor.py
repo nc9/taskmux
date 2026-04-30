@@ -288,6 +288,21 @@ class TaskProcess:
     exit_code: int | None = field(default=None)
 
 
+def _public_internal_pair(
+    host: str | None, internal_port: int | None, proxy_port: int
+) -> tuple[int | None, int | None, str | None]:
+    """Status-dict shape for (port, internal_port, internal_url).
+
+    Host-bound tasks expose a public port (the proxy) plus a loopback listener;
+    surfacing the listener under `internal_*` stops agents pairing the public
+    `url` with the loopback port.
+    """
+    if host is None:
+        return internal_port, None, None
+    iurl = f"http://127.0.0.1:{internal_port}" if internal_port else None
+    return proxy_port, internal_port, iurl
+
+
 @runtime_checkable
 class Supervisor(Protocol):
     config: TaskmuxConfig
@@ -916,6 +931,7 @@ class PosixSupervisor:
         return status
 
     def inspect_task(self, task_name: str) -> dict:
+        from .global_config import loadGlobalConfig
         from .url import taskUrl
 
         if task_name not in self.config.tasks:
@@ -923,6 +939,10 @@ class PosixSupervisor:
 
         task_cfg = self.config.tasks[task_name]
         url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
+        proxy_port = loadGlobalConfig().proxy_https_port
+        port, internal_port, internal_url = _public_internal_pair(
+            task_cfg.host, self.assigned_ports.get(task_name), proxy_port
+        )
         info: dict = {
             "name": task_name,
             "command": task_cfg.command,
@@ -932,7 +952,9 @@ class PosixSupervisor:
             "cwd": task_cfg.cwd,
             "host": task_cfg.host,
             "url": url,
-            "port": self.assigned_ports.get(task_name),
+            "port": port,
+            "internal_port": internal_port,
+            "internal_url": internal_url,
             "tunnel": str(task_cfg.tunnel) if task_cfg.tunnel else None,
             "public_hostname": task_cfg.public_hostname,
             "public_url": (
@@ -956,9 +978,11 @@ class PosixSupervisor:
         return info
 
     def list_tasks(self) -> dict:
+        from .global_config import loadGlobalConfig
         from .url import taskUrl
 
         exists = self.session_exists()
+        proxy_port = loadGlobalConfig().proxy_https_port
         tasks = []
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
@@ -966,6 +990,9 @@ class PosixSupervisor:
             url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
             public_url = (
                 f"https://{task_cfg.public_hostname}/" if task_cfg.public_hostname else None
+            )
+            port, internal_port, internal_url = _public_internal_pair(
+                task_cfg.host, self.assigned_ports.get(task_name), proxy_port
             )
             tasks.append(
                 {
@@ -976,7 +1003,9 @@ class PosixSupervisor:
                     "auto_start": task_cfg.auto_start,
                     "host": task_cfg.host,
                     "url": url,
-                    "port": self.assigned_ports.get(task_name),
+                    "port": port,
+                    "internal_port": internal_port,
+                    "internal_url": internal_url,
                     "restart_policy": str(task_cfg.restart_policy),
                     "cwd": task_cfg.cwd,
                     "depends_on": task_cfg.depends_on,
