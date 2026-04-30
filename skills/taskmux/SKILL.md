@@ -111,7 +111,7 @@ Slug + apex + wildcard can coexist; specific hosts win over wildcard. Duplicate 
 
 ### Trusting the CA in Node/Python (the `unable to verify the first certificate` gotcha)
 
-`mkcert -install` (run by `taskmux ca install`) only trusts the root in the **OS keychain**. Node.js (Claude Code, Cursor, VS Code, Electron, MCP SDKs) and Python (`requests`/`httpx`/`ssl`) ignore the keychain — they need env vars pointing at `mkcert -CAROOT/rootCA.pem`. Symptom: HTTPS calls to `https://*.{project}.localhost` fail with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` / `unable to verify the first certificate` / `SSL: CERTIFICATE_VERIFY_FAILED`.
+`mkcert -install` (run by `taskmux ca install`) only trusts the root in the **OS keychain**. Node.js (Claude Code, Cursor, VS Code, Electron, MCP SDKs) and Python (`requests`/`httpx`/`ssl`) ignore the keychain — they need env vars pointing at a CA bundle file. Symptom: HTTPS calls to `https://*.{project}.localhost` fail with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` / `unable to verify the first certificate` / `SSL: CERTIFICATE_VERIFY_FAILED`.
 
 Fix:
 
@@ -121,6 +121,8 @@ taskmux ca trust-clients   # writes NODE_EXTRA_CA_CERTS / REQUESTS_CA_BUNDLE / S
                            #   to ~/.zshenv (zsh) / ~/.bashrc (bash) / ~/.config/fish/config.fish
 source ~/.zshenv           # apply in current shell (new shells inherit automatically)
 ```
+
+`trust-clients` builds a **combined bundle** at `~/.taskmux/ca-bundle.pem` containing the system CAs (Mozilla roots) + mkcert local CA, then points the env vars at it. This is critical: setting `SSL_CERT_FILE` to mkcert's single-CA `rootCA.pem` would strand openssl-using tools (npm, curl, bun publish) and break public TLS with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`. Re-run `trust-clients` after mkcert reissues the root or system CAs change.
 
 Idempotent — re-running replaces the managed sentinel block in place. `--print` emits exports to stdout for `eval` / dotfile managers; `--shell <zsh|bash|fish>` overrides `$SHELL`.
 
