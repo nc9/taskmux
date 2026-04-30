@@ -70,7 +70,10 @@ taskmux daemon [start|stop|status|restart|list]
 taskmux daemon register [--force]   # register cwd in global registry
 
 # Proxy / certs
-taskmux ca install                  # one-time mkcert root install
+taskmux ca install                  # one-time mkcert root install (OS keychain)
+taskmux ca trust-clients            # trust CA in Node/Python (writes ~/.zshenv etc.)
+taskmux ca trust-clients --print    # print exports without writing
+taskmux ca trust-clients --shell zsh|bash|fish
 taskmux dns install|uninstall|flush|query <name>
 ```
 
@@ -105,6 +108,21 @@ Result shape: `{"ok": true|false, ...}`. Error: `{"ok": false, "error": "..."}`.
 | `"*"` (wildcard) | catch-all for `*.{project}.localhost` | one per project; URL displayed as `https://*.{project}.localhost` (display only) |
 
 Slug + apex + wildcard can coexist; specific hosts win over wildcard. Duplicate slugs/apex/wildcard rejected at config-validation time.
+
+### Trusting the CA in Node/Python (the `unable to verify the first certificate` gotcha)
+
+`mkcert -install` (run by `taskmux ca install`) only trusts the root in the **OS keychain**. Node.js (Claude Code, Cursor, VS Code, Electron, MCP SDKs) and Python (`requests`/`httpx`/`ssl`) ignore the keychain — they need env vars pointing at `mkcert -CAROOT/rootCA.pem`. Symptom: HTTPS calls to `https://*.{project}.localhost` fail with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` / `unable to verify the first certificate` / `SSL: CERTIFICATE_VERIFY_FAILED`.
+
+Fix:
+
+```bash
+taskmux ca install         # OS keychain (browsers, curl)
+taskmux ca trust-clients   # writes NODE_EXTRA_CA_CERTS / REQUESTS_CA_BUNDLE / SSL_CERT_FILE
+                           #   to ~/.zshenv (zsh) / ~/.bashrc (bash) / ~/.config/fish/config.fish
+source ~/.zshenv           # apply in current shell (new shells inherit automatically)
+```
+
+Idempotent — re-running replaces the managed sentinel block in place. `--print` emits exports to stdout for `eval` / dotfile managers; `--shell <zsh|bash|fish>` overrides `$SHELL`.
 
 How proxy serves a request:
 1. Daemon binds `:443` (configurable) and a per-process `state.json` records each task's `$PORT`.
