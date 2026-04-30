@@ -73,18 +73,20 @@ class ProxyServer:
         self,
         https_port: int = 443,
         bind: str = "127.0.0.1",
-        sock: socket.socket | None = None,
+        socks: list[socket.socket] | None = None,
     ) -> None:
         self.https_port = https_port
         self.bind = bind
-        # Optional pre-bound listening socket. Used when the daemon binds :443
-        # as root and then drops privileges before starting the listener.
-        self._sock = sock
+        # Optional pre-bound listening sockets. The daemon binds :443 as root,
+        # drops privileges, and hands the sockets here. Multiple sockets are
+        # used for dual-stack (v4 + v6) so macOS getaddrinfo's `*.localhost`
+        # → ::1 mapping doesn't dead-end on a v4-only listener.
+        self._socks: list[socket.socket] = list(socks) if socks else []
         self.logger = logging.getLogger("taskmux-daemon.proxy")
         self._routes: dict[tuple[str, str], int] = {}
         self._projects: dict[str, _ProjectCert] = {}
         self._runner: web.AppRunner | None = None
-        self._site: web.BaseSite | None = None
+        self._sites: list[web.BaseSite] = []
         self._default_ctx: ssl.SSLContext | None = None
 
     # ---- public mutators ----
@@ -133,26 +135,34 @@ class ProxyServer:
         # SNI dispatch: swap context to match servername.
         self._default_ctx.sni_callback = self._sni_callback  # type: ignore[attr-defined]
 
-        if self._sock is not None:
-            self._site = web.SockSite(
-                self._runner,
-                self._sock,
-                ssl_context=self._default_ctx,
-            )
+        if self._socks:
+            for sk in self._socks:
+                site = web.SockSite(
+                    self._runner,
+                    sk,
+                    ssl_context=self._default_ctx,
+                )
+                await site.start()
+                self._sites.append(site)
+                fam = "v6" if sk.family == socket.AF_INET6 else "v4"
+                self.logger.info(
+                    f"Proxy listening on https://{self.bind}:{self.https_port} ({fam})"
+                )
         else:
-            self._site = web.TCPSite(
+            site = web.TCPSite(
                 self._runner,
                 host=self.bind,
                 port=self.https_port,
                 ssl_context=self._default_ctx,
             )
-        await self._site.start()
-        self.logger.info(f"Proxy listening on https://{self.bind}:{self.https_port}")
+            await site.start()
+            self._sites.append(site)
+            self.logger.info(f"Proxy listening on https://{self.bind}:{self.https_port}")
 
     async def stop(self) -> None:
-        if self._site is not None:
-            await self._site.stop()
-            self._site = None
+        for site in self._sites:
+            await site.stop()
+        self._sites = []
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None

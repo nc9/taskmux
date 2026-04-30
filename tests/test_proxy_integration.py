@@ -113,6 +113,81 @@ def test_proxy_routes_https_traffic_end_to_end(tmp_path):
     assert "api.demo.localhost" in payload["raw"]
 
 
+def test_proxy_serves_both_v4_and_v6_loopback(tmp_path):
+    """Regression: macOS getaddrinfo maps *.localhost to ::1 first, so the
+    proxy must answer on the v6 loopback as well as v4."""
+    from aiohttp import web
+
+    from taskmux.proxy import ProxyServer
+
+    if sys.platform == "win32":
+        pytest.skip("event-loop policy specifics on windows")
+
+    upstream_port = _free_port()
+    proxy_port = _free_port()
+    cert, key = _make_cert(tmp_path / "certs" / "demo", "demo")
+
+    async def upstream_handler(request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    def _bind(family: int, addr: str, port: int) -> socket.socket:
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s.bind((addr, port))
+        s.listen(64)
+        s.setblocking(False)
+        return s
+
+    async def run() -> tuple[int, int]:
+        upstream = web.Application()
+        upstream.router.add_get("/{tail:.*}", upstream_handler)
+        runner = web.AppRunner(upstream, access_log=None)
+        await runner.setup()
+        upsite = web.TCPSite(runner, host="127.0.0.1", port=upstream_port)
+        await upsite.start()
+
+        try:
+            v4 = _bind(socket.AF_INET, "127.0.0.1", proxy_port)
+            v6 = _bind(socket.AF_INET6, "::1", proxy_port)
+        except OSError:
+            pytest.skip("v6 loopback not available in this environment")
+
+        proxy = ProxyServer(https_port=proxy_port, bind="127.0.0.1", socks=[v4, v6])
+        proxy.register_project("demo", cert, key)
+        proxy.set_route("demo", "api", upstream_port)
+        await proxy.start()
+
+        async def _hit(host: str) -> int:
+            ssl_ctx = ssl.create_default_context(cafile=str(_ca_root()))
+            reader, writer = await asyncio.open_connection(
+                host,
+                proxy_port,
+                ssl=ssl_ctx,
+                server_hostname="api.demo.localhost",
+            )
+            writer.write(b"GET / HTTP/1.1\r\nHost: api.demo.localhost\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            raw = await reader.read()
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return int(raw.split(b"\r\n", 1)[0].split()[1])
+
+        try:
+            v4_status = await _hit("127.0.0.1")
+            v6_status = await _hit("::1")
+            return v4_status, v6_status
+        finally:
+            await proxy.stop()
+            await runner.cleanup()
+
+    v4_status, v6_status = asyncio.run(run())
+    assert v4_status == 200
+    assert v6_status == 200
+
+
 def test_proxy_returns_502_for_unmatched_route(tmp_path):
     from taskmux.proxy import ProxyServer
 

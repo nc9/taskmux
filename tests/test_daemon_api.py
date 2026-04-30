@@ -14,6 +14,132 @@ import websockets
 from taskmux import daemon as daemon_mod
 from taskmux import paths as paths_mod
 from taskmux import registry as reg
+from taskmux.daemon import TaskmuxDaemon
+
+
+class TestProxyBindTargets:
+    """Plan dual-stack pairs so v6-preferring resolvers reach the proxy."""
+
+    def test_v4_loopback_mirrors_v6(self):
+        assert TaskmuxDaemon._proxy_bind_targets("127.0.0.1") == [
+            (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET6, "::1"),
+        ]
+
+    def test_v6_loopback_mirrors_v4(self):
+        assert TaskmuxDaemon._proxy_bind_targets("::1") == [
+            (socket.AF_INET6, "::1"),
+            (socket.AF_INET, "127.0.0.1"),
+        ]
+
+    def test_v4_wildcard_mirrors_v6_wildcard(self):
+        assert TaskmuxDaemon._proxy_bind_targets("0.0.0.0") == [
+            (socket.AF_INET, "0.0.0.0"),
+            (socket.AF_INET6, "::"),
+        ]
+
+    def test_v6_wildcard_mirrors_v4_wildcard(self):
+        assert TaskmuxDaemon._proxy_bind_targets("::") == [
+            (socket.AF_INET6, "::"),
+            (socket.AF_INET, "0.0.0.0"),
+        ]
+
+    def test_specific_v4_address_single_stack(self):
+        assert TaskmuxDaemon._proxy_bind_targets("10.0.0.5") == [
+            (socket.AF_INET, "10.0.0.5"),
+        ]
+
+    def test_specific_v6_address_single_stack(self):
+        assert TaskmuxDaemon._proxy_bind_targets("fd00::1") == [
+            (socket.AF_INET6, "fd00::1"),
+        ]
+
+
+class TestPreBindProxySockets:
+    """Partial-fallback behavior when v6 bring-up fails."""
+
+    def _ephemeral_port(self) -> int:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def _make_daemon(self, port: int) -> TaskmuxDaemon:
+        from taskmux.global_config import GlobalConfig
+
+        d = TaskmuxDaemon.__new__(TaskmuxDaemon)
+        d.global_config = GlobalConfig(proxy_bind="127.0.0.1", proxy_https_port=port)
+        d.logger = daemon_mod.logging.getLogger("taskmux-daemon-test")
+        return d
+
+    def test_v6_socket_creation_failure_falls_back_to_v4(self, monkeypatch):
+        """OSError from socket.socket(AF_INET6, ...) must NOT abort startup."""
+        port = self._ephemeral_port()
+        d = self._make_daemon(port)
+
+        real_socket = socket.socket
+
+        def fake_socket(family, *args, **kwargs):
+            if family == socket.AF_INET6:
+                raise OSError("Address family not supported by protocol")
+            return real_socket(family, *args, **kwargs)
+
+        monkeypatch.setattr(daemon_mod.socket, "socket", fake_socket)
+
+        try:
+            socks = d._pre_bind_proxy_sockets()
+            assert len(socks) == 1
+            assert socks[0].family == socket.AF_INET
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_v6_setsockopt_failure_falls_back_to_v4(self, monkeypatch):
+        """OSError from IPV6_V6ONLY setsockopt must NOT abort startup."""
+        port = self._ephemeral_port()
+        d = self._make_daemon(port)
+
+        real_socket = socket.socket
+
+        class FakeV6Sock:
+            def __init__(self, *a, **kw):
+                self._real = real_socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            def setsockopt(self, level, optname, value):  # noqa: ARG002
+                if level == socket.IPPROTO_IPV6:
+                    raise OSError("Operation not supported")
+
+            def close(self):
+                self._real.close()
+
+        def fake_socket(family, *args, **kwargs):
+            if family == socket.AF_INET6:
+                return FakeV6Sock(family, *args, **kwargs)
+            return real_socket(family, *args, **kwargs)
+
+        monkeypatch.setattr(daemon_mod.socket, "socket", fake_socket)
+
+        try:
+            socks = d._pre_bind_proxy_sockets()
+            assert len(socks) == 1
+            assert socks[0].family == socket.AF_INET
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_primary_bind_failure_aborts(self, monkeypatch):
+        """When v4 (primary) fails, return [] — daemon can't serve any traffic."""
+        port = self._ephemeral_port()
+        d = self._make_daemon(port)
+
+        real_socket = socket.socket
+
+        def fake_socket(family, *args, **kwargs):
+            if family == socket.AF_INET:
+                raise OSError("EACCES")
+            return real_socket(family, *args, **kwargs)
+
+        monkeypatch.setattr(daemon_mod.socket, "socket", fake_socket)
+        assert d._pre_bind_proxy_sockets() == []
 
 
 class FakeSupervisor:

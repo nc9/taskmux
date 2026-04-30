@@ -213,7 +213,7 @@ class TaskmuxDaemon:
         self.proxy: ProxyServer | None = None
         self._proxy_eligible = False
         self._proxy_started = False
-        self._proxy_sock: socket.socket | None = None
+        self._proxy_socks: list[socket.socket] = []
         self.host_resolver: HostResolver | None = None
         self.dns_server: object | None = None
         # (project_id, backend_name) -> TunnelBackend. Lazily created on
@@ -258,7 +258,7 @@ class TaskmuxDaemon:
             sys.exit(1)
 
         self._warn_if_unprivileged()
-        self._proxy_sock = self._pre_bind_proxy_socket()
+        self._proxy_socks = self._pre_bind_proxy_sockets()
         self._install_resolver_root()
         self._drop_privileges()
 
@@ -518,32 +518,85 @@ class TaskmuxDaemon:
             'host_resolver = "noop") in ~/.taskmux/config.toml.'
         )
 
-    def _pre_bind_proxy_socket(self) -> socket.socket | None:
+    @staticmethod
+    def _proxy_bind_targets(bind: str) -> list[tuple[int, str]]:
+        """Plan address-family pairs for a given proxy_bind string.
+
+        Loopback v4↔v6 are mirrored so a v6-preferring resolver (macOS
+        getaddrinfo for `*.localhost`) doesn't dead-end. Wildcard binds
+        likewise mirror across families. Specific non-loopback addresses
+        bind exactly that family (operator opt-in).
+        """
+        if bind == "127.0.0.1":
+            return [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")]
+        if bind == "0.0.0.0":
+            return [(socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")]
+        if bind == "::1":
+            return [(socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")]
+        if bind == "::":
+            return [(socket.AF_INET6, "::"), (socket.AF_INET, "0.0.0.0")]
+        family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+        return [(family, bind)]
+
+    def _pre_bind_proxy_sockets(self) -> list[socket.socket]:
+        """Bind proxy listeners as root, before privilege drop.
+
+        macOS libc maps `*.localhost` → both 127.0.0.1 *and* ::1, with v6
+        preferred by getaddrinfo. Listening only on v4 means TLS handshake
+        fails for any client that tries v6 first (curl, browsers). When the
+        operator picks a loopback bind we mirror to the matching v6/v4 family
+        so connections land regardless of address selection. Operators who
+        bind to a specific non-loopback address get exactly what they asked
+        for — no surprises.
+        """
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
-            return None
+            return []
         if not self.global_config.proxy_enabled:
-            return None
-        family = socket.AF_INET
-        addr = (self.global_config.proxy_bind, self.global_config.proxy_https_port)
-        s = socket.socket(family, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(addr)
-            s.listen(128)
-            s.setblocking(False)
-        except (PermissionError, OSError) as e:
-            s.close()
-            self.logger.error(
-                f"Pre-bind to {addr[0]}:{addr[1]} failed: {e}. "
-                f"Run with `sudo taskmux daemon` (the daemon binds :443 as root "
-                f"then drops privileges immediately) or set proxy_https_port to "
-                f"a non-privileged port (>=1024) in ~/.taskmux/config.toml."
+            return []
+
+        bind = self.global_config.proxy_bind
+        port = self.global_config.proxy_https_port
+        targets = self._proxy_bind_targets(bind)
+
+        socks: list[socket.socket] = []
+        for family, addr in targets:
+            display = f"[{addr}]:{port}" if family == socket.AF_INET6 else f"{addr}:{port}"
+            s: socket.socket | None = None
+            try:
+                # Cover the whole bring-up: AF_INET6 itself can EAFNOSUPPORT
+                # on hosts with v6 disabled, and IPV6_V6ONLY can EOPNOTSUPP
+                # on some kernels — both must fall through to the secondary
+                # warning path, not abort daemon startup.
+                s = socket.socket(family, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if family == socket.AF_INET6:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                s.bind((addr, port))
+                s.listen(128)
+                s.setblocking(False)
+            except (PermissionError, OSError) as e:
+                if s is not None:
+                    s.close()
+                primary = not socks
+                if primary:
+                    self.logger.error(
+                        f"Pre-bind to {display} failed: {e}. "
+                        f"Run with `sudo taskmux daemon` (the daemon binds :{port} as root "
+                        f"then drops privileges immediately) or set proxy_https_port to "
+                        f"a non-privileged port (>=1024) in ~/.taskmux/config.toml."
+                    )
+                    return []
+                self.logger.warning(
+                    f"Pre-bind to {display} failed: {e}; serving without "
+                    f"this address family. macOS clients preferring this "
+                    f"family will fail to connect."
+                )
+                continue
+            socks.append(s)
+            self.logger.info(
+                f"Pre-bound proxy listener on {display} (will TLS-wrap after privilege drop)"
             )
-            return None
-        self.logger.info(
-            f"Pre-bound proxy listener on {addr[0]}:{addr[1]} (will TLS-wrap after privilege drop)"
-        )
-        return s
+        return socks
 
     def _install_resolver_root(self) -> None:
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
@@ -868,7 +921,7 @@ class TaskmuxDaemon:
         self.proxy = ProxyServer(
             https_port=self.global_config.proxy_https_port,
             bind=self.global_config.proxy_bind,
-            sock=self._proxy_sock,
+            socks=self._proxy_socks,
         )
         self._proxy_eligible = True
         async with self._lock:
