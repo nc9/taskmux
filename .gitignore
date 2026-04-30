@@ -14,3 +14,6 @@ CLAUDE.md
 .env*
 .DS_Store
 .claude/
+
+# local brand reference page (assets are committed; preview is not)
+branding/
