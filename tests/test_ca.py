@@ -103,6 +103,47 @@ def test_mint_cert_idempotent_when_cached(isolated_paths, monkeypatch):
         mock_run.assert_not_called()
 
 
+def test_ca_root_path_returns_pem(isolated_paths, monkeypatch, tmp_path):
+    monkeypatch.setattr(ca.shutil, "which", lambda _name: "/usr/bin/mkcert")
+    caroot = tmp_path / "caroot"
+    caroot.mkdir()
+    (caroot / "rootCA.pem").write_text("FAKEROOT")
+
+    def fake_run(cmd, **_kwargs):  # noqa: ANN001
+        class _R:
+            returncode = 0
+            stdout = f"{caroot}\n"
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    pem = ca.caRootPath()
+    assert pem == caroot / "rootCA.pem"
+    assert pem.read_text() == "FAKEROOT"
+
+
+def test_ca_root_path_raises_when_pem_missing(isolated_paths, monkeypatch, tmp_path):
+    monkeypatch.setattr(ca.shutil, "which", lambda _name: "/usr/bin/mkcert")
+    caroot = tmp_path / "empty-caroot"
+    caroot.mkdir()
+
+    def fake_run(cmd, **_kwargs):  # noqa: ANN001
+        class _R:
+            returncode = 0
+            stdout = f"{caroot}\n"
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    with pytest.raises(Exception) as exc_info:
+        ca.caRootPath()
+    assert "rootCA.pem not found" in str(exc_info.value)
+    assert "taskmux ca install" in str(exc_info.value)
+    assert exc_info.value.code == ErrorCode.INTERNAL
+
+
 def test_mint_cert_failure_raises(isolated_paths, monkeypatch):
     monkeypatch.setattr(ca.shutil, "which", lambda _name: "/usr/bin/mkcert")
 

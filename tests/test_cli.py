@@ -366,3 +366,47 @@ class TestRemoveCommand:
             result = runner.invoke(app, ["remove", "server"])
             assert result.exit_code == 0
             mock_rm.assert_called_once_with(None, "server")
+
+
+class TestCaTrustClients:
+    def test_print_emits_export_lines(self, tmp_path: Path, monkeypatch):
+        pem = tmp_path / "rootCA.pem"
+        pem.write_text("FAKE")
+        monkeypatch.setenv("SHELL", "/bin/zsh")
+        with patch("taskmux.ca.caRootPath", return_value=pem):
+            result = runner.invoke(app, ["ca", "trust-clients", "--print", "--shell", "zsh"])
+        assert result.exit_code == 0
+        assert f'export NODE_EXTRA_CA_CERTS="{pem}"' in result.output
+        assert f'export REQUESTS_CA_BUNDLE="{pem}"' in result.output
+        assert f'export SSL_CERT_FILE="{pem}"' in result.output
+
+    def test_print_fish_uses_set_gx(self, tmp_path: Path, monkeypatch):
+        pem = tmp_path / "rootCA.pem"
+        pem.write_text("FAKE")
+        with patch("taskmux.ca.caRootPath", return_value=pem):
+            result = runner.invoke(app, ["ca", "trust-clients", "--print", "--shell", "fish"])
+        assert result.exit_code == 0
+        assert f'set -gx NODE_EXTRA_CA_CERTS "{pem}"' in result.output
+
+    def test_writes_block_to_rc(self, tmp_path: Path, monkeypatch):
+        pem = tmp_path / "rootCA.pem"
+        pem.write_text("FAKE")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        with patch("taskmux.ca.caRootPath", return_value=pem):
+            result = runner.invoke(app, ["ca", "trust-clients", "--shell", "zsh"])
+        assert result.exit_code == 0
+        rc = tmp_path / ".zshenv"
+        assert rc.exists()
+        text = rc.read_text()
+        assert "# >>> taskmux trust-clients >>>" in text
+        assert f'export NODE_EXTRA_CA_CERTS="{pem}"' in text
+
+    def test_missing_rootca_fails(self, tmp_path: Path, monkeypatch):
+        from taskmux.errors import ErrorCode, TaskmuxError
+
+        def boom():
+            raise TaskmuxError(ErrorCode.INTERNAL, detail="rootCA.pem not found")
+
+        with patch("taskmux.ca.caRootPath", side_effect=boom):
+            result = runner.invoke(app, ["ca", "trust-clients", "--shell", "zsh"])
+        assert result.exit_code == 1

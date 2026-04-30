@@ -60,6 +60,34 @@ def ensureCAInstalled() -> None:
         )
 
 
+def caRootPath() -> Path:
+    """Resolve mkcert's root CA file (rootCA.pem) under `mkcert -CAROOT`.
+
+    Raises TaskmuxError if rootCA.pem is missing — usually means the user has
+    not run `taskmux ca install` yet.
+    """
+    bin_path = _mkcertBin()
+    result = subprocess.run(
+        [bin_path, "-CAROOT"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        msg = result.stderr.strip() or result.stdout.strip() or "(no output)"
+        raise TaskmuxError(
+            ErrorCode.INTERNAL,
+            detail=f"mkcert -CAROOT failed: {msg}",
+        )
+    pem = Path(result.stdout.strip()) / "rootCA.pem"
+    if not pem.exists():
+        raise TaskmuxError(
+            ErrorCode.INTERNAL,
+            detail=f"rootCA.pem not found at {pem} — run 'taskmux ca install' first.",
+        )
+    return pem
+
+
 def mintCert(project: str) -> tuple[Path, Path]:
     """Mint cert + key for *.{project}.localhost. Cached at ~/.taskmux/certs/{project}/."""
     bin_path = _mkcertBin()

@@ -963,6 +963,13 @@ def url(
         print_result({"ok": True, "task": task, "url": u})
     else:
         console.print(u)
+        from .shell_env import clientTrustMissing
+
+        if clientTrustMissing():
+            console.print(
+                "Tip: Node/Python may reject this cert — run 'taskmux ca trust-clients' once.",
+                style="dim",
+            )
 
 
 @app.command()
@@ -1365,6 +1372,11 @@ def ca_install():
         print_result({"ok": True, "action": "installed"})
     else:
         console.print("Local CA installed (mkcert -install).")
+        console.print(
+            "Tip: run 'taskmux ca trust-clients' so Node/Python "
+            "(Claude Code, Cursor, etc.) trust this CA.",
+            style="dim",
+        )
 
 
 @ca_app.command("mint")
@@ -1386,6 +1398,74 @@ def ca_mint():
     else:
         console.print(f"Cert: {cert}")
         console.print(f"Key:  {key}")
+
+
+@ca_app.command("trust-clients")
+def ca_trust_clients(
+    shell: Optional[str] = typer.Option(  # noqa: UP045
+        None,
+        "--shell",
+        help="Override $SHELL (zsh|bash|fish).",
+    ),
+    print_only: bool = typer.Option(
+        False,
+        "--print",
+        help="Print exports to stdout, do not write any file.",
+    ),
+):
+    """Trust the mkcert root CA in Node.js and Python by writing env-var
+    exports into your shell rc file (NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE,
+    SSL_CERT_FILE).
+    """
+    from . import ca, shell_env
+
+    try:
+        sh = shell_env.detectShell(shell)
+        caPath = ca.caRootPath()
+    except (ca.MkcertMissing, TaskmuxError) as e:
+        msg = e.message if hasattr(e, "message") else str(e)
+        if is_json_mode():
+            print_result({"ok": False, "error": msg})
+        else:
+            console.print(msg, style="red")
+        sys.exit(1)
+
+    if print_only:
+        sys.stdout.write(shell_env.renderExportsOnly(caPath, sh))
+        sys.stdout.flush()
+        if is_json_mode():
+            print_result({"ok": True, "action": "printed", "shell": sh, "caPath": str(caPath)})
+        return
+
+    result = shell_env.applyTrustClients(caPath, sh)
+    if not result.get("ok"):
+        if is_json_mode():
+            print_result(result)
+        else:
+            console.print(result.get("error", "trust-clients failed"), style="red")
+        sys.exit(1)
+
+    if is_json_mode():
+        print_result(result)
+    else:
+        action = result["action"]
+        rc = result["rcFile"]
+        if action == "unchanged":
+            console.print(f"No change — exports already present in {rc}.")
+        else:
+            verb = "Replaced" if action == "replaced" else "Wrote"
+            console.print(f"{verb} 3 exports in {rc}.")
+            console.print(f"To apply now: source {rc}")
+            if sh == "zsh":
+                console.print(
+                    "New shells and macOS GUI app launches inherit it automatically.",
+                    style="dim",
+                )
+            elif sh == "bash":
+                console.print(
+                    "New shells inherit it; relaunch GUI apps so they pick it up.",
+                    style="dim",
+                )
 
 
 app.add_typer(ca_app)
@@ -1631,6 +1711,13 @@ def worktree_urls():
         return
     for row in out:
         console.print(f"{row['task']:15} {row['url']}")
+    from .shell_env import clientTrustMissing
+
+    if clientTrustMissing():
+        console.print(
+            "Tip: Node/Python may reject these certs — run 'taskmux ca trust-clients' once.",
+            style="dim",
+        )
 
 
 app.add_typer(worktree_app)
@@ -1699,6 +1786,13 @@ def alias_add(
         )
     else:
         console.print(f"Alias '{name}' → {u} (127.0.0.1:{entry['port']})")
+        from .shell_env import clientTrustMissing
+
+        if clientTrustMissing():
+            console.print(
+                "Tip: Node/Python may reject this cert — run 'taskmux ca trust-clients' once.",
+                style="dim",
+            )
 
 
 @alias_app.command("list")
