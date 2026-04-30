@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>taskmux — branding</title>
+<style>
+  :root {
+    --bg: #0A0A0B;
+    --fg: #FAFAF7;
+    --muted: #71717A;
+    --tile: #111113;
+    --border: rgba(255,255,255,0.08);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 64px 32px 128px;
+    -webkit-font-smoothing: antialiased;
+  }
+  body.theme-light { --bg: #F4F1EA; --fg: #0A0A0B; --muted: #52525B; --tile: #FFFFFF; --border: rgba(0,0,0,0.10); }
+  .container { max-width: 1200px; margin: 0 auto; }
+
+  header {
+    margin-bottom: 64px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  h1 {
+    font-family: "Inter", "SF Pro Display", -apple-system, system-ui, sans-serif;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin: 0;
+  }
+  h1 span { color: var(--muted); font-weight: 400; }
+
+  .controls { display: flex; gap: 6px; align-items: center; }
+  .controls label { color: var(--muted); margin-right: 8px; }
+  .controls button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    padding: 6px 12px;
+    font: inherit;
+    cursor: pointer;
+    border-radius: 6px;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .controls button.active { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+
+  .row-title {
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 11px;
+    margin: 56px 0 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .row-title:first-of-type { margin-top: 0; }
+  .row-title .hint { text-transform: none; letter-spacing: 0; color: var(--muted); }
+
+  /* hero */
+  .hero {
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: var(--tile);
+    padding: 96px 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 32px;
+    flex-direction: column;
+  }
+  .hero img.icon { height: 120px; width: 120px; }
+  .hero img.wm { width: 100%; max-width: 480px; }
+
+  /* favicon row */
+  .fav-row {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 16px;
+  }
+  .fav {
+    aspect-ratio: 1 / 1;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--tile);
+    display: grid;
+    place-items: center;
+    padding: 12px;
+    position: relative;
+  }
+  .fav img { max-width: 100%; max-height: 100%; }
+  .fav .cap { position: absolute; bottom: 6px; right: 8px; font-size: 10px; color: var(--muted); }
+
+  /* icon grid */
+  .icon-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 20px;
+  }
+  .card {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    background: var(--tile);
+  }
+  .card .canvas {
+    aspect-ratio: 1 / 1;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+  }
+  .card .canvas img { max-width: 80%; max-height: 80%; }
+  .card .meta {
+    padding: 14px 18px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .card .meta .name { font-weight: 500; }
+  .card .meta .desc { color: var(--muted); font-size: 12px; }
+
+  /* wordmark grid */
+  .wm-grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
+  .wm-card {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    overflow: hidden;
+    background: var(--tile);
+  }
+  .wm-card .wm-canvas {
+    padding: 56px 64px;
+    display: grid;
+    place-items: center;
+  }
+  .wm-card .wm-canvas img { width: 100%; max-width: 720px; height: auto; }
+  .wm-card .meta {
+    padding: 14px 18px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .wm-card .meta .name { font-weight: 500; }
+  .wm-card .meta .desc { color: var(--muted); font-size: 12px; }
+
+  /* lockup row */
+  .lockup-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+    gap: 20px;
+  }
+  .lockup {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 28px 32px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--tile);
+  }
+  .lockup img.icon { height: 64px; width: 64px; }
+  .lockup img.wm { height: 32px; width: auto; }
+
+  /* tokens */
+  .tokens {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 16px;
+  }
+  .token {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--tile);
+  }
+  .token .swatch { height: 88px; }
+  .token .info {
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .token .info .name { font-weight: 500; color: var(--fg); }
+  .token .info .hex { color: var(--muted); font-size: 12px; }
+
+  /* downloads */
+  .dl-table {
+    width: 100%;
+    border-collapse: collapse;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    font-size: 12px;
+  }
+  .dl-table th, .dl-table td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .dl-table th { color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.08em; font-size: 11px; }
+  .dl-table tr:last-child td { border-bottom: none; }
+  .dl-table a { color: var(--fg); text-decoration: none; border-bottom: 1px solid var(--border); }
+  .dl-table a:hover { border-bottom-color: var(--fg); }
+</style>
+</head>
+<body class="theme-dark">
+
+<div class="container">
+  <header>
+    <h1>taskmux <span>— brand assets</span></h1>
+    <div class="controls">
+      <button data-theme="dark" class="active">dark</button>
+      <button data-theme="light">light</button>
+    </div>
+  </header>
+
+  <div class="row-title">hero</div>
+  <div class="hero">
+    <img class="icon" id="heroIcon" src="../assets/taskmux-icon-dark-512.webp" alt="taskmux icon" />
+    <img class="wm" id="heroWm" src="../assets/taskmux-wordmark-dark-1600.webp" alt="taskmux" />
+  </div>
+
+  <div class="row-title">icon — favicon scale <span class="hint">128 · 512 · 1024</span></div>
+  <div class="fav-row" id="favRow"></div>
+
+  <div class="row-title">icon — full</div>
+  <div class="icon-grid" id="iconGrid"></div>
+
+  <div class="row-title">wordmark</div>
+  <div class="wm-grid" id="wmGrid"></div>
+
+  <div class="row-title">lockup</div>
+  <div class="lockup-row" id="lockupRow"></div>
+
+  <div class="row-title">colors</div>
+  <div class="tokens" id="tokens"></div>
+
+  <div class="row-title">downloads</div>
+  <table class="dl-table" id="dlTable">
+    <thead>
+      <tr><th>asset</th><th>format</th><th>size</th><th>file</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const iconSizes = [128, 512, 1024];
+const wmWidths = [800, 1600];
+const colors = [
+  { name: "ink",        hex: "#0A0A0B", note: "near-black, light-theme text" },
+  { name: "paper",      hex: "#FAFAF7", note: "off-white, dark-theme text" },
+  { name: "console",    hex: "#22C55E", note: "accent — cursor, active state" },
+  { name: "muted",      hex: "#71717A", note: "subdued labels" },
+  { name: "border",     hex: "#27272A", note: "hairline (dark)" },
+  { name: "surface",    hex: "#111113", note: "card surface (dark)" },
+];
+
+function el(tag, props, children) {
+  const e = document.createElement(tag);
+  if (props) Object.assign(e, props);
+  (children || []).forEach(c => e.appendChild(c));
+  return e;
+}
+
+function setTheme(theme) {
+  document.body.classList.toggle("theme-light", theme === "light");
+  document.body.classList.toggle("theme-dark", theme === "dark");
+  const variant = theme === "dark" ? "dark" : "light";
+  document.getElementById("heroIcon").src = `../assets/taskmux-icon-${variant}-512.webp`;
+  document.getElementById("heroWm").src = `../assets/taskmux-wordmark-${variant}-1600.webp`;
+  document.querySelectorAll("img[data-icon]").forEach(img => {
+    img.src = `../assets/taskmux-icon-${variant}-${img.dataset.icon}.webp`;
+  });
+  document.querySelectorAll("img[data-wm]").forEach(img => {
+    img.src = `../assets/taskmux-wordmark-${variant}-${img.dataset.wm}.webp`;
+  });
+}
+
+const favRow = document.getElementById("favRow");
+iconSizes.forEach(s => {
+  const img = el("img");
+  img.dataset.icon = String(s);
+  img.alt = `${s}px`;
+  const cap = el("span", { className: "cap", textContent: `${s}` });
+  favRow.appendChild(el("div", { className: "fav" }, [img, cap]));
+});
+
+const iconGrid = document.getElementById("iconGrid");
+iconSizes.forEach(s => {
+  const img = el("img");
+  img.dataset.icon = String(s);
+  img.alt = `icon ${s}`;
+  const canvas = el("div", { className: "canvas" }, [img]);
+  const name = el("span", { className: "name", textContent: `icon-${s}` });
+  const desc = el("span", { className: "desc", textContent: `${s}×${s}` });
+  const meta = el("div", { className: "meta" }, [name, desc]);
+  iconGrid.appendChild(el("div", { className: "card" }, [canvas, meta]));
+});
+
+const wmGrid = document.getElementById("wmGrid");
+wmWidths.forEach(w => {
+  const img = el("img");
+  img.dataset.wm = String(w);
+  img.alt = `wordmark ${w}`;
+  const canvas = el("div", { className: "wm-canvas" }, [img]);
+  const name = el("span", { className: "name", textContent: `wordmark-${w}` });
+  const desc = el("span", { className: "desc", textContent: `${w}px wide` });
+  const meta = el("div", { className: "meta" }, [name, desc]);
+  wmGrid.appendChild(el("div", { className: "wm-card" }, [canvas, meta]));
+});
+
+const lockupRow = document.getElementById("lockupRow");
+[64, 96, 128].forEach(scale => {
+  const icon = el("img", { className: "icon" });
+  icon.dataset.icon = "512";
+  icon.style.height = `${scale}px`;
+  icon.style.width = `${scale}px`;
+  icon.alt = "";
+  const wm = el("img", { className: "wm" });
+  wm.dataset.wm = "800";
+  wm.style.height = `${Math.round(scale * 0.45)}px`;
+  wm.alt = "taskmux";
+  lockupRow.appendChild(el("div", { className: "lockup" }, [icon, wm]));
+});
+
+const tokens = document.getElementById("tokens");
+colors.forEach(c => {
+  const sw = el("div", { className: "swatch" });
+  sw.style.background = c.hex;
+  const name = el("span", { className: "name", textContent: c.name });
+  const hex = el("span", { className: "hex", textContent: `${c.hex} — ${c.note}` });
+  const info = el("div", { className: "info" }, [name, hex]);
+  tokens.appendChild(el("div", { className: "token" }, [sw, info]));
+});
+
+const dlBody = document.querySelector("#dlTable tbody");
+function dlRow(asset, fmt, size, file) {
+  const tr = el("tr");
+  [asset, fmt, size, ""].forEach((t, i) => {
+    const td = el("td");
+    if (i === 3) {
+      const a = el("a", { textContent: file, href: `../assets/${file}` });
+      td.appendChild(a);
+    } else {
+      td.textContent = t;
+    }
+    tr.appendChild(td);
+  });
+  dlBody.appendChild(tr);
+}
+["dark", "light"].forEach(theme => {
+  iconSizes.forEach(s => {
+    dlRow(`icon ${theme}`, "PNG",  `${s}×${s}`,  `taskmux-icon-${theme}-${s}.png`);
+    dlRow(`icon ${theme}`, "WebP", `${s}×${s}`,  `taskmux-icon-${theme}-${s}.webp`);
+  });
+  wmWidths.forEach(w => {
+    dlRow(`wordmark ${theme}`, "PNG",  `${w}w`, `taskmux-wordmark-${theme}-${w}.png`);
+    dlRow(`wordmark ${theme}`, "WebP", `${w}w`, `taskmux-wordmark-${theme}-${w}.webp`);
+  });
+});
+
+document.querySelectorAll(".controls button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("[data-theme]").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    setTheme(btn.dataset.theme);
+  });
+});
+
+setTheme("dark");
+</script>
+</body>
+</html>

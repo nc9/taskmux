@@ -1,3 +1,7 @@
+<p align="center">
+  <img alt="taskmux" src="assets/taskmux-wordmark-light-800.webp" width="320">
+</p>
+
 # Taskmux
 
 Daemon-supervised task manager for development environments. Define tasks in `taskmux.toml`, start them in dependency order, monitor health, auto-restart on failure, read persistent timestamped logs. Every command supports `--json` for agents and scripts.
