@@ -926,12 +926,26 @@ class TaskmuxDaemon:
             self.proxy.set_route(session, alias_entry["host"], alias_entry["port"])
 
     def _on_task_route_change(self, project: str, _task: str, host: str, port: int | None) -> None:
-        if self.proxy is None:
+        if self.proxy is not None:
+            if port is None:
+                self.proxy.drop_route(project, host)
+            else:
+                self.proxy.set_route(project, host, port)
+        # If this project has any tunneled tasks, re-sync the tunnel backend so
+        # a `taskmux start <task>` (which only fires this sync callback, never
+        # _resync_project_routes) actually wires Cloudflare ingress + spawns
+        # cloudflared. Cheap when there are no tunneled tasks (early return
+        # in _sync_tunnels). Scheduled on the daemon loop because this
+        # callback is invoked from synchronous supervisor code.
+        cfg = self.configs.get(project)
+        if cfg is None:
             return
-        if port is None:
-            self.proxy.drop_route(project, host)
-        else:
-            self.proxy.set_route(project, host, port)
+        if not any(t.tunnel is not None for t in cfg.tasks.values()):
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(self._sync_tunnels(project)))
 
     async def _resync_project_routes(self, session: str) -> dict:
         """Reconcile a project's proxy routes against disk state + live tasks.

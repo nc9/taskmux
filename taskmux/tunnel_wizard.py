@@ -15,6 +15,7 @@ Every entry point returns plain dataclasses so the CLI can render to text or
 
 from __future__ import annotations
 
+import json as _json
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -37,8 +38,28 @@ from .models import (
     TunnelKind,
     TunnelProjectConfig,
 )
-from .paths import globalConfigPath
+from .paths import globalConfigPath, tunnelStateDir
 from .tunnels import EffectiveCloudflareConfig, resolveCloudflareConfig
+
+
+def _load_cached_tunnel_id(tunnel_name: str) -> str | None:
+    """Read the cached tunnel_id from the per-tunnel state file, if any.
+
+    Used by `enable()` to feed preflight a hint of "this is our own tunnel"
+    so DNS-collision detection on re-run doesn't flag our existing CNAME.
+    Best-effort: parse failure returns None (preflight still works, just
+    treats every cfargotunnel.com record as foreign).
+    """
+    path = tunnelStateDir("cloudflare") / f"{tunnel_name}.json"
+    if not path.exists():
+        return None
+    try:
+        data = _json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    tid = data.get("tunnel_id")
+    return str(tid) if tid else None
+
 
 _CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 _CLOUDFLARED_INSTALL = (
@@ -517,9 +538,30 @@ async def enable(
                             "(pass via public_hostnames= or set in taskmux.toml)"
                         ),
                     )
-                new_tasks[tname] = tcfg.model_copy(
-                    update={"tunnel": TunnelKind.CLOUDFLARE, "public_hostname": hostname}
-                )
+                # Rebuild via the constructor so field/model validators run
+                # (model_copy bypasses them — see feedback_pydantic_rebuild memory).
+                # public_hostname is normalised + checked; tunnel/host invariants enforced.
+                dump = tcfg.model_dump()
+                # `host` is stored as "" for apex; the validator rejects "" on load,
+                # so translate back to the user-facing sentinel before re-constructing.
+                if dump.get("host") == "":
+                    dump["host"] = "@"
+                dump["tunnel"] = TunnelKind.CLOUDFLARE
+                dump["public_hostname"] = hostname
+                try:
+                    new_tasks[tname] = TaskConfig(**dump)
+                except TaskmuxError as e:
+                    return EnableResult(
+                        ok=False,
+                        backend="cloudflare",
+                        project_id=project_id,
+                        tunnel_name=None,
+                        tunnel_id=None,
+                        public_urls={},
+                        config={},
+                        preflight=PreflightReport(),
+                        error=f"Task {tname!r}: {e.message}",
+                    )
             else:
                 new_tasks[tname] = tcfg
         project_cfg = TaskmuxConfig(
@@ -554,12 +596,21 @@ async def enable(
         )
         writeConfig(config_path, project_cfg)
 
-    # --- 4. resolve effective config
+    # --- 4. resolve effective config. Under dry_run, layer the runtime
+    # overrides on top of an in-memory copy of the global / project config
+    # so preflight can validate proposed credentials without writing them.
+    effective_global_cf = global_cfg.tunnel.cloudflare
+    effective_project_cf = project_cfg.tunnel.cloudflare
+    if dry_run:
+        if account_id:
+            effective_global_cf = effective_global_cf.model_copy(update={"account_id": account_id})
+        if zone_id:
+            effective_project_cf = effective_project_cf.model_copy(update={"zone_id": zone_id})
     eff = resolveCloudflareConfig(
-        global_cf=global_cfg.tunnel.cloudflare,
-        project_cf=project_cfg.tunnel.cloudflare,
+        global_cf=effective_global_cf,
+        project_cf=effective_project_cf,
         project_id=project_id,
-        api_token_override=None,
+        api_token_override=api_token if dry_run else None,
     )
 
     # --- 5. auto-resolve missing zone from public_hostname
@@ -583,11 +634,28 @@ async def enable(
                 sources={**eff.sources, "zone_id": "auto"},
             )
 
-    # --- 6. preflight (token, scopes, zone, collisions)
+    # --- 6. preflight (token, scopes, zone, collisions). Load any cached
+    # tunnel_id so DNS-collision detection recognises CNAMEs that already
+    # point at our own tunnel — otherwise a successful re-run reports
+    # "preflight failed" because the existing record looks foreign.
+    cached_tunnel_id = _load_cached_tunnel_id(eff.tunnel_name)
+    # Under dry-run, fold the runtime credential overrides into the
+    # in-memory global config so preflight resolves them without disk writes.
+    preflight_global = global_cfg
+    preflight_project = project_cfg
+    if dry_run and (account_id or zone_id):
+        new_global_tunnel = global_cfg.tunnel.model_copy(update={"cloudflare": effective_global_cf})
+        new_project_tunnel = project_cfg.tunnel.model_copy(
+            update={"cloudflare": effective_project_cf}
+        )
+        preflight_global = global_cfg.model_copy(update={"tunnel": new_global_tunnel})
+        preflight_project = project_cfg.model_copy(update={"tunnel": new_project_tunnel})
     report = await preflight(
         project_id=project_id,
-        project_cfg=project_cfg,
-        global_cfg=global_cfg,
+        project_cfg=preflight_project,
+        global_cfg=preflight_global,
+        api_token_override=api_token if dry_run else None,
+        tunnel_id=cached_tunnel_id,
     )
 
     # --- 7. mutating step: ensure tunnel + DNS routes

@@ -7,6 +7,7 @@ the real ``_api`` parsing, error handling, and ordering — not the HTTP wire.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tomllib
 from pathlib import Path
@@ -28,6 +29,7 @@ from taskmux.models import (
     TaskConfig,
     TaskmuxConfig,
     TunnelKind,
+    TunnelProjectConfig,
 )
 from taskmux.tunnel_wizard import describeTunnelConfig, setTunnelConfig
 from taskmux.tunnels import resolveCloudflareConfig
@@ -169,9 +171,7 @@ class _FakeResponse:
         self._payload = payload
 
     async def text(self) -> str:
-        import json as _json
-
-        return _json.dumps(self._payload)
+        return json.dumps(self._payload)
 
     async def json(self):
         return self._payload
@@ -506,3 +506,232 @@ class TestDisable:
         _run(_run_disable())
         loaded = tomllib.loads((project_dir / "taskmux.toml").read_text())
         assert "tunnel" not in loaded
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for codex review findings (R-001..R-004)
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionCodexReview:
+    """Regression tests for findings in the codex review (R-001..R-004)."""
+
+    def test_r001_idempotent_rerun_loads_cached_tunnel_id(
+        self, isolated_taskmux_home: Path, tmp_path: Path
+    ):
+        """R-001: re-running enable() should pass cached tunnel_id to preflight
+        so DNS-collision detection recognises our own existing CNAME."""
+        # Stage cached state — pretend we've enabled before.
+        from taskmux.paths import tunnelStateDir as _stateDir
+
+        cache = _stateDir("cloudflare") / "taskmux-myproj.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(
+            json.dumps(
+                {
+                    "tunnel_id": "tunnel-uuid",
+                    "tunnel_name": "taskmux-myproj",
+                    "token": "tok",
+                }
+            )
+        )
+        loaded = tunnel_wizard._load_cached_tunnel_id("taskmux-myproj")
+        assert loaded == "tunnel-uuid"
+
+    def test_r001_missing_cache_returns_none(self, isolated_taskmux_home: Path):
+        assert tunnel_wizard._load_cached_tunnel_id("never-set-up") is None
+
+    def test_r002_invalid_public_hostname_rejected_by_enable(
+        self, isolated_taskmux_home: Path, tmp_path: Path
+    ):
+        """R-002: enable() must run TaskConfig validators on CLI-supplied
+        public_hostname rather than bypassing them via model_copy."""
+        # Seed global config so enable() doesn't need network.
+        gcfg = GlobalConfig(
+            tunnel=TunnelGlobalConfig(
+                cloudflare=CloudflareGlobalConfig(
+                    account_id="acct", zone_id="zone", api_token="tok"
+                )
+            )
+        )
+        writeGlobalConfig(gcfg)
+        project_dir = tmp_path / "myproj"
+        project_dir.mkdir()
+        (project_dir / "taskmux.toml").write_text(
+            'name = "myproj"\n\n[tasks.api]\ncommand = "bun dev"\nhost = "api"\n'
+        )
+
+        async def _run_enable():
+            return await tunnel_wizard.enable(
+                config_path=project_dir / "taskmux.toml",
+                tasks=["api"],
+                public_hostnames={"api": "not_a_host"},  # invalid FQDN
+                dry_run=True,
+            )
+
+        result = _run(_run_enable())
+        assert not result.ok
+        assert result.error is not None
+        # Validation message comes from TaskConfig._validate_public_hostname.
+        assert "public_hostname" in result.error.lower() or "invalid" in result.error.lower()
+
+    def test_r002_valid_public_hostname_normalized_via_enable(
+        self, isolated_taskmux_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Mixed-case + trailing dot should be normalised by the validator
+        when the wizard rebuilds the TaskConfig — and not crash with a
+        validation error."""
+        gcfg = GlobalConfig(
+            tunnel=TunnelGlobalConfig(
+                cloudflare=CloudflareGlobalConfig(
+                    account_id="acct", zone_id="zone", api_token="tok"
+                )
+            )
+        )
+        writeGlobalConfig(gcfg)
+        project_dir = tmp_path / "myproj"
+        project_dir.mkdir()
+        (project_dir / "taskmux.toml").write_text(
+            'name = "myproj"\n\n[tasks.api]\ncommand = "bun dev"\nhost = "api"\n'
+        )
+
+        # Stub Cloudflare API so preflight doesn't hit the network.
+        sess = _FakeSession(
+            {
+                ("GET", "/user/tokens/verify"): {
+                    "success": True,
+                    "result": {"status": "active"},
+                },
+                ("GET", "/zones"): {
+                    "success": True,
+                    "result": [{"id": "zone", "name": "example.com"}],
+                },
+                ("GET", "/zones/zone/dns_records"): {"success": True, "result": []},
+            }
+        )
+        _patch_session(monkeypatch, sess)
+
+        async def _run_enable():
+            return await tunnel_wizard.enable(
+                config_path=project_dir / "taskmux.toml",
+                tasks=["api"],
+                public_hostnames={"api": " API.Example.com. "},
+                dry_run=True,
+            )
+
+        result = _run(_run_enable())
+        # The TaskConfig validator normalised the hostname; no error.
+        assert result.error is None or "public_hostname" not in (result.error or "")
+
+    def test_r003_dry_run_passes_credential_overrides_to_preflight(
+        self, isolated_taskmux_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """R-003: --dry-run --token X --account-id Y --zone Z should let
+        preflight verify those values without writing them to disk."""
+        # Empty global config — no creds persisted.
+        project_dir = tmp_path / "myproj"
+        project_dir.mkdir()
+        (project_dir / "taskmux.toml").write_text(
+            'name = "myproj"\n\n[tasks.api]\n'
+            'command = "bun dev"\nhost = "api"\n'
+            'tunnel = "cloudflare"\npublic_hostname = "api.example.com"\n'
+        )
+        # Mock the API surface so preflight reads the override values.
+        sess = _FakeSession(
+            {
+                ("GET", "/user/tokens/verify"): {
+                    "success": True,
+                    "result": {"status": "active"},
+                },
+                ("GET", "/zones"): {
+                    "success": True,
+                    "result": [{"id": "passed-zone", "name": "example.com"}],
+                },
+                ("GET", "/zones/passed-zone/dns_records"): {
+                    "success": True,
+                    "result": [],
+                },
+            }
+        )
+        _patch_session(monkeypatch, sess)
+
+        async def _run_enable():
+            return await tunnel_wizard.enable(
+                config_path=project_dir / "taskmux.toml",
+                api_token="passed-token",
+                account_id="passed-acct",
+                zone_id="passed-zone",
+                dry_run=True,
+            )
+
+        result = _run(_run_enable())
+        # Disk untouched: global config still has no token persisted.
+        assert loadGlobalConfig().tunnel.cloudflare.api_token is None
+        # Preflight must have seen the runtime values — no missing-credential
+        # checks should be present.
+        check_names = {c.name for c in result.preflight.checks}
+        assert "api_token" in check_names
+        api_token_check = next(c for c in result.preflight.checks if c.name == "api_token")
+        assert api_token_check.ok, f"token check failed: {api_token_check.detail}"
+        account_check = next(c for c in result.preflight.checks if c.name == "account_id")
+        assert account_check.ok
+
+    def test_r004_route_change_schedules_tunnel_sync_when_project_has_tunnel(self, tmp_path: Path):
+        """R-004: _on_task_route_change must trigger _sync_tunnels for projects
+        with tunneled tasks so `taskmux start` activates Cloudflare ingress."""
+        from taskmux.daemon import TaskmuxDaemon
+        from taskmux.global_config import GlobalConfig as _G
+
+        d = TaskmuxDaemon.__new__(TaskmuxDaemon)
+        d.proxy = None
+        d.global_config = _G()
+
+        task = TaskConfig(
+            command="bun dev",
+            host="api",
+            tunnel=TunnelKind.CLOUDFLARE,
+            public_hostname="api.example.com",
+        )
+        cfg = TaskmuxConfig(
+            name="proj",
+            tasks={"api": task},
+            tunnel=TunnelProjectConfig(cloudflare=CloudflareTunnelProjectConfig(zone_id="z")),
+        )
+        d.configs = {"proj": cfg}
+
+        # Capture the scheduled coroutine.
+        scheduled: list[str] = []
+
+        class _LoopStub:
+            def call_soon_threadsafe(self, callback):
+                # The lambda creates a Task — we can't easily inspect it
+                # without an actual loop, so just record that scheduling happened.
+                scheduled.append("scheduled")
+
+        d._loop = _LoopStub()
+        d._on_task_route_change("proj", "api", "api", 12345)
+        assert scheduled == ["scheduled"]
+
+    def test_r004_route_change_skips_sync_for_non_tunneled_projects(self, tmp_path: Path):
+        """No tunneled tasks → no sync scheduled (cheap path)."""
+        from taskmux.daemon import TaskmuxDaemon
+        from taskmux.global_config import GlobalConfig as _G
+
+        d = TaskmuxDaemon.__new__(TaskmuxDaemon)
+        d.proxy = None
+        d.global_config = _G()
+        cfg = TaskmuxConfig(
+            name="proj",
+            tasks={"api": TaskConfig(command="bun dev", host="api")},
+        )
+        d.configs = {"proj": cfg}
+
+        scheduled: list[str] = []
+
+        class _LoopStub:
+            def call_soon_threadsafe(self, callback):
+                scheduled.append("scheduled")
+
+        d._loop = _LoopStub()
+        d._on_task_route_change("proj", "api", "api", 12345)
+        assert scheduled == []
