@@ -159,3 +159,115 @@ def test_mint_cert_failure_raises(isolated_paths, monkeypatch):
     with pytest.raises(Exception) as exc_info:
         ca.mintCert("alpha")
     assert "boom" in str(exc_info.value)
+
+
+def test_build_combined_bundle_concats_system_and_mkcert(isolated_paths, monkeypatch, tmp_path):
+    sys_ca = tmp_path / "system.pem"
+    sys_ca.write_text("-----BEGIN CERTIFICATE-----\nSYSROOT\n-----END CERTIFICATE-----\n")
+    mkcert_pem = tmp_path / "rootCA.pem"
+    mkcert_pem.write_text("-----BEGIN CERTIFICATE-----\nMKCERT\n-----END CERTIFICATE-----\n")
+    monkeypatch.setattr(ca, "systemCaBundle", lambda exclude=None: sys_ca)
+
+    out = ca.buildCombinedBundle(mkcert_pem)
+
+    assert out == ca.combinedBundlePath()
+    body = out.read_text()
+    assert "SYSROOT" in body
+    assert "MKCERT" in body
+    assert body.index("SYSROOT") < body.index("MKCERT")
+
+
+def test_build_combined_bundle_idempotent(isolated_paths, monkeypatch, tmp_path):
+    sys_ca = tmp_path / "system.pem"
+    sys_ca.write_text("SYS\n")
+    mkcert_pem = tmp_path / "rootCA.pem"
+    mkcert_pem.write_text("MK\n")
+    monkeypatch.setattr(ca, "systemCaBundle", lambda exclude=None: sys_ca)
+
+    out1 = ca.buildCombinedBundle(mkcert_pem)
+    body1 = out1.read_text()
+    out2 = ca.buildCombinedBundle(mkcert_pem)
+    body2 = out2.read_text()
+
+    assert out1 == out2
+    assert body1 == body2
+
+
+def test_build_combined_bundle_replaces_stale(isolated_paths, monkeypatch, tmp_path):
+    sys_ca = tmp_path / "system.pem"
+    sys_ca.write_text("OLD-SYS\n")
+    mkcert_pem = tmp_path / "rootCA.pem"
+    mkcert_pem.write_text("MK\n")
+    monkeypatch.setattr(ca, "systemCaBundle", lambda exclude=None: sys_ca)
+    ca.buildCombinedBundle(mkcert_pem)
+    sys_ca.write_text("NEW-SYS\n")
+
+    out = ca.buildCombinedBundle(mkcert_pem)
+    body = out.read_text()
+    assert "NEW-SYS" in body
+    assert "OLD-SYS" not in body
+
+
+def test_build_combined_bundle_raises_when_no_system_ca(isolated_paths, monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "systemCaBundle", lambda exclude=None: None)
+    mkcert_pem = tmp_path / "rootCA.pem"
+    mkcert_pem.write_text("MK\n")
+    with pytest.raises(Exception) as exc_info:
+        ca.buildCombinedBundle(mkcert_pem)
+    assert "system CA bundle not found" in str(exc_info.value)
+    assert exc_info.value.code == ErrorCode.INTERNAL
+
+
+def test_system_ca_bundle_prefers_candidate_over_ssl_default(monkeypatch, tmp_path):
+    """Candidate paths beat ssl.get_default_verify_paths so a poisoned
+    SSL_CERT_FILE can't masquerade as the system bundle."""
+    candidate = tmp_path / "candidate.pem"
+    candidate.write_text("X")
+    poisoned = tmp_path / "mkcert-poisoned.pem"
+    poisoned.write_text("Y")
+
+    class _Paths:
+        cafile = str(poisoned)
+
+    monkeypatch.setattr(ca.ssl, "get_default_verify_paths", lambda: _Paths())
+    monkeypatch.setattr(ca, "_SYSTEM_CA_CANDIDATES", (str(candidate),))
+    assert ca.systemCaBundle() == candidate
+
+
+def test_system_ca_bundle_falls_back_to_ssl_default(monkeypatch, tmp_path):
+    real = tmp_path / "default.pem"
+    real.write_text("X")
+
+    class _Paths:
+        cafile = str(real)
+
+    monkeypatch.setattr(ca.ssl, "get_default_verify_paths", lambda: _Paths())
+    monkeypatch.setattr(ca, "_SYSTEM_CA_CANDIDATES", ("/nonexistent/x.pem",))
+    assert ca.systemCaBundle() == real
+
+
+def test_system_ca_bundle_excludes_mkcert_path(monkeypatch, tmp_path):
+    """Even if a candidate path resolves to mkcert's rootCA.pem (e.g. user
+    symlinked /etc/ssl/cert.pem), excluding it must skip to the next option."""
+    mkcert_real = tmp_path / "rootCA.pem"
+    mkcert_real.write_text("MK")
+    poisoned_link = tmp_path / "etc-ssl-cert.pem"
+    poisoned_link.symlink_to(mkcert_real)
+    fallback = tmp_path / "real-system.pem"
+    fallback.write_text("SYS")
+
+    class _Paths:
+        cafile = str(fallback)
+
+    monkeypatch.setattr(ca.ssl, "get_default_verify_paths", lambda: _Paths())
+    monkeypatch.setattr(ca, "_SYSTEM_CA_CANDIDATES", (str(poisoned_link),))
+    assert ca.systemCaBundle(exclude=mkcert_real) == fallback
+
+
+def test_system_ca_bundle_returns_none_when_nothing_present(monkeypatch):
+    class _Paths:
+        cafile = None
+
+    monkeypatch.setattr(ca.ssl, "get_default_verify_paths", lambda: _Paths())
+    monkeypatch.setattr(ca, "_SYSTEM_CA_CANDIDATES", ("/nonexistent/x.pem",))
+    assert ca.systemCaBundle() is None

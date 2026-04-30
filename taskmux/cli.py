@@ -1421,7 +1421,8 @@ def ca_trust_clients(
 
     try:
         sh = shell_env.detectShell(shell)
-        caPath = ca.caRootPath()
+        mkcertPath = ca.caRootPath()
+        bundlePath = ca.buildCombinedBundle(mkcertPath)
     except (ca.MkcertMissing, TaskmuxError) as e:
         msg = e.message if hasattr(e, "message") else str(e)
         if is_json_mode():
@@ -1431,14 +1432,15 @@ def ca_trust_clients(
         sys.exit(1)
 
     if print_only:
-        exports = shell_env.renderExportsOnly(caPath, sh)
+        exports = shell_env.renderExportsOnly(bundlePath, sh)
         if is_json_mode():
             print_result(
                 {
                     "ok": True,
                     "action": "printed",
                     "shell": sh,
-                    "caPath": str(caPath),
+                    "caPath": str(bundlePath),
+                    "mkcertCaPath": str(mkcertPath),
                     "exports": exports,
                 }
             )
@@ -1447,7 +1449,8 @@ def ca_trust_clients(
             sys.stdout.flush()
         return
 
-    result = shell_env.applyTrustClients(caPath, sh)
+    result = shell_env.applyTrustClients(bundlePath, sh)
+    result["mkcertCaPath"] = str(mkcertPath)
     if not result.get("ok"):
         if is_json_mode():
             print_result(result)

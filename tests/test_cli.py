@@ -3,6 +3,7 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
 from taskmux.cli import app
@@ -369,32 +370,47 @@ class TestRemoveCommand:
 
 
 class TestCaTrustClients:
-    def test_print_emits_export_lines(self, tmp_path: Path, monkeypatch):
-        pem = tmp_path / "rootCA.pem"
-        pem.write_text("FAKE")
+    @pytest.fixture
+    def fake_bundle(self, tmp_path: Path, monkeypatch):
+        """Stub mkcert root + system CA so trust-clients produces a real
+        combined bundle under tmp_path."""
+        from taskmux import ca
+        from taskmux import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "TASKMUX_DIR", tmp_path / ".taskmux")
+        mkcert_pem = tmp_path / "rootCA.pem"
+        mkcert_pem.write_text("MKCERT-FAKE\n")
+        sys_pem = tmp_path / "system.pem"
+        sys_pem.write_text("SYSROOT-FAKE\n")
+        monkeypatch.setattr(ca, "systemCaBundle", lambda exclude=None: sys_pem)
+        return mkcert_pem, ca.combinedBundlePath()
+
+    def test_print_emits_export_lines(self, fake_bundle, monkeypatch):
+        mkcert_pem, bundle = fake_bundle
         monkeypatch.setenv("SHELL", "/bin/zsh")
-        with patch("taskmux.ca.caRootPath", return_value=pem):
+        with patch("taskmux.ca.caRootPath", return_value=mkcert_pem):
             result = runner.invoke(app, ["ca", "trust-clients", "--print", "--shell", "zsh"])
         assert result.exit_code == 0
-        assert f"export NODE_EXTRA_CA_CERTS={pem}" in result.output
-        assert f"export REQUESTS_CA_BUNDLE={pem}" in result.output
-        assert f"export SSL_CERT_FILE={pem}" in result.output
+        assert f"export NODE_EXTRA_CA_CERTS={bundle}" in result.output
+        assert f"export REQUESTS_CA_BUNDLE={bundle}" in result.output
+        assert f"export SSL_CERT_FILE={bundle}" in result.output
+        body = bundle.read_text()
+        assert "SYSROOT-FAKE" in body
+        assert "MKCERT-FAKE" in body
 
-    def test_print_fish_uses_set_gx(self, tmp_path: Path, monkeypatch):
-        pem = tmp_path / "rootCA.pem"
-        pem.write_text("FAKE")
-        with patch("taskmux.ca.caRootPath", return_value=pem):
+    def test_print_fish_uses_set_gx(self, fake_bundle):
+        mkcert_pem, bundle = fake_bundle
+        with patch("taskmux.ca.caRootPath", return_value=mkcert_pem):
             result = runner.invoke(app, ["ca", "trust-clients", "--print", "--shell", "fish"])
         assert result.exit_code == 0
-        assert f"set -gx NODE_EXTRA_CA_CERTS '{pem}'" in result.output
+        assert f"set -gx NODE_EXTRA_CA_CERTS '{bundle}'" in result.output
 
-    def test_print_json_mode_emits_only_json(self, tmp_path: Path, monkeypatch):
+    def test_print_json_mode_emits_only_json(self, fake_bundle):
         """--json --print must produce valid JSON, not raw exports + JSON."""
         import json
 
-        pem = tmp_path / "rootCA.pem"
-        pem.write_text("FAKE")
-        with patch("taskmux.ca.caRootPath", return_value=pem):
+        mkcert_pem, bundle = fake_bundle
+        with patch("taskmux.ca.caRootPath", return_value=mkcert_pem):
             result = runner.invoke(
                 app, ["--json", "ca", "trust-clients", "--print", "--shell", "zsh"]
             )
@@ -402,23 +418,24 @@ class TestCaTrustClients:
         parsed = json.loads(result.output)
         assert parsed["ok"] is True
         assert parsed["action"] == "printed"
-        assert parsed["caPath"] == str(pem)
+        assert parsed["caPath"] == str(bundle)
+        assert parsed["mkcertCaPath"] == str(mkcert_pem)
         assert "export NODE_EXTRA_CA_CERTS" in parsed["exports"]
 
-    def test_writes_block_to_rc(self, tmp_path: Path, monkeypatch):
-        pem = tmp_path / "rootCA.pem"
-        pem.write_text("FAKE")
+    def test_writes_block_to_rc(self, fake_bundle, monkeypatch, tmp_path: Path):
+        mkcert_pem, bundle = fake_bundle
         monkeypatch.setenv("HOME", str(tmp_path))
-        with patch("taskmux.ca.caRootPath", return_value=pem):
+        with patch("taskmux.ca.caRootPath", return_value=mkcert_pem):
             result = runner.invoke(app, ["ca", "trust-clients", "--shell", "zsh"])
         assert result.exit_code == 0
         rc = tmp_path / ".zshenv"
         assert rc.exists()
         text = rc.read_text()
         assert "# >>> taskmux trust-clients >>>" in text
-        assert f"export NODE_EXTRA_CA_CERTS={pem}" in text
+        assert f"export NODE_EXTRA_CA_CERTS={bundle}" in text
+        assert str(mkcert_pem) not in text
 
-    def test_missing_rootca_fails(self, tmp_path: Path, monkeypatch):
+    def test_missing_rootca_fails(self, tmp_path: Path):
         from taskmux.errors import ErrorCode, TaskmuxError
 
         def boom():
@@ -427,3 +444,16 @@ class TestCaTrustClients:
         with patch("taskmux.ca.caRootPath", side_effect=boom):
             result = runner.invoke(app, ["ca", "trust-clients", "--shell", "zsh"])
         assert result.exit_code == 1
+
+    def test_missing_system_ca_fails(self, tmp_path: Path, monkeypatch):
+        from taskmux import ca
+        from taskmux import paths as paths_mod
+
+        monkeypatch.setattr(paths_mod, "TASKMUX_DIR", tmp_path / ".taskmux")
+        mkcert_pem = tmp_path / "rootCA.pem"
+        mkcert_pem.write_text("MK\n")
+        monkeypatch.setattr(ca, "systemCaBundle", lambda exclude=None: None)
+        with patch("taskmux.ca.caRootPath", return_value=mkcert_pem):
+            result = runner.invoke(app, ["ca", "trust-clients", "--shell", "zsh"])
+        assert result.exit_code == 1
+        assert "system CA bundle not found" in result.output
