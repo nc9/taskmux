@@ -4,25 +4,106 @@
 
 # Taskmux
 
-Daemon-supervised task manager for development environments. Define tasks in `taskmux.toml`, start them in dependency order, monitor health, auto-restart on failure, read persistent timestamped logs. Every command supports `--json` for agents and scripts.
+Task manager for coding agents with dependencies, observability, health monitoring, local hostnames, worktree support, tunnel support and a lot more. 
 
-Designed to pair well with coding agents like Claude Code, Codex, and OpenCode — `taskmux init` injects usage instructions into their context files, and the JSON output + WebSocket API give agents a clean, machine-readable surface for managing dev environments.
+Example `taskmux.toml` for your project:
+
+```toml
+name = "example"
+
+[tasks.api]
+command = "uv run api --port $PORT" # taskmux injects a free $PORT per task
+cwd = "api"                         # working directory
+host = "api"                        # binds https://api.example.localhost (mkcert trusted)
+                                    # for host-routed tasks, taskmux TCP-probes $PORT — no health_url needed
+env = { LOG_LEVEL = "debug" }       # extra env vars merged into the task
+
+[tasks.website]
+command = "npm run dev -- --port $PORT"  # framework reads $PORT, taskmux routes the proxy
+cwd = "web"
+host = "@"                          # apex: https://example.localhost (one per project)
+depends_on = ["api"]                # waits for api's health_url to pass before starting
+restart_policy = "always"           # respawn on crash with exponential backoff
+
+[tasks.worker]
+command = "uv run worker"
+depends_on = ["api"]
+restart_policy = "on-failure"       # default; only restart on non-zero exit
+max_restarts = 10
+
+[tasks.db]
+command = "docker compose up postgres"
+auto_start = false                  # skipped by `taskmux start`; run with `taskmux start db`
+health_check = "pg_isready -h localhost -p 5432"  # shell exit-0 == healthy
+stop_grace_period = 15              # seconds after SIGINT before SIGTERM
+
+# Or expose any external/Docker port through the same proxy without a task:
+#   taskmux alias add admin 8080 --host admin    # -> https://admin.example.localhost
+#   taskmux tunnel up website                    # public URL via Cloudflare Tunnel
+```
+
+then in shell:
+
+```bash
+$ taskmux start
+$ taskmux restart website
+$ taskmux logs --since 5m website
+```
+
+etc. all with JSON outputs for agents and skills that allow you to add / edit in your favourite coding agent:
+
+```bash
+> add our website service to taskmux and bind it to apex domain.
+```
+
+A live `taskmux status` for the example project above:
+
+```
+$ taskmux status
+
+  Status   Task     URL                            Public                                 Command                          Notes
+  Healthy  api      https://api.example.localhost  —                                      uv run api --port $PORT          cwd=api
+  Healthy  website  https://example.localhost      https://example-web.trycloudflare.com  npm run dev -- --port $PORT      cwd=web deps=[api] restart=always
+  Healthy  worker   —                              —                                      uv run worker                    deps=[api] restart-max=10
+  Stopped  db       —                              —                                      docker compose up postgres       manual
+
+Aliases (external routes):
+  Name   URL                              Target
+  admin  https://admin.example.localhost  127.0.0.1:8080
+```
+
+`taskmux status --json` returns the same data with `tunnel.public_url`, `last_health`, `pid`, `port`, and event counters per task.
 
 ## Features
 
-- **Task orchestration** — start/stop/restart tasks with dependency ordering and signal escalation
-- **Persistent logs** — timestamped, rotated, survives session kill (`~/.taskmux/projects/{session}/logs/`)
-- **Health checks** — custom commands with retries, used for dependency gating and auto-restart
-- **Restart policies** — `no`, `on-failure` (default), `always` with exponential backoff
-- **JSON output** — `--json` on every command for programmatic consumption
-- **Event history** — lifecycle events recorded to `~/.taskmux/events.jsonl`
-- **Lifecycle hooks** — before/after start/stop at global and per-task level
-- **HTTPS proxy** — `host = "api"` exposes a task at `https://api.{project}.localhost` with a trusted local cert (mkcert); taskmux assigns a free `$PORT` per task so config never pins ports. Apex (`@`) and wildcard (`*`) host routes supported alongside specific subdomains
-- **Dynamic DNS** — optional in-process DNS server resolves any `*.localhost` to `127.0.0.1` (no `/etc/hosts` churn, no daemon restart when adding hosts)
-- **Worktree-aware** — linked git worktrees auto-namespace their `project_id` (`myproject-feat-foo`) so logs, registry entries, and proxy URLs don't collide with the primary checkout
-- **Port cleanup** — kills orphaned listeners before starting
-- **Agent context** — `taskmux init` patches a thin pointer + project task table into the project's `CLAUDE.md` / `AGENTS.md` (whichever exists; prompts you to pick if neither does). Install the [taskmux skill](#agent-skill) for the richer cross-agent CLI cheat sheet
-- **Daemon-owned processes** — every task runs under the daemon as its own process group on a PTY (so colors + `isatty()` keep working). Daemon shutdown signal-cascades into every task; CLI commands are thin RPC over a local WebSocket.
+### No port juggling
+
+- **Dynamic `$PORT` injection** — taskmux picks a free port per task and exports `$PORT` into the command. Configs never pin ports, so two checkouts (or two worktrees) of the same project never collide.
+- **HTTPS proxy with trusted certs** — `host = "api"` exposes a task at `https://api.{project}.localhost` with an mkcert-signed wildcard cert. Apex (`@` → `https://{project}.localhost`) and wildcard (`*`, catch-all) routes coexist with specific subdomains.
+- **Aliases for non-taskmux ports** — `taskmux alias add admin 8080 --host admin` routes `https://admin.{project}.localhost` to any external/Docker/sidecar port without declaring it as a task.
+- **Dynamic DNS server** — optional in-process resolver answers any `*.localhost` to `127.0.0.1`, so adding hosts requires no `/etc/hosts` churn and no daemon restart. Falls back to `etc_hosts` or `noop` if you'd rather manage resolution yourself.
+- **Cloudflare Tunnel support** — `taskmux tunnel up <task>` exposes a host-routed task at a public HTTPS URL via Cloudflare; per-task auth, cascade config, and tunnel state tracked alongside the task.
+- **Port cleanup** — orphaned listeners on assigned ports are killed before a task starts, so a crashed previous run never blocks the next one.
+
+### Worktree-aware (parallel agents, no collisions)
+
+- Linked git worktrees auto-namespace their `project_id` (`myproject-feat-foo`) so logs, state, registry entries, and proxy URLs (`https://api.myproject-feat-foo.localhost`) don't collide with the primary checkout — or with another agent running in a sibling worktree.
+- The user-facing `name` in `taskmux.toml` stays the same; everything routed by `project_id` namespaces automatically. Spawn N parallel agents on N branches, each gets its own URL and log directory.
+
+### Agent-native observability
+
+- **`--json` on every command** — machine-readable output for programmatic consumption; agents parse `status`, `inspect`, `events`, `logs` directly.
+- **Persistent timestamped logs** — survive task kill / daemon restart at `~/.taskmux/projects/{project_id}/logs/`. Rotated by size; greppable with `taskmux logs -g <pat> -C N --since 5m`.
+- **Event history** — lifecycle events (start, stop, health failure, auto-restart, max-restarts-reached) appended to `~/.taskmux/events.jsonl`. Filter by task / time / event type.
+- **Health checks** — `health_url` (HTTP probe), `health_check` (shell exit code), or auto TCP probe for host-routed tasks. Retries gate dependents and trigger auto-restart.
+- **Agent context injection** — `taskmux init` patches a thin task table + pointer into the project's `CLAUDE.md` / `AGENTS.md`; re-rendered on every `taskmux add` / `remove` so agents never see a stale list. Pair with the [taskmux skill](#agent-skill) for cross-agent CLI guidance.
+
+### Process supervision
+
+- **Task orchestration** — start/stop/restart with dependency ordering and graceful signal escalation (`SIGINT` → `SIGTERM` → `SIGKILL` on the task's process group).
+- **Restart policies** — `no`, `on-failure` (default), `always` with exponential backoff and a `max_restarts` ceiling that resets after a healthy interval.
+- **Lifecycle hooks** — `before_start`, `after_start`, `before_stop`, `after_stop` at global and per-task scope. Run shell commands or scripts at every state transition.
+- **Daemon-owned processes** — every task runs under the daemon as its own process group on a PTY (colors + `isatty()` keep working). Daemon shutdown signal-cascades into every task; CLI commands are thin RPC over a local WebSocket.
 
 ## Install
 
