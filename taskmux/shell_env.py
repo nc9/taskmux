@@ -14,6 +14,8 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shlex
+import stat
 import tempfile
 from pathlib import Path
 
@@ -73,11 +75,18 @@ def rcPathFor(shell: str) -> Path:
     raise TaskmuxError(ErrorCode.INVALID_ARGUMENT, detail=f"unsupported shell {shell!r}")
 
 
+def _fishQuote(s: str) -> str:
+    """Single-quote for fish; backslash-escape `\\` and `'` only."""
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
 def _exportLines(caPath: Path, shell: str) -> list[str]:
     p = str(caPath)
     if shell == "fish":
-        return [f'set -gx {name} "{p}"' for name in _VARS]
-    return [f'export {name}="{p}"' for name in _VARS]
+        q = _fishQuote(p)
+        return [f"set -gx {name} {q}" for name in _VARS]
+    q = shlex.quote(p)
+    return [f"export {name}={q}" for name in _VARS]
 
 
 def renderExportsOnly(caPath: Path, shell: str) -> str:
@@ -99,6 +108,9 @@ def _atomicWrite(target: Path, content: str) -> None:
     """
     final = target.resolve() if target.is_symlink() else target
     final.parent.mkdir(parents=True, exist_ok=True)
+    existingMode: int | None = None
+    if final.exists():
+        existingMode = stat.S_IMODE(final.stat().st_mode)
     fd, tmp = tempfile.mkstemp(
         dir=str(final.parent),
         prefix=final.name + ".",
@@ -107,7 +119,7 @@ def _atomicWrite(target: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(content)
-        os.chmod(tmp, 0o644)
+        os.chmod(tmp, existingMode if existingMode is not None else 0o644)
         os.replace(tmp, final)
     except Exception:
         with contextlib.suppress(OSError):

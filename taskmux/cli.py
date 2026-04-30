@@ -1431,10 +1431,20 @@ def ca_trust_clients(
         sys.exit(1)
 
     if print_only:
-        sys.stdout.write(shell_env.renderExportsOnly(caPath, sh))
-        sys.stdout.flush()
+        exports = shell_env.renderExportsOnly(caPath, sh)
         if is_json_mode():
-            print_result({"ok": True, "action": "printed", "shell": sh, "caPath": str(caPath)})
+            print_result(
+                {
+                    "ok": True,
+                    "action": "printed",
+                    "shell": sh,
+                    "caPath": str(caPath),
+                    "exports": exports,
+                }
+            )
+        else:
+            sys.stdout.write(exports)
+            sys.stdout.flush()
         return
 
     result = shell_env.applyTrustClients(caPath, sh)

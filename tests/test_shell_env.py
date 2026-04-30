@@ -49,24 +49,46 @@ def test_rc_path_for_each_shell(tmpHome: Path):
 def test_render_exports_only_zsh():
     out = shell_env.renderExportsOnly(Path("/x/rootCA.pem"), "zsh")
     assert out == (
-        'export NODE_EXTRA_CA_CERTS="/x/rootCA.pem"\n'
-        'export REQUESTS_CA_BUNDLE="/x/rootCA.pem"\n'
-        'export SSL_CERT_FILE="/x/rootCA.pem"\n'
+        "export NODE_EXTRA_CA_CERTS=/x/rootCA.pem\n"
+        "export REQUESTS_CA_BUNDLE=/x/rootCA.pem\n"
+        "export SSL_CERT_FILE=/x/rootCA.pem\n"
     )
 
 
 def test_render_exports_only_bash_quotes_spaces():
     out = shell_env.renderExportsOnly(Path("/has space/rootCA.pem"), "bash")
-    assert 'export NODE_EXTRA_CA_CERTS="/has space/rootCA.pem"\n' in out
+    assert "export NODE_EXTRA_CA_CERTS='/has space/rootCA.pem'\n" in out
 
 
 def test_render_exports_only_fish():
     out = shell_env.renderExportsOnly(Path("/x/rootCA.pem"), "fish")
     assert out == (
-        'set -gx NODE_EXTRA_CA_CERTS "/x/rootCA.pem"\n'
-        'set -gx REQUESTS_CA_BUNDLE "/x/rootCA.pem"\n'
-        'set -gx SSL_CERT_FILE "/x/rootCA.pem"\n'
+        "set -gx NODE_EXTRA_CA_CERTS '/x/rootCA.pem'\n"
+        "set -gx REQUESTS_CA_BUNDLE '/x/rootCA.pem'\n"
+        "set -gx SSL_CERT_FILE '/x/rootCA.pem'\n"
     )
+
+
+def test_render_escapes_shell_metacharacters_bash():
+    """`$`, backticks, `\\`, `\"` must round-trip through bash without expansion."""
+    import subprocess
+
+    weird = '/weird/$HOME`whoami`\\"x.pem'
+    out = shell_env.renderExportsOnly(Path(weird), "bash")
+    line = next(line for line in out.splitlines() if "NODE_EXTRA_CA_CERTS" in line)
+    proc = subprocess.run(
+        ["bash", "-c", f'{line}; printf %s "$NODE_EXTRA_CA_CERTS"'],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout == weird
+
+
+def test_render_escapes_metacharacters_fish():
+    out = shell_env.renderExportsOnly(Path("/weird/it's/a\\path.pem"), "fish")
+    line = next(line for line in out.splitlines() if "NODE_EXTRA_CA_CERTS" in line)
+    assert line == "set -gx NODE_EXTRA_CA_CERTS '/weird/it\\'s/a\\\\path.pem'"
 
 
 def test_render_block_has_sentinels():
@@ -164,6 +186,27 @@ def test_apply_preserves_crlf(tmp_path: Path):
     raw = rc.read_bytes()
     assert b"\r\n" in raw
     assert b"\n\n" not in raw.replace(b"\r\n", b"")
+
+
+def test_apply_preserves_existing_rc_mode(tmp_path: Path):
+    """0600 rc files (e.g. holding tokens) must not be downgraded to 0644."""
+    rc = tmp_path / ".zshenv"
+    rc.write_text("# secrets here\n")
+    rc.chmod(0o600)
+    shell_env.applyTrustClients(Path("/x/rootCA.pem"), "zsh", rcOverride=rc)
+    import stat as _stat
+
+    assert _stat.S_IMODE(rc.stat().st_mode) == 0o600
+
+
+def test_apply_creates_new_rc_with_644(tmp_path: Path):
+    rc = tmp_path / ".zshenv"
+    shell_env.applyTrustClients(Path("/x/rootCA.pem"), "zsh", rcOverride=rc)
+    import stat as _stat
+
+    mode = _stat.S_IMODE(rc.stat().st_mode)
+    # umask may strip group/other bits; user-readable+writable is the floor.
+    assert mode & 0o600 == 0o600
 
 
 def test_apply_windows_returns_error(tmp_path: Path, monkeypatch):

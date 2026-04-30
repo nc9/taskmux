@@ -376,9 +376,9 @@ class TestCaTrustClients:
         with patch("taskmux.ca.caRootPath", return_value=pem):
             result = runner.invoke(app, ["ca", "trust-clients", "--print", "--shell", "zsh"])
         assert result.exit_code == 0
-        assert f'export NODE_EXTRA_CA_CERTS="{pem}"' in result.output
-        assert f'export REQUESTS_CA_BUNDLE="{pem}"' in result.output
-        assert f'export SSL_CERT_FILE="{pem}"' in result.output
+        assert f"export NODE_EXTRA_CA_CERTS={pem}" in result.output
+        assert f"export REQUESTS_CA_BUNDLE={pem}" in result.output
+        assert f"export SSL_CERT_FILE={pem}" in result.output
 
     def test_print_fish_uses_set_gx(self, tmp_path: Path, monkeypatch):
         pem = tmp_path / "rootCA.pem"
@@ -386,7 +386,24 @@ class TestCaTrustClients:
         with patch("taskmux.ca.caRootPath", return_value=pem):
             result = runner.invoke(app, ["ca", "trust-clients", "--print", "--shell", "fish"])
         assert result.exit_code == 0
-        assert f'set -gx NODE_EXTRA_CA_CERTS "{pem}"' in result.output
+        assert f"set -gx NODE_EXTRA_CA_CERTS '{pem}'" in result.output
+
+    def test_print_json_mode_emits_only_json(self, tmp_path: Path, monkeypatch):
+        """--json --print must produce valid JSON, not raw exports + JSON."""
+        import json
+
+        pem = tmp_path / "rootCA.pem"
+        pem.write_text("FAKE")
+        with patch("taskmux.ca.caRootPath", return_value=pem):
+            result = runner.invoke(
+                app, ["--json", "ca", "trust-clients", "--print", "--shell", "zsh"]
+            )
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is True
+        assert parsed["action"] == "printed"
+        assert parsed["caPath"] == str(pem)
+        assert "export NODE_EXTRA_CA_CERTS" in parsed["exports"]
 
     def test_writes_block_to_rc(self, tmp_path: Path, monkeypatch):
         pem = tmp_path / "rootCA.pem"
@@ -399,7 +416,7 @@ class TestCaTrustClients:
         assert rc.exists()
         text = rc.read_text()
         assert "# >>> taskmux trust-clients >>>" in text
-        assert f'export NODE_EXTRA_CA_CERTS="{pem}"' in text
+        assert f"export NODE_EXTRA_CA_CERTS={pem}" in text
 
     def test_missing_rootca_fails(self, tmp_path: Path, monkeypatch):
         from taskmux.errors import ErrorCode, TaskmuxError
