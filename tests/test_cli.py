@@ -358,6 +358,65 @@ class TestUrlCommand:
         assert result.exit_code == 1
 
 
+class TestOpenCommand:
+    def test_open_with_host(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\nhost = "api"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("webbrowser.open", return_value=True) as mock_open:
+            result = runner.invoke(app, ["open", "api"])
+        assert result.exit_code == 0
+        mock_open.assert_called_once_with("https://api.demo.localhost")
+
+    def test_open_json_mode(self, tmp_path: Path, monkeypatch):
+        import json as _json
+
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\nhost = "api"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("webbrowser.open", return_value=True):
+            result = runner.invoke(app, ["--json", "open", "api"])
+        assert result.exit_code == 0
+        payload = _json.loads(result.output)
+        assert payload == {"ok": True, "task": "api", "url": "https://api.demo.localhost"}
+
+    def test_open_without_host_fails(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("webbrowser.open") as mock_open:
+            result = runner.invoke(app, ["open", "api"])
+        assert result.exit_code == 1
+        mock_open.assert_not_called()
+
+    def test_open_unknown_task(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("webbrowser.open") as mock_open:
+            result = runner.invoke(app, ["open", "ghost"])
+        assert result.exit_code == 1
+        mock_open.assert_not_called()
+
+    def test_open_browser_failure_exits_nonzero(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "x"\nhost = "api"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("webbrowser.open", return_value=False):
+            result = runner.invoke(app, ["--json", "open", "api"])
+        assert result.exit_code == 1
+        assert '"ok": false' in result.output
+
+    def test_open_wildcard_host_fails(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.catch]\ncommand = "x"\nhost = "*"\n')
+        monkeypatch.chdir(tmp_path)
+        with patch("webbrowser.open") as mock_open:
+            result = runner.invoke(app, ["open", "catch"])
+        assert result.exit_code == 1
+        mock_open.assert_not_called()
+
+
 class TestRemoveCommand:
     @patch("taskmux.cli.loadProjectIdentity")
     @patch("taskmux.cli.ipc_client.is_daemon_running", return_value=False)

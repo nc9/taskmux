@@ -988,6 +988,58 @@ def url(
             console.print(f"public: {public_url}", style="cyan")
 
 
+def open_url(
+    task: str = typer.Argument(..., help="Task or alias name"),
+):
+    """Open the proxy URL for a task or alias in the default browser (manual)."""
+    import webbrowser
+
+    from .aliases import lookupAlias
+    from .url import taskUrl
+
+    cli = TaskmuxCLI()
+    cfg = cli.config.tasks.get(task)
+    host: str | None = cfg.host if cfg is not None else None
+    if host is None:
+        alias = lookupAlias(cli.config.name, cli.identity.worktree_id, task)
+        if alias is not None:
+            host = alias["host"]
+    if host is None:
+        if cfg is None:
+            err = "task_not_found"
+            msg = f"'{task}' not found as task or alias"
+        else:
+            err = "no_host"
+            msg = f"Task '{task}' has no host set (not exposed via proxy)"
+        if is_json_mode():
+            print_result({"ok": False, "error": err, "task": task})
+        else:
+            console.print(msg, style="yellow" if err == "no_host" else "red")
+        sys.exit(1)
+    if host == "*":
+        if is_json_mode():
+            print_result({"ok": False, "error": "wildcard_host", "task": task})
+        else:
+            console.print(
+                f"Task '{task}' is a wildcard host — no concrete URL to open",
+                style="yellow",
+            )
+        sys.exit(1)
+    u = taskUrl(cli.project_id, host)
+    opened = webbrowser.open(u)
+    if is_json_mode():
+        print_result({"ok": opened, "task": task, "url": u})
+    else:
+        console.print(u)
+        if not opened:
+            console.print("Failed to launch browser", style="red")
+    if not opened:
+        sys.exit(1)
+
+
+app.command(name="open")(open_url)
+
+
 @app.command()
 def watch():
     """Watch taskmux.toml for changes and reload on edit (foreground, no daemon)."""
