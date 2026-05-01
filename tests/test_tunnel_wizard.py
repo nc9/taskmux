@@ -452,9 +452,7 @@ class TestDescribeAndSet:
                 config_path=project_dir / "taskmux.toml",
             )
 
-    def test_set_project_rejects_unknown_key(
-        self, isolated_taskmux_home: Path, tmp_path: Path
-    ):
+    def test_set_project_rejects_unknown_key(self, isolated_taskmux_home: Path, tmp_path: Path):
         project_dir = tmp_path / "myproj"
         project_dir.mkdir()
         (project_dir / "taskmux.toml").write_text('name = "myproj"\n')
