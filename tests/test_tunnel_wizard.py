@@ -439,6 +439,32 @@ class TestDescribeAndSet:
                 config_path=project_dir / "taskmux.toml",
             )
 
+    def test_set_project_rejects_api_token_via_dotted_key(
+        self, isolated_taskmux_home: Path, tmp_path: Path
+    ):
+        project_dir = tmp_path / "myproj"
+        project_dir.mkdir()
+        (project_dir / "taskmux.toml").write_text('name = "myproj"\n')
+        with pytest.raises(TaskmuxError):
+            setTunnelConfig(
+                scope="project",
+                updates={"tunnel.cloudflare.api_token": "leaked"},
+                config_path=project_dir / "taskmux.toml",
+            )
+
+    def test_set_project_rejects_unknown_key(
+        self, isolated_taskmux_home: Path, tmp_path: Path
+    ):
+        project_dir = tmp_path / "myproj"
+        project_dir.mkdir()
+        (project_dir / "taskmux.toml").write_text('name = "myproj"\n')
+        with pytest.raises(TaskmuxError):
+            setTunnelConfig(
+                scope="project",
+                updates={"account_id": "abc"},
+                config_path=project_dir / "taskmux.toml",
+            )
+
     def test_set_project_zone_id(self, isolated_taskmux_home: Path, tmp_path: Path):
         project_dir = tmp_path / "myproj"
         project_dir.mkdir()

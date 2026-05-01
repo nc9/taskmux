@@ -2026,8 +2026,10 @@ def tunnel_enable_cmd(
     """Wizard / non-interactive: stand up a Cloudflare Tunnel for the project.
 
     Idempotent. Re-running with the same inputs is safe. Without flags on a
-    TTY, prompts for missing inputs. Under --json or non-TTY, returns
-    structured ``missing_input`` errors instead of prompting.
+    TTY, prompts for missing inputs. Under --json or non-TTY, prompts are
+    skipped — outcomes are reported via the structured result (``ok``,
+    ``error``, and the ``preflight.checks`` array, which itself names the
+    specific field that failed).
     """
     if backend != "cloudflare":
         if is_json_mode():

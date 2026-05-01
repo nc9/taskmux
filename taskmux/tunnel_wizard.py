@@ -305,7 +305,7 @@ async def _check_token(token: str | None) -> CheckResult:
             "api_token",
             False,
             "Cloudflare API token not configured",
-            fix="taskmux tunnel config set --global api_token=<token>",
+            fix="taskmux tunnel config-set --scope global api_token=<token>",
         )
     ok, detail = await _verify_token(token)
     if ok:
@@ -851,11 +851,18 @@ def setTunnelConfig(
             detail="project scope requires a config_path",
         )
     identity = loadProjectIdentity(config_path)
-    cf_updates = {k.split(".")[-1]: v for k, v in updates.items() if k != "api_token"}
-    if "api_token" in updates or "api_token_env" in cf_updates:
+    cf_updates = {k.split(".")[-1]: v for k, v in updates.items()}
+    if "api_token" in cf_updates or "api_token_env" in cf_updates:
         raise TaskmuxError(
             ErrorCode.CONFIG_VALIDATION,
             detail="api_token cannot be set at project scope (use scope=global)",
+        )
+    allowed_keys = {"zone_id", "tunnel_name"}
+    unknown = sorted(set(cf_updates) - allowed_keys)
+    if unknown:
+        raise TaskmuxError(
+            ErrorCode.INVALID_ARGUMENT,
+            detail=f"unsupported project tunnel keys: {', '.join(unknown)}",
         )
     new_cf = identity.config.tunnel.cloudflare.model_copy(update=cf_updates)
     new_tunnel = TunnelProjectConfig(cloudflare=new_cf)
