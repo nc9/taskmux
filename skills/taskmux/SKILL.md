@@ -8,7 +8,7 @@ description: Manage long-running dev tasks (servers, watchers, build processes) 
 
 Long-running dev tasks (servers, watchers, builds) need persistent logs, auto-restart, and stable URLs — backgrounded shells (`npm run dev &`) give you none. Taskmux does.
 
-Tmux-backed task runner. Tasks are declared in `taskmux.toml`; taskmux runs each in its own tmux window, mirrors output to a persistent timestamped log, and (when a daemon or `--monitor` is up) auto-restarts per `restart_policy`. Every command takes `--json`.
+Daemon-supervised task runner. Tasks are declared in `taskmux.toml`; the daemon spawns each as its own PTY-backed process group, mirrors output to a persistent timestamped log, and auto-restarts per `restart_policy`. Every command takes `--json`.
 
 ## When to invoke
 
@@ -239,8 +239,8 @@ Daemon picks up changes via file watcher.
 ## Anti-patterns — DO NOT
 
 - ❌ `npm run dev &` / `cargo watch ... &` — backgrounded shell processes have no logs, no restart, no visibility.
-- ❌ `kill -9 <pid>` of a taskmux pane — bypasses manual-stop tracking; auto-restart re-spawns it. Use `taskmux stop`/`kill`.
-- ❌ `tmux capture-pane` for log analysis — use `taskmux logs <task> --grep` against persistent logs.
+- ❌ `kill -9 <pid>` of a task process — bypasses manual-stop tracking; auto-restart re-spawns it. Use `taskmux stop`/`kill`.
+- ❌ Hunting through terminal scrollback for log analysis — use `taskmux logs <task> --grep` against persistent logs.
 - ❌ Editing `taskmux.toml` without a daemon running — file watcher only runs in `taskmux daemon` or `start --monitor`.
 - ❌ `taskmux init` on a project that already has `taskmux.toml` — no-op.
 
@@ -293,10 +293,10 @@ log_max_files = 3
 
 ## stop vs kill vs restart
 
-| Command   | Signal                  | Window     | Auto-restart |
-|-----------|-------------------------|------------|--------------|
-| `stop`    | C-c → SIGTERM → SIGKILL | Stays      | Blocked      |
-| `kill`    | SIGKILL                 | Destroyed  | Blocked      |
-| `restart` | Full stop + start       | Reused     | Re-enabled   |
+| Command   | Signal (on task's process group)            | Auto-restart |
+|-----------|---------------------------------------------|--------------|
+| `stop`    | SIGINT → SIGTERM → SIGKILL (graceful)       | Blocked      |
+| `kill`    | SIGKILL (immediate)                         | Blocked      |
+| `restart` | Full stop + spawn fresh process             | Re-enabled   |
 
 `stop`/`kill` set a manual-stop flag — restart policy suppressed until `start`/`restart` clears it.
