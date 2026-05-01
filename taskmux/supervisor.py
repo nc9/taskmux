@@ -933,6 +933,11 @@ class PosixSupervisor:
             "host": task_cfg.host,
             "url": url,
             "port": self.assigned_ports.get(task_name),
+            "tunnel": str(task_cfg.tunnel) if task_cfg.tunnel else None,
+            "public_hostname": task_cfg.public_hostname,
+            "public_url": (
+                f"https://{task_cfg.public_hostname}/" if task_cfg.public_hostname else None
+            ),
             "health_check": task_cfg.health_check,
             "depends_on": task_cfg.depends_on,
             "running": False,
@@ -959,6 +964,9 @@ class PosixSupervisor:
             status = self.get_task_status(task_name)
             last = self.restart_tracker.last_health(task_name)
             url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
+            public_url = (
+                f"https://{task_cfg.public_hostname}/" if task_cfg.public_hostname else None
+            )
             tasks.append(
                 {
                     "name": task_name,
@@ -972,6 +980,9 @@ class PosixSupervisor:
                     "restart_policy": str(task_cfg.restart_policy),
                     "cwd": task_cfg.cwd,
                     "depends_on": task_cfg.depends_on,
+                    "tunnel": str(task_cfg.tunnel) if task_cfg.tunnel else None,
+                    "public_hostname": task_cfg.public_hostname,
+                    "public_url": public_url,
                     "last_health": last.to_dict() if last else None,
                 }
             )

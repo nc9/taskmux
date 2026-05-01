@@ -1,7 +1,7 @@
 ---
 name: taskmux
-version: 0.7.1
-description: Manage long-running dev tasks (servers, watchers, build processes) via taskmux — a tmux-backed task runner driven by `taskmux.toml`. TRIGGER when cwd has `taskmux.toml`, when the user mentions taskmux, or when the user wants to start/stop/inspect/tail-logs of long-running processes in a project that has taskmux configured. SKIP for one-shot commands (tests, builds) and for projects without `taskmux.toml`.
+version: 0.8.0
+description: Manage long-running dev tasks (servers, watchers, build processes) via taskmux — a daemon-supervised task runner driven by `taskmux.toml` with optional public exposure via Cloudflare Tunnel. TRIGGER when cwd has `taskmux.toml`, when the user mentions taskmux, or when the user wants to start/stop/inspect/tail-logs of long-running processes, or expose a service publicly via a tunnel. SKIP for one-shot commands (tests, builds) and for projects without `taskmux.toml`.
 ---
 
 # taskmux
@@ -75,6 +75,17 @@ taskmux ca trust-clients            # trust CA in Node/Python (writes ~/.zshenv 
 taskmux ca trust-clients --print    # print exports without writing
 taskmux ca trust-clients --shell zsh|bash|fish
 taskmux dns install|uninstall|flush|query <name>
+
+# Tunnels (public exposure — Cloudflare today, more providers coming)
+taskmux tunnel enable [--backend cloudflare] [--token <t>] [--account-id <id>] \
+                      [--zone <id>] [--task api --task web] \
+                      [--public-hostname api=api.example.com] [--dry-run]
+taskmux tunnel test                 # preflight: token, scopes, zones, DNS collisions
+taskmux tunnel config [--reveal]    # cascaded view (global + project + sources)
+taskmux tunnel config-set --scope global zone_id=abc api_token=cf-pat-...
+taskmux tunnel disable [--prune]
+taskmux tunnel status               # backend health, last sync, mappings
+taskmux tunnel logs [cloudflare] [--follow]
 ```
 
 ## JSON patterns
@@ -150,6 +161,47 @@ proxy_bind = "127.0.0.1"           # "0.0.0.0" exposes to LAN (be deliberate)
 
 `taskmux status` flips host-routed tasks to `healthy: false` when the proxy listener isn't bound or this project's host route isn't registered. The reason is in `last_health.reason`; the top-level `proxy: {bound, port, reason}` summarises overall state.
 
+## Public access (tunnels)
+
+To expose a host-routed task on the public internet (webhooks, mobile, remote agents): the existing local URL is unaffected — public access is **additive**.
+
+```bash
+# Wizard / non-interactive — runs preflight, creates tunnel, writes DNS
+taskmux tunnel enable --json \
+    --token "$CLOUDFLARE_API_TOKEN" \
+    --task api --public-hostname api=api.example.com \
+    --task web --public-hostname web=web.example.com
+```
+
+Under `--json` (or non-TTY) every step is non-interactive. Missing inputs return `{"ok": false, "error": "missing_input", "field": "..."}` instead of prompting — feed them in via flags and re-run.
+
+Cascade for config: `~/.taskmux/config.toml` `[tunnel.cloudflare]` (account_id, zone_id, api_token, tunnel_name) is the **default** for every project; `taskmux.toml` `[tunnel.cloudflare]` overrides per project; if zone_id is unset everywhere, it's auto-resolved from the public_hostname's apex.
+
+Token policy:
+- Lives in `~/.taskmux/config.toml` (`api_token` field, file chmod 0600 — daemon refuses otherwise) OR an env var named by `api_token_env` (default `CLOUDFLARE_API_TOKEN`).
+- **Never** in `taskmux.toml` (git-tracked) — validation rejects it there.
+- `taskmux config show` and `taskmux tunnel config` mask it; `--reveal` shows plaintext.
+
+Per-task config (added by `tunnel enable`, but writable directly):
+```toml
+[tasks.api]
+host = "api"
+tunnel = "cloudflare"                   # also: "noop" for self-hosted infra
+public_hostname = "api.example.com"
+```
+
+Validation rules: `tunnel` requires `host` set + non-wildcard + `public_hostname` valid FQDN.
+
+Triage when something's off:
+1. `taskmux tunnel test --json` — preflight without mutating. Missing piece is in the failed `check`.
+2. `taskmux tunnel status --json` — `cloudflared` running? `last_error` text?
+3. `taskmux tunnel logs cloudflare --follow` — child process stdout/stderr.
+4. `taskmux url <task> --json` — local + public URL together.
+
+When user says "expose this" / "make it public" / "tunnel": always default to `taskmux tunnel enable` against cwd. Don't manually edit Cloudflare — taskmux owns the cfd_tunnel, ingress, and DNS routes.
+
+Provider note: only `cloudflare` is wired today. Tailscale Funnel and ngrok are deferred (single-funnel-per-node and free-tier-no-BYO-domain limits respectively). Self-hosted (frp / sish / Caddy) → set `tunnel = "noop"`; taskmux records the public hostname for status display while you wire exposure outside.
+
 ## Worktrees
 
 Linked git worktrees get an auto-suffixed `project_id` (e.g. `myproject-feat-foo`) so logs, registry entries, and proxy URLs (`https://api.myproject-feat-foo.localhost`) don't collide with the primary checkout. The user-facing `name` in `taskmux.toml` stays the same; everything routed by `project_id` namespaces automatically.
@@ -219,6 +271,8 @@ command = "..."
 auto_start = true
 cwd = "..."                 # relative to taskmux.toml dir
 host = "api" | "@" | "*"    # → proxy URL; PORT exported into command only
+tunnel = "cloudflare"       # optional: "cloudflare" | "noop"
+public_hostname = "..."     # required when tunnel = "cloudflare"
 depends_on = []
 # Health: omit when `host` is set — taskmux TCP-probes assigned port.
 # $PORT is NOT substituted in these fields (passed verbatim to http/shell).

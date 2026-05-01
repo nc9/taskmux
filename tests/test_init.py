@@ -39,9 +39,7 @@ class TestInitProject:
         captured = capsys.readouterr()
         assert "already exists" in captured.out
 
-    def test_defaults_creates_agents_md_when_neither_exists(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_defaults_creates_agents_md_when_neither_exists(self, tmp_path: Path, monkeypatch):
         _silenceSkill(monkeypatch)
         initProject(path=tmp_path, defaults=True)
         assert (tmp_path / AGENTS_FILE).exists()
@@ -67,9 +65,7 @@ class TestInitProject:
         assert CONTEXT_START in (tmp_path / AGENTS_FILE).read_text()
 
     @patch("builtins.input", side_effect=["my-session", ""])
-    def test_interactive_default_picks_agents_md(
-        self, mock_input, tmp_path: Path, monkeypatch
-    ):
+    def test_interactive_default_picks_agents_md(self, mock_input, tmp_path: Path, monkeypatch):
         _silenceSkill(monkeypatch)
         cfg = initProject(path=tmp_path, defaults=False)
         assert cfg.name == "my-session"
@@ -103,9 +99,7 @@ class TestInitProject:
         captured = capsys.readouterr()
         assert "npx skills add nc9/taskmux" in captured.out
 
-    def test_skill_tip_suppressed_when_installed(
-        self, tmp_path: Path, monkeypatch, capsys
-    ):
+    def test_skill_tip_suppressed_when_installed(self, tmp_path: Path, monkeypatch, capsys):
         _silenceSkill(monkeypatch)
         initProject(path=tmp_path, defaults=True)
         captured = capsys.readouterr()

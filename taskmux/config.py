@@ -159,6 +159,24 @@ def _writeWorktreeTable(wt) -> tomlkit.items.Table | None:  # type: ignore[name-
     return tbl
 
 
+def _writeTunnelTable(tunnel) -> tomlkit.items.Table | None:  # type: ignore[name-defined]
+    """Build a tomlkit table for [tunnel], or None if every backend is default."""
+    cf = tunnel.cloudflare
+    fields: list[tuple[str, str]] = []
+    if cf.zone_id is not None:
+        fields.append(("zone_id", cf.zone_id))
+    if cf.tunnel_name is not None:
+        fields.append(("tunnel_name", cf.tunnel_name))
+    if not fields:
+        return None
+    outer = tomlkit.table()
+    inner = tomlkit.table()
+    for k, v in fields:
+        inner.add(k, v)
+    outer.add("cloudflare", inner)
+    return outer
+
+
 def _writeHooksTable(hooks: HookConfig) -> tomlkit.items.Table | None:  # type: ignore[name-defined]
     """Build a tomlkit table for hooks, returning None if all empty."""
     fields = [
@@ -204,6 +222,12 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
         doc.add("worktree", wt_tbl)
         doc.add(tomlkit.nl())
 
+    # Tunnel settings (only emitted when any backend has non-default fields)
+    tun_tbl = _writeTunnelTable(config.tunnel)
+    if tun_tbl is not None:
+        doc.add("tunnel", tun_tbl)
+        doc.add(tomlkit.nl())
+
     for task_name, task_cfg in config.tasks.items():
         tbl = tomlkit.table(is_super_table=True)
         inner = tomlkit.table()
@@ -219,6 +243,10 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("host", "@" if task_cfg.host == "" else task_cfg.host)
         if task_cfg.host_path != "/":
             inner.add("host_path", task_cfg.host_path)
+        if task_cfg.tunnel is not None:
+            inner.add("tunnel", str(task_cfg.tunnel))
+        if task_cfg.public_hostname is not None:
+            inner.add("public_hostname", task_cfg.public_hostname)
         if task_cfg.health_check is not None:
             inner.add("health_check", task_cfg.health_check)
         if task_cfg.health_url is not None:
@@ -299,9 +327,7 @@ def removeTask(path: Path | None, name: str) -> tuple[TaskmuxConfig, bool]:
     return cfg, True
 
 
-def _rebuildWithTasks(
-    cfg: TaskmuxConfig, new_tasks: dict[str, TaskConfig]
-) -> TaskmuxConfig:
+def _rebuildWithTasks(cfg: TaskmuxConfig, new_tasks: dict[str, TaskConfig]) -> TaskmuxConfig:
     """Build a fresh TaskmuxConfig with new_tasks, preserving every other field.
 
     Uses the public constructor so model + field validators (DNS-safe name,
@@ -316,5 +342,6 @@ def _rebuildWithTasks(
         auto_inject_agents=cfg.auto_inject_agents,
         hooks=cfg.hooks,
         worktree=cfg.worktree,
+        tunnel=cfg.tunnel,
         tasks=new_tasks,
     )

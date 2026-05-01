@@ -42,8 +42,8 @@ _SKILL_NAME = "taskmux"
 # joined to $HOME. `.agents/skills` is the shared convention used by Codex,
 # OpenCode, Cursor, Gemini CLI, Copilot, Cline, Warp, etc.
 _PROJECT_SKILL_DIRS = (
-    Path(".claude") / "skills",       # Claude Code
-    Path(".agents") / "skills",       # shared cross-agent
+    Path(".claude") / "skills",  # Claude Code
+    Path(".agents") / "skills",  # shared cross-agent
     Path(".codex") / "skills",
     Path(".opencode") / "skills",
 )
@@ -67,9 +67,7 @@ def skillInstalled(project_path: Path | None = None) -> bool:
     home = Path.home()
     candidates = [home / d / _SKILL_NAME / "SKILL.md" for d in _GLOBAL_SKILL_DIRS]
     if project_path is not None:
-        candidates.extend(
-            project_path / d / _SKILL_NAME / "SKILL.md" for d in _PROJECT_SKILL_DIRS
-        )
+        candidates.extend(project_path / d / _SKILL_NAME / "SKILL.md" for d in _PROJECT_SKILL_DIRS)
     return any(p.exists() for p in candidates)
 
 

@@ -780,11 +780,15 @@ def _status():
         _print_alias_section(aliases)
         return
 
+    has_public = any(t.get("public_url") for t in tasks)
+
     table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
     table.add_column("", width=1, no_wrap=True)
     table.add_column("Status", style="cyan", no_wrap=True)
     table.add_column("Task", style="magenta", no_wrap=True)
     table.add_column("URL", no_wrap=True)
+    if has_public:
+        table.add_column("Public URL", no_wrap=True)
     table.add_column("Command", overflow="ellipsis", no_wrap=True)
     table.add_column("Notes", style="dim", no_wrap=True)
 
@@ -802,14 +806,18 @@ def _status():
             notes.append(f"cwd={t['cwd']}")
         if t.get("depends_on"):
             notes.append(f"deps=[{','.join(t['depends_on'])}]")
-        table.add_row(
+        if t.get("tunnel"):
+            notes.append(f"tunnel={t['tunnel']}")
+        row = [
             f"[{icon_style}]{health_icon}[/{icon_style}]",
             status_text,
             t["name"],
             t.get("url") or "",
-            t["command"],
-            " ".join(notes),
-        )
+        ]
+        if has_public:
+            row.append(t.get("public_url") or "")
+        row.extend([t["command"], " ".join(notes)])
+        table.add_row(*row)
         last = t.get("last_health")
         if last and not last.get("ok") and last.get("reason"):
             fail_rows.append((t["name"], last.get("method", ""), last.get("reason", "")))
@@ -959,8 +967,14 @@ def url(
             console.print(msg, style="yellow" if err == "no_host" else "red")
         sys.exit(1)
     u = taskUrl(cli.project_id, host)
+    public_url: str | None = None
+    if cfg is not None and cfg.public_hostname:
+        public_url = f"https://{cfg.public_hostname}/"
     if is_json_mode():
-        print_result({"ok": True, "task": task, "url": u})
+        out: dict = {"ok": True, "task": task, "url": u}
+        if public_url:
+            out["public_url"] = public_url
+        print_result(out)
     else:
         console.print(u)
         from .shell_env import clientTrustMissing
@@ -970,6 +984,8 @@ def url(
                 "Tip: Node/Python may reject this cert — run 'taskmux ca trust-clients' once.",
                 style="dim",
             )
+        if public_url:
+            console.print(f"public: {public_url}", style="cyan")
 
 
 @app.command()
@@ -1278,15 +1294,31 @@ config_app = typer.Typer(
 )
 
 
+def _mask_secrets_in_config(data: dict, reveal: bool) -> dict:
+    """Replace nested `tunnel.cloudflare.api_token` with a masked stub unless reveal=True."""
+    out = dict(data)
+    tunnel = dict(out.get("tunnel") or {})
+    cf = dict(tunnel.get("cloudflare") or {})
+    token = cf.get("api_token")
+    if token and not reveal:
+        cf["api_token"] = f"{token[:4]}***{token[-4:]}" if len(token) > 8 else "***"
+    if cf:
+        tunnel["cloudflare"] = cf
+        out["tunnel"] = tunnel
+    return out
+
+
 @config_app.command("show")
-def config_show():
-    """Print the resolved global config (defaults + overrides)."""
+def config_show(
+    reveal: bool = typer.Option(False, "--reveal", help="Show secrets in plaintext"),
+):
+    """Print the resolved global config (defaults + overrides). Secrets masked."""
     from .global_config import loadGlobalConfig
     from .paths import globalConfigPath
 
     cfg = loadGlobalConfig()
     path = globalConfigPath()
-    data = cfg.model_dump()
+    data = _mask_secrets_in_config(cfg.model_dump(), reveal)
     if is_json_mode():
         print_result({"path": str(path), "exists": path.exists(), "config": data})
         return
@@ -1302,18 +1334,25 @@ def config_show():
 
 @config_app.command("set")
 def config_set(
-    key: str = typer.Argument(..., help="Config key, e.g. health_check_interval"),
+    key: str = typer.Argument(
+        ..., help="Config key (top-level or dotted, e.g. tunnel.cloudflare.zone_id)"
+    ),
     value: str = typer.Argument(..., help="New value (parsed as int/bool/string)"),
 ):
-    """Set a global config key. Coerces value to int/bool when possible."""
+    """Set a global config key. Coerces value to int/bool when possible.
+
+    Accepts top-level fields (`health_check_interval`) or dotted paths into
+    nested blocks (`tunnel.cloudflare.zone_id`).
+    """
     from .errors import ErrorCode
     from .global_config import GlobalConfig, updateGlobalConfig
 
-    if key not in GlobalConfig.model_fields:
+    top_key = key.split(".", 1)[0]
+    if top_key not in GlobalConfig.model_fields:
         valid = ", ".join(sorted(GlobalConfig.model_fields))
         raise TaskmuxError(
             ErrorCode.CONFIG_VALIDATION,
-            detail=f"unknown config key '{key}' (valid: {valid})",
+            detail=f"unknown config key '{key}' (valid top-level: {valid})",
         )
 
     parsed: object = value
@@ -1322,11 +1361,14 @@ def config_set(
     else:
         with contextlib.suppress(ValueError):
             parsed = int(value)
-    new = updateGlobalConfig({key: parsed})
+    updateGlobalConfig({key: parsed})
     if is_json_mode():
-        print_result({"ok": True, "key": key, "value": getattr(new, key, parsed)})
+        print_result({"ok": True, "key": key, "value": parsed})
     else:
-        console.print(f"Set {key} = {getattr(new, key, parsed)}", style="green")
+        display = parsed
+        if "api_token" in key and isinstance(display, str) and len(display) > 8:
+            display = f"{display[:4]}***{display[-4:]}"
+        console.print(f"Set {key} = {display}", style="green")
 
 
 @config_app.command("path")
@@ -1859,6 +1901,411 @@ def alias_remove(
 
 
 app.add_typer(alias_app)
+
+
+# ---------------------------------------------------------------------------
+# Tunnel sub-app
+# ---------------------------------------------------------------------------
+
+tunnel_app = typer.Typer(
+    name="tunnel",
+    help=(
+        'Inspect public-tunnel backends. Per-task `tunnel = "cloudflare"` '
+        "in taskmux.toml exposes the service via a Cloudflare Tunnel; this "
+        "command surfaces backend health and recent log lines."
+    ),
+    no_args_is_help=True,
+)
+
+
+def _print_check_row(check: dict) -> None:
+    icon = "[green]ok[/green]" if check.get("ok") else "[red]fail[/red]"
+    name = check.get("name", "?")
+    detail = check.get("detail", "")
+    console.print(f"  {icon}  [bold]{name}[/bold]  {detail}")
+    fix = check.get("fix")
+    if fix and not check.get("ok"):
+        console.print(f"        [yellow]→ fix:[/yellow] {fix}")
+
+
+def _render_enable_result(result: dict) -> None:
+    if not result.get("ok"):
+        console.print(
+            f"[red]Tunnel setup did not complete[/red]: {result.get('error') or 'preflight failed'}"
+        )
+    pre = result.get("preflight", {})
+    if pre.get("checks"):
+        console.print("\n[bold]Preflight[/bold]")
+        for c in pre["checks"]:
+            _print_check_row(c)
+    public = result.get("public_urls") or {}
+    if public:
+        console.print("\n[bold]Public URLs[/bold]")
+        for task, url in public.items():
+            console.print(f"  [magenta]{task}[/magenta]  {url}")
+    eff = result.get("config") or {}
+    if eff:
+        console.print("\n[bold]Effective config[/bold]")
+        for key in ("account_id", "zone_id", "tunnel_name", "api_token"):
+            entry = eff.get(key) or {}
+            value = entry.get("value")
+            source = entry.get("source") or "—"
+            console.print(f"  {key:<13} {value!s:<30} [dim](source: {source})[/dim]")
+
+
+def _interactive_enable_inputs(cli_obj: TaskmuxCLI) -> dict:
+    """Prompt for missing pieces interactively. Used only when stdin is a TTY."""
+    import os as _os
+
+    from rich.prompt import Confirm, Prompt
+
+    from .global_config import loadGlobalConfig as _loadGlobalConfig
+
+    inputs: dict = {}
+    g = _loadGlobalConfig()
+    cf = g.tunnel.cloudflare
+    if not cf.api_token and not _os.environ.get(cf.api_token_env or "CLOUDFLARE_API_TOKEN"):
+        console.print(
+            "[bold]Cloudflare API token[/bold] "
+            f"(or export ${cf.api_token_env or 'CLOUDFLARE_API_TOKEN'} and re-run)"
+        )
+        token = Prompt.ask("token", password=True, default="").strip()
+        if token:
+            inputs["api_token"] = token
+    if not cf.account_id:
+        account = Prompt.ask(
+            "[bold]Cloudflare account ID[/bold] (dash → any zone → right sidebar)"
+        ).strip()
+        if account:
+            inputs["account_id"] = account
+
+    cfg_tasks = list(cli_obj.config.tasks.items())
+    host_tasks = [(n, t) for n, t in cfg_tasks if t.host is not None and t.host != "*"]
+    if not host_tasks:
+        console.print(
+            '[yellow]No tasks with `host` set — add `host = "..."` '
+            "to a task before tunneling.[/yellow]"
+        )
+        return inputs
+
+    console.print("\n[bold]Tasks to expose publicly[/bold] (Enter to skip):")
+    public_hostnames: dict[str, str] = {}
+    for name, t in host_tasks:
+        existing = t.public_hostname
+        val = Prompt.ask(
+            f"  public_hostname for [magenta]{name}[/magenta]",
+            default=existing or "",
+        )
+        if val:
+            public_hostnames[name] = val
+    if public_hostnames:
+        inputs["public_hostnames"] = public_hostnames
+        inputs["tasks"] = list(public_hostnames.keys())
+
+    if not Confirm.ask("\nProceed?", default=True):
+        raise typer.Exit(code=0)
+    return inputs
+
+
+@tunnel_app.command("enable")
+def tunnel_enable_cmd(
+    backend: str = typer.Option("cloudflare", "--backend", help="Tunnel provider"),
+    token: str | None = typer.Option(None, "--token", help="Cloudflare API token"),
+    account_id: str | None = typer.Option(None, "--account-id", help="CF account UUID"),
+    zone: str | None = typer.Option(None, "--zone", help="Override zone_id at project level"),
+    task: list[str] = typer.Option(  # noqa: B008
+        [], "--task", help="Task to tunnel (repeatable)"
+    ),
+    public_hostname: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--public-hostname",
+        help="task=fqdn pair (repeatable, e.g. --public-hostname api=api.example.com)",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preflight + plan, no mutations"),
+):
+    """Wizard / non-interactive: stand up a Cloudflare Tunnel for the project.
+
+    Idempotent. Re-running with the same inputs is safe. Without flags on a
+    TTY, prompts for missing inputs. Under --json or non-TTY, prompts are
+    skipped — outcomes are reported via the structured result (``ok``,
+    ``error``, and the ``preflight.checks`` array, which itself names the
+    specific field that failed).
+    """
+    if backend != "cloudflare":
+        if is_json_mode():
+            print_result({"ok": False, "error": "unsupported_backend", "backend": backend})
+        else:
+            console.print(f"Backend '{backend}' is not supported yet.", style="red")
+        raise typer.Exit(code=1)
+
+    cli = TaskmuxCLI()
+    public_map: dict[str, str] = {}
+    for pair in public_hostname:
+        if "=" not in pair:
+            err = {
+                "ok": False,
+                "error": "invalid_arg",
+                "field": "public_hostname",
+                "hint": "use --public-hostname task=fqdn",
+            }
+            if is_json_mode():
+                print_result(err)
+            else:
+                console.print(
+                    f"Invalid --public-hostname {pair!r}: expected task=fqdn",
+                    style="red",
+                )
+            raise typer.Exit(code=1)
+        k, v = pair.split("=", 1)
+        public_map[k.strip()] = v.strip()
+
+    inputs: dict = {
+        "api_token": token,
+        "account_id": account_id,
+        "zone_id": zone,
+        "tasks": task or None,
+        "public_hostnames": public_map or None,
+        "dry_run": dry_run,
+    }
+
+    interactive = sys.stdin.isatty() and not is_json_mode()
+    if interactive and not (token or account_id or task or public_map):
+        inputs.update(_interactive_enable_inputs(cli))
+
+    from . import tunnel_wizard
+
+    async def _run() -> dict:
+        result = await tunnel_wizard.enable(
+            config_path=cli.config_path,
+            api_token=inputs.get("api_token"),
+            account_id=inputs.get("account_id"),
+            zone_id=inputs.get("zone_id"),
+            tasks=inputs.get("tasks"),
+            public_hostnames=inputs.get("public_hostnames"),
+            dry_run=dry_run,
+        )
+        return result.to_dict()
+
+    payload = asyncio.run(_run())
+    # Trigger daemon resync so ingress + DNS reach the new state.
+    if payload.get("ok"):
+        with contextlib.suppress(Exception):
+            ipc_client.call_no_ensure("resync", params={"session": cli.project_id})
+
+    if is_json_mode():
+        print_result(payload)
+    else:
+        _render_enable_result(payload)
+    if not payload.get("ok"):
+        raise typer.Exit(code=1)
+
+
+@tunnel_app.command("disable")
+def tunnel_disable_cmd(
+    prune: bool = typer.Option(
+        False, "--prune", help="Also remove [tunnel.cloudflare] from taskmux.toml"
+    ),
+):
+    """Strip `tunnel`/`public_hostname` from every task in this project."""
+    cli = TaskmuxCLI()
+    from . import tunnel_wizard
+
+    async def _run() -> dict:
+        return await tunnel_wizard.disable(config_path=cli.config_path, prune=prune)
+
+    payload = asyncio.run(_run())
+    with contextlib.suppress(Exception):
+        ipc_client.call_no_ensure("resync", params={"session": cli.project_id})
+    if is_json_mode():
+        print_result(payload)
+    else:
+        console.print(
+            f"Tunnel disabled for {payload['project_id']} "
+            f"({len(payload['tasks_disabled'])} tasks updated, prune={payload['pruned']})"
+        )
+
+
+@tunnel_app.command("test")
+def tunnel_test_cmd():
+    """Run preflight (token, scopes, zones, DNS collisions) without mutating."""
+    cli = TaskmuxCLI()
+    from . import tunnel_wizard
+
+    async def _run() -> dict:
+        from .global_config import loadGlobalConfig as _load
+
+        report = await tunnel_wizard.preflight(
+            project_id=cli.project_id,
+            project_cfg=cli.config,
+            global_cfg=_load(),
+        )
+        return report.to_dict()
+
+    payload = asyncio.run(_run())
+    if is_json_mode():
+        print_result({"ok": payload["ok"], "preflight": payload})
+        return
+    console.print("[bold]Preflight[/bold]")
+    for c in payload["checks"]:
+        _print_check_row(c)
+    if not payload["ok"]:
+        raise typer.Exit(code=1)
+
+
+@tunnel_app.command("config")
+def tunnel_config_cmd(
+    reveal: bool = typer.Option(False, "--reveal", help="Show api_token in plaintext"),
+):
+    """Show the cascaded tunnel config + per-field source."""
+    cli = TaskmuxCLI()
+    from . import tunnel_wizard
+
+    payload = tunnel_wizard.describeTunnelConfig(config_path=cli.config_path, reveal=reveal)
+    if is_json_mode():
+        print_result(payload)
+        return
+    eff = payload.get("effective", {})
+    console.print("[bold]Effective[/bold]")
+    for key in ("account_id", "zone_id", "tunnel_name", "api_token"):
+        entry = eff.get(key) or {}
+        value = entry.get("value")
+        source = entry.get("source") or "—"
+        console.print(f"  {key:<13} {value!s:<32} [dim](source: {source})[/dim]")
+    console.print(f"\n[bold]Global[/bold]   ({payload['global_config_path']})")
+    g = payload.get("global", {}) or {}
+    for k in ("account_id", "zone_id", "tunnel_name", "api_token", "api_token_env"):
+        console.print(f"  {k:<14} {g.get(k)!s}")
+    console.print(f"\n[bold]Project[/bold]  ({payload['config_path']})")
+    p = payload.get("project", {}) or {}
+    for k in ("zone_id", "tunnel_name"):
+        console.print(f"  {k:<14} {p.get(k)!s}")
+    if payload.get("tasks"):
+        console.print("\n[bold]Tasks[/bold]")
+        for t in payload["tasks"]:
+            console.print(
+                f"  [magenta]{t['name']}[/magenta]  tunnel={t['tunnel']!s}  "
+                f"public={t['public_url'] or '—'}"
+            )
+    health_bits = []
+    health_bits.append(f"cloudflared: {'present' if payload['cloudflared_in_path'] else 'missing'}")
+    mode_str = "ok" if payload["config_file_mode_ok"] else "NEEDS chmod 600"
+    health_bits.append(f"~/.taskmux/config.toml mode: {mode_str}")
+    console.print(f"\n[dim]{'  •  '.join(health_bits)}[/dim]")
+
+
+@tunnel_app.command("config-set")
+def tunnel_config_set_cmd(
+    scope: str = typer.Option(
+        "global", "--scope", help="'global' (~/.taskmux/config.toml) or 'project' (taskmux.toml)"
+    ),
+    set_pairs: list[str] = typer.Argument(  # noqa: B008
+        ..., help="key=value pairs (e.g. zone_id=abc123 api_token=cf-pat-...)"
+    ),
+):
+    """Set one or more tunnel config keys at the chosen scope."""
+    updates: dict = {}
+    for pair in set_pairs:
+        if "=" not in pair:
+            if is_json_mode():
+                print_result({"ok": False, "error": "invalid_arg", "pair": pair})
+            else:
+                console.print(f"Invalid {pair!r}: expected key=value", style="red")
+            raise typer.Exit(code=1)
+        k, v = pair.split("=", 1)
+        updates[k.strip()] = v.strip()
+
+    config_path: Path | None = None
+    if scope == "project":
+        config_path = TaskmuxCLI().config_path
+
+    from . import tunnel_wizard
+
+    payload = tunnel_wizard.setTunnelConfig(scope=scope, updates=updates, config_path=config_path)
+    if is_json_mode():
+        print_result(payload)
+    else:
+        console.print(f"Updated {len(payload['updated'])} key(s) at scope={scope}")
+
+
+@tunnel_app.command("status")
+def tunnel_status_cmd():
+    """Show health + last-sync state of every active tunnel backend."""
+    resp = ipc_client.call("tunnel_status")
+    entries = resp.get("tunnels", [])
+    if is_json_mode():
+        print_result({"ok": True, "tunnels": entries})
+        return
+    if not entries:
+        console.print("No tunnels active.")
+        return
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("Project", style="magenta", no_wrap=True)
+    table.add_column("Backend", style="cyan", no_wrap=True)
+    table.add_column("Tunnel", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Mappings", no_wrap=True)
+    table.add_column("Note", style="dim")
+    for e in entries:
+        status_text = "ok" if e.get("last_sync_ok") else "error"
+        status_style = "green" if e.get("last_sync_ok") else "red"
+        running = e.get("cloudflared_running")
+        if running is False:
+            status_text = "stopped"
+            status_style = "yellow"
+        table.add_row(
+            e.get("session", ""),
+            e.get("backend", ""),
+            e.get("tunnel_name") or "",
+            f"[{status_style}]{status_text}[/{status_style}]",
+            str(e.get("mappings", 0)),
+            e.get("last_error") or "",
+        )
+    console.print(table)
+
+
+@tunnel_app.command("logs")
+def tunnel_logs_cmd(
+    backend: str = typer.Argument("cloudflare", help="Backend name"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Tail the log file"),
+    lines: int = typer.Option(50, "--lines", "-n", help="Lines of history"),
+):
+    """Tail the cloudflared log for a project's tunnel."""
+    from .paths import tunnelStateDir
+
+    log_dir = tunnelStateDir(backend)
+    if not log_dir.exists():
+        if is_json_mode():
+            print_result({"ok": False, "error": "no_logs", "backend": backend})
+        else:
+            console.print(f"No logs for backend '{backend}' yet.", style="yellow")
+        return
+    log_files = sorted(log_dir.glob("*.log"))
+    if not log_files:
+        if is_json_mode():
+            print_result({"ok": False, "error": "no_logs", "backend": backend})
+        else:
+            console.print(f"No logs for backend '{backend}' yet.", style="yellow")
+        return
+    if is_json_mode():
+        print_result({"ok": True, "backend": backend, "files": [str(p) for p in log_files]})
+        return
+    if follow:
+        if len(log_files) == 1:
+            ipc_client.follow_log_file(log_files[0])
+        else:
+            tagged = [(p.stem, p, "cyan") for p in log_files]
+            ipc_client.follow_log_files(tagged)
+        return
+    for path in log_files:
+        console.print(f"==> {path} <==", style="dim")
+        with path.open("rb") as f:
+            data = f.read()
+        text = data.decode("utf-8", errors="replace").splitlines()
+        for line in text[-lines:]:
+            console.print(line)
+
+
+app.add_typer(tunnel_app)
 
 
 def _hoist_global_flags(argv: list[str]) -> list[str]:

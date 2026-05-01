@@ -29,6 +29,7 @@ from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 from .config import addTask, loadConfig, removeTask
+from .errors import TaskmuxError
 from .events import recordEvent
 from .host_resolver import HostResolver, getResolver
 from .models import TaskmuxConfig
@@ -42,6 +43,12 @@ from .paths import (
 from .proxy import ProxyServer
 from .registry import readRegistry
 from .supervisor import Supervisor, _parseSince, make_supervisor, readLogFile
+from .tunnels import (
+    CloudflareTunnelBackend,
+    NoopTunnelBackend,
+    TunnelBackend,
+    TunnelMapping,
+)
 from .url import taskUrl
 
 # ---------------------------------------------------------------------------
@@ -209,6 +216,9 @@ class TaskmuxDaemon:
         self._proxy_sock: socket.socket | None = None
         self.host_resolver: HostResolver | None = None
         self.dns_server: object | None = None
+        # (project_id, backend_name) -> TunnelBackend. Lazily created on
+        # first sync for projects that opt in via `tunnel = "..."` on a task.
+        self.tunnels: dict[tuple[str, str], TunnelBackend] = {}
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self.logger = self._setup_logging()
@@ -297,6 +307,11 @@ class TaskmuxDaemon:
                     await sup.stop_all()
             except Exception as e:  # noqa: BLE001
                 self.logger.error(f"stop_all failed for {session}: {e}")
+        for (session, kind), backend in list(self.tunnels.items()):
+            try:
+                await backend.clear()
+            except Exception as e:  # noqa: BLE001
+                self.logger.error(f"tunnel clear failed for {session}/{kind}: {e}")
         self.stop()
         # Cancel the long-running tasks so start()'s gather() unblocks.
         if self.health_check_task and not self.health_check_task.done():
@@ -457,6 +472,12 @@ class TaskmuxDaemon:
         self.configs.pop(session, None)
         self.project_states.pop(session, None)
         self.config_paths.pop(session, None)
+        for sess, kind in list(self.tunnels.keys()):
+            if sess != session:
+                continue
+            backend = self.tunnels.pop((sess, kind))
+            if self._loop is not None:
+                self._loop.call_soon(lambda b=backend: asyncio.create_task(b.clear()))
         if self.proxy is not None:
             self.proxy.unregister_project(session)
             from .ca import dropCert
@@ -641,6 +662,140 @@ class TaskmuxDaemon:
         with contextlib.suppress(PermissionError, OSError):
             self.host_resolver.sync(mappings)
 
+    def _collect_tunnel_mappings(self, session: str) -> dict[str, list[TunnelMapping]]:
+        """Per-backend tunnel mappings for one project.
+
+        Walks the project's live tasks; for each task with `tunnel` set, emits
+        `(public_hostname, internal_fqdn, proxy_port)`. Apex hosts compose to
+        `<project_id>.<tld>`; wildcard hosts are skipped (no single FQDN to
+        target). Tasks without `host` or without `public_hostname` are
+        likewise skipped (caught earlier by config validation, but defensive).
+        """
+        cfg = self.configs.get(session)
+        sup = self.projects.get(session)
+        if cfg is None or sup is None:
+            return {}
+        tld = self.global_config.dns_managed_tld
+        proxy_port = self.global_config.proxy_https_port
+        running: set[str] = set()
+        with contextlib.suppress(Exception):
+            if sup.session_exists():
+                running = set(sup.list_windows())
+
+        out: dict[str, list[TunnelMapping]] = {}
+        for task_name, task_cfg in cfg.tasks.items():
+            if task_cfg.tunnel is None or not task_cfg.public_hostname:
+                continue
+            if task_cfg.host is None or task_cfg.host == "*":
+                continue
+            if task_name not in running:
+                # Tunnel only what the proxy is currently routing.
+                continue
+            internal_fqdn = (
+                f"{session}.{tld}" if task_cfg.host == "" else f"{task_cfg.host}.{session}.{tld}"
+            )
+            out.setdefault(str(task_cfg.tunnel), []).append(
+                (task_cfg.public_hostname, internal_fqdn, proxy_port)
+            )
+        return out
+
+    def _ensure_tunnel_backend(self, session: str, kind: str) -> TunnelBackend | None:
+        """Get-or-create the backend instance for (project, kind)."""
+        existing = self.tunnels.get((session, kind))
+        if existing is not None:
+            return existing
+        cfg = self.configs.get(session)
+        if cfg is None:
+            return None
+        backend: TunnelBackend | None = None
+        if kind == "noop":
+            backend = NoopTunnelBackend()
+        elif kind == "cloudflare":
+            backend = self._build_cloudflare_backend(session, cfg)
+        if backend is None:
+            return None
+        self.tunnels[(session, kind)] = backend
+        return backend
+
+    def _build_cloudflare_backend(self, session: str, cfg: TaskmuxConfig) -> TunnelBackend | None:
+        from .global_config import globalConfigModeOk
+        from .tunnels import resolveCloudflareConfig
+
+        # Refuse to read an embedded token from a world-readable config.
+        if self.global_config.tunnel.cloudflare.api_token:
+            ok, mode = globalConfigModeOk()
+            if not ok:
+                mode_str = oct(mode) if mode is not None else "?"
+                self.logger.error(
+                    f"~/.taskmux/config.toml is mode {mode_str} but contains "
+                    "[tunnel.cloudflare].api_token — refusing to read. "
+                    "Run `chmod 600 ~/.taskmux/config.toml` (or move the token "
+                    "to an env var via api_token_env). Tunnel disabled."
+                )
+                return None
+
+        eff = resolveCloudflareConfig(
+            global_cf=self.global_config.tunnel.cloudflare,
+            project_cf=cfg.tunnel.cloudflare,
+            project_id=session,
+        )
+        missing: list[str] = []
+        if not eff.account_id:
+            missing.append(
+                "account_id (set [tunnel.cloudflare].account_id in ~/.taskmux/config.toml)"
+            )
+        if not eff.api_token:
+            env_name = self.global_config.tunnel.cloudflare.api_token_env or "CLOUDFLARE_API_TOKEN"
+            missing.append(f"api_token (embed in ~/.taskmux/config.toml or export ${env_name})")
+        if not eff.zone_id:
+            # Auto-resolution requires an API call — defer to the wizard /
+            # `taskmux tunnel enable`. Daemon does NOT auto-resolve to avoid
+            # masking a config error with a quiet network round-trip.
+            missing.append(
+                "zone_id (set [tunnel.cloudflare].zone_id, or run "
+                "`taskmux tunnel enable` to auto-resolve from public_hostname)"
+            )
+        if missing:
+            self.logger.error(
+                f"Project '{session}' tunnel='cloudflare' disabled — missing: "
+                + "; ".join(missing)
+                + ". Tasks still serve locally."
+            )
+            return None
+        return CloudflareTunnelBackend(
+            account_id=eff.account_id,  # type: ignore[arg-type]
+            api_token=eff.api_token,  # type: ignore[arg-type]
+            zone_id=eff.zone_id,  # type: ignore[arg-type]
+            tunnel_name=eff.tunnel_name,
+            proxy_port=self.global_config.proxy_https_port,
+        )
+
+    async def _sync_tunnels(self, session: str) -> None:
+        """Reconcile every configured tunnel backend for one project.
+
+        Empty mapping list ⇒ tear that backend down (clear), but keep the
+        instance + cached state so the next sync is cheap.
+        """
+        per_kind = self._collect_tunnel_mappings(session)
+        cfg = self.configs.get(session)
+        configured_kinds: set[str] = set()
+        if cfg is not None:
+            for tc in cfg.tasks.values():
+                if tc.tunnel is not None:
+                    configured_kinds.add(str(tc.tunnel))
+        for kind in configured_kinds:
+            backend = self._ensure_tunnel_backend(session, kind)
+            if backend is None:
+                continue
+            mappings = per_kind.get(kind, [])
+            try:
+                if mappings:
+                    await backend.sync(mappings)
+                else:
+                    await backend.clear()
+            except Exception as e:  # noqa: BLE001
+                self.logger.error(f"Tunnel '{kind}' sync for {session!r} failed: {e}")
+
     def _drop_privileges(self) -> None:
         """If running as root via sudo, drop to SUDO_UID/SUDO_GID."""
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
@@ -771,12 +926,26 @@ class TaskmuxDaemon:
             self.proxy.set_route(session, alias_entry["host"], alias_entry["port"])
 
     def _on_task_route_change(self, project: str, _task: str, host: str, port: int | None) -> None:
-        if self.proxy is None:
+        if self.proxy is not None:
+            if port is None:
+                self.proxy.drop_route(project, host)
+            else:
+                self.proxy.set_route(project, host, port)
+        # If this project has any tunneled tasks, re-sync the tunnel backend so
+        # a `taskmux start <task>` (which only fires this sync callback, never
+        # _resync_project_routes) actually wires Cloudflare ingress + spawns
+        # cloudflared. Cheap when there are no tunneled tasks (early return
+        # in _sync_tunnels). Scheduled on the daemon loop because this
+        # callback is invoked from synchronous supervisor code.
+        cfg = self.configs.get(project)
+        if cfg is None:
             return
-        if port is None:
-            self.proxy.drop_route(project, host)
-        else:
-            self.proxy.set_route(project, host, port)
+        if not any(t.tunnel is not None for t in cfg.tasks.values()):
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(self._sync_tunnels(project)))
 
     async def _resync_project_routes(self, session: str) -> dict:
         """Reconcile a project's proxy routes against disk state + live tasks.
@@ -829,6 +998,8 @@ class TaskmuxDaemon:
             added.extend(desired.keys())
         with contextlib.suppress(Exception):
             self._sync_hostnames()
+        with contextlib.suppress(Exception):
+            await self._sync_tunnels(session)
         return {"ok": True, "added": added, "dropped": dropped}
 
     async def _mark_missing(self, session: str) -> None:
@@ -948,6 +1119,12 @@ class TaskmuxDaemon:
             "add_task",
             "remove_task",
             "proxy_routes",
+            "tunnel_status",
+            "tunnel_config_get",
+            "tunnel_config_set",
+            "tunnel_test",
+            "tunnel_enable",
+            "tunnel_disable",
             "url",
             "resync",
             "sync_registry",
@@ -978,6 +1155,86 @@ class TaskmuxDaemon:
         if command == "proxy_routes":
             routes = self.proxy.routes_snapshot() if self.proxy is not None else {}
             return {"command": command, "running": self.proxy is not None, "routes": routes}
+
+        if command == "tunnel_status":
+            entries = []
+            for (sess, _kind), backend in sorted(self.tunnels.items()):
+                snap = backend.status()
+                snap["session"] = sess
+                entries.append(snap)
+            return {"command": command, "tunnels": entries}
+
+        if command == "tunnel_config_get":
+            from .tunnel_wizard import describeTunnelConfig
+
+            session_param = params.get("session")
+            cfg_path = self.config_paths.get(session_param) if session_param else None
+            if cfg_path is None:
+                return {
+                    "error": "missing_session",
+                    "command": command,
+                    "hint": "tunnel_config_get requires params.session",
+                }
+            payload = describeTunnelConfig(config_path=cfg_path, reveal=bool(params.get("reveal")))
+            return {"command": command, **payload}
+
+        if command == "tunnel_config_set":
+            from .tunnel_wizard import setTunnelConfig
+
+            scope = params.get("scope", "global")
+            updates = params.get("updates") or {}
+            session_param = params.get("session")
+            cfg_path = self.config_paths.get(session_param) if session_param else None
+            try:
+                payload = setTunnelConfig(scope=scope, updates=updates, config_path=cfg_path)
+            except TaskmuxError as e:
+                return {"command": command, **e.to_dict()}
+            return {"command": command, **payload}
+
+        if command == "tunnel_test":
+            from .global_config import loadGlobalConfig as _load_global
+            from .tunnel_wizard import preflight as _preflight
+
+            session_param = params.get("session")
+            if not session_param or session_param not in self.configs:
+                return {"error": "missing_session", "command": command}
+            report = await _preflight(
+                project_id=session_param,
+                project_cfg=self.configs[session_param],
+                global_cfg=_load_global(),
+            )
+            return {"command": command, "ok": report.ok, "preflight": report.to_dict()}
+
+        if command == "tunnel_enable":
+            from .tunnel_wizard import enable as _enable
+
+            session_param = params.get("session")
+            cfg_path = self.config_paths.get(session_param) if session_param else None
+            if cfg_path is None:
+                return {"error": "missing_session", "command": command}
+            try:
+                result = await _enable(
+                    config_path=cfg_path,
+                    api_token=params.get("api_token"),
+                    account_id=params.get("account_id"),
+                    zone_id=params.get("zone_id"),
+                    tasks=params.get("tasks"),
+                    public_hostnames=params.get("public_hostnames") or {},
+                    dry_run=bool(params.get("dry_run")),
+                )
+            except TaskmuxError as e:
+                return {"command": command, **e.to_dict()}
+            return {"command": command, **result.to_dict()}
+
+        if command == "tunnel_disable":
+            from .tunnel_wizard import disable as _disable
+
+            session_param = params.get("session")
+            cfg_path = self.config_paths.get(session_param) if session_param else None
+            if cfg_path is None:
+                return {"error": "missing_session", "command": command}
+            payload = await _disable(config_path=cfg_path, prune=bool(params.get("prune")))
+            return {"command": command, **payload}
 
         # Session-scoped commands
         session = params.get("session")
