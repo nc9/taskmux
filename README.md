@@ -191,6 +191,7 @@ taskmux init --defaults          # non-interactive
 
 # URLs / proxy
 taskmux url <name>               # print proxy URL for a task or alias
+taskmux open <name>              # open proxy URL in default browser (manual only)
 taskmux ca install               # install local CA into system trust store (one-time)
 taskmux ca mint                  # mint cert for the current project
 

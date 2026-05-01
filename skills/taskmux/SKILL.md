@@ -45,6 +45,7 @@ taskmux health                      # health-check table (-v for probe details)
 taskmux inspect <task>              # full task state
 taskmux events [--task X --since 1h]
 taskmux url <task>                  # print proxy URL
+taskmux open <task>                 # open proxy URL in default browser (manual only)
 
 # Logs (persistent, timestamped, ~/.taskmux/projects/{project_id}/logs/)
 taskmux logs [<task>] [-f] [-n N] [-g PATTERN] [-C N] [--since 5m]
