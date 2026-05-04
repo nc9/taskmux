@@ -120,8 +120,7 @@ Generic CLI guidance (when to invoke, JSON patterns, anti-patterns) lives in a p
 Install via:
 
 ```bash
-npx skills add nc9/taskmux --skill taskmux        # project-local (.claude/skills/ or .agents/skills/)
-npx skills add nc9/taskmux --skill taskmux -g     # global (~/.claude/skills/, ~/.agents/skills/, etc.)
+npx skills add nc9/taskmux --skill taskmux -g
 ```
 
 `taskmux init` checks for the skill at the common install paths and prints the install hint if it's missing — you only need to run it once per machine (or per project for project-local installs).
@@ -130,18 +129,13 @@ npx skills add nc9/taskmux --skill taskmux -g     # global (~/.claude/skills/, ~
 
 `taskmux init` patches a small marked block (`<!-- taskmux:start --> ... <!-- taskmux:end -->`) into the project's existing `CLAUDE.md` and/or `AGENTS.md`. The block lists current tasks + URLs and points the agent at `taskmux --json status` / `inspect` / `logs`.
 
-- Both files exist → patches both.
-- One file exists → patches that one.
-- Neither exists → interactive prompt asks which to create (default: `AGENTS.md`, the cross-agent convention). With `--defaults`, creates `AGENTS.md`.
-- Re-running `taskmux init` (after `taskmux add`/`remove`) replaces the marked block in place — your other notes in the file are untouched.
-
 The block also re-renders automatically on every `taskmux add` / `taskmux remove`, so the agent context never drifts from the live task list. Disable per-project in `taskmux.toml`:
 
 ```toml
 auto_inject_agents = false
 ```
 
-…or globally in `~/.taskmux/config.toml` (project setting wins when both are present):
+or globally in `~/.taskmux/config.toml` (project setting wins when both are present):
 
 ```toml
 auto_inject_agents = false
