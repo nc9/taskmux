@@ -100,6 +100,11 @@ class RestartTracker:
         self._consecutive_failures: dict[str, int] = {}
         self._manually_stopped: set[str] = set()
         self._last_health: dict[str, HealthResult] = {}
+        # Tasks for which `max_restarts_reached` was already emitted. Cleared
+        # on a successful manual restart / start (via `reset()`). Without this
+        # the auto-restart loop re-emits every health sweep (every ~5s),
+        # drowning event-bus subscribers in duplicates.
+        self._cap_reached: set[str] = set()
 
     def get(self, task_name: str) -> dict[str, float]:
         return self._data.get(task_name, {"count": 0, "last": 0.0})
@@ -110,6 +115,19 @@ class RestartTracker:
 
     def reset(self, task_name: str) -> None:
         self._data.pop(task_name, None)
+        self._cap_reached.discard(task_name)
+
+    def mark_cap_reached(self, task_name: str) -> bool:
+        """Return True only on the edge — the first call after the cap was hit.
+
+        Subsequent calls return False until `reset()` clears the flag (which
+        happens on a successful manual `start` / `restart` that revives the
+        task).
+        """
+        if task_name in self._cap_reached:
+            return False
+        self._cap_reached.add(task_name)
+        return True
 
     def record_health_failure(self, task_name: str) -> int:
         count = self._consecutive_failures.get(task_name, 0) + 1
@@ -605,7 +623,7 @@ class PosixSupervisor:
             self._emit_route(task_name, None)
         recordEvent(
             "task_exited",
-            session=self.config.name,
+            session=self.project_id,
             task=task_name,
             exit_code=exit_code,
         )
@@ -711,7 +729,7 @@ class PosixSupervisor:
         if task_cfg.host is not None:
             self._emit_route(task_name, self.assigned_ports.get(task_name))
 
-        recordEvent("task_started", session=self.config.name, task=task_name)
+        recordEvent("task_started", session=self.project_id, task=task_name)
         result: dict = {"ok": True, "task": task_name, "action": "started"}
         if warnings:
             result["warnings"] = warnings
@@ -738,7 +756,7 @@ class PosixSupervisor:
         runHook(self.config.hooks.after_stop, task_name)
         if task_cfg.host is not None:
             self._emit_route(task_name, None)
-        recordEvent("task_stopped", session=self.config.name, task=task_name, reason="manual")
+        recordEvent("task_stopped", session=self.project_id, task=task_name, reason="manual")
         return {"ok": True, "task": task_name, "action": "stopped"}
 
     async def restart_task(self, task_name: str) -> dict:
@@ -767,7 +785,7 @@ class PosixSupervisor:
         if task_cfg.host is not None:
             self._emit_route(task_name, self.assigned_ports.get(task_name))
 
-        recordEvent("task_restarted", session=self.config.name, task=task_name)
+        recordEvent("task_restarted", session=self.project_id, task=task_name)
         return {"ok": True, "task": task_name, "action": "restarted"}
 
     async def kill_task(self, task_name: str) -> dict:
@@ -791,7 +809,7 @@ class PosixSupervisor:
         cfg = self.config.tasks.get(task_name)
         if cfg is not None and cfg.host is not None:
             self._emit_route(task_name, None)
-        recordEvent("task_killed", session=self.config.name, task=task_name)
+        recordEvent("task_killed", session=self.project_id, task=task_name)
         return {"ok": True, "task": task_name, "action": "killed"}
 
     async def start_all(self) -> dict:
@@ -857,7 +875,7 @@ class PosixSupervisor:
                 started.append(task_name)
 
         runHook(self.config.hooks.after_start)
-        recordEvent("session_started", session=self.config.name, tasks=started)
+        recordEvent("session_started", session=self.project_id, tasks=started)
 
         result: dict = {
             "ok": True,
@@ -909,7 +927,7 @@ class PosixSupervisor:
                 self._emit_route(task_name, None)
 
         runHook(self.config.hooks.after_stop)
-        recordEvent("session_stopped", session=self.config.name)
+        recordEvent("session_stopped", session=self.project_id)
         return {"ok": True, "session": self.config.name, "action": "stopped"}
 
     async def restart_all(self) -> dict:
@@ -1196,7 +1214,7 @@ class PosixSupervisor:
                 failures = self.restart_tracker.record_health_failure(task_name)
                 recordEvent(
                     "health_check_failed",
-                    session=self.config.name,
+                    session=self.project_id,
                     task=task_name,
                     attempt=failures,
                 )
@@ -1224,12 +1242,17 @@ class PosixSupervisor:
 
             info = self.restart_tracker.get(task_name)
             if task_cfg.max_restarts and info["count"] >= task_cfg.max_restarts:
-                recordEvent(
-                    "max_restarts_reached",
-                    session=self.config.name,
-                    task=task_name,
-                    count=int(info["count"]),
-                )
+                # Edge-trigger: emit once on the cap-reached transition and
+                # then stay quiet. The auto-restart loop runs every health
+                # sweep (~5s), so without this guard subscribers see a fresh
+                # `max_restarts_reached` for every probe forever.
+                if self.restart_tracker.mark_cap_reached(task_name):
+                    recordEvent(
+                        "max_restarts_reached",
+                        session=self.project_id,
+                        task=task_name,
+                        count=int(info["count"]),
+                    )
                 continue
 
             delay = min(task_cfg.restart_backoff ** info["count"], 60)
@@ -1237,7 +1260,7 @@ class PosixSupervisor:
                 continue
 
             reason = "process_exited" if not proc_alive else "health_retries_exceeded"
-            recordEvent("auto_restart", session=self.config.name, task=task_name, reason=reason)
+            recordEvent("auto_restart", session=self.project_id, task=task_name, reason=reason)
             async with self._lock_for(task_name):
                 await self._restart_task_locked(task_name)
             self.restart_tracker.record(task_name)

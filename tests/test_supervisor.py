@@ -140,6 +140,26 @@ class TestRestartTracker:
         rt.record_health_result("a", result)
         assert rt.last_health("a") == result
 
+    def test_mark_cap_reached_edge_trigger(self):
+        """First call returns True (emit), subsequent return False (suppress)."""
+        rt = RestartTracker()
+        assert rt.mark_cap_reached("a") is True
+        assert rt.mark_cap_reached("a") is False
+        assert rt.mark_cap_reached("a") is False
+
+    def test_reset_clears_cap_reached(self):
+        """Successful auto-recovery clears the flag so a future cap re-emits."""
+        rt = RestartTracker()
+        rt.mark_cap_reached("a")
+        rt.reset("a")
+        assert rt.mark_cap_reached("a") is True
+
+    def test_cap_reached_per_task(self):
+        """Edge state is per-task — flagging 'a' must not silence 'b'."""
+        rt = RestartTracker()
+        rt.mark_cap_reached("a")
+        assert rt.mark_cap_reached("b") is True
+
 
 # ---------------------------------------------------------------------------
 # Log rotation + writer
