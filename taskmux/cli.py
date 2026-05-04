@@ -2657,9 +2657,7 @@ def mcp_status_cmd() -> None:
         if local_view["mcp_json_url"] == local_view["url"]:
             status_cell = "[green]✓ matches[/green]"
         elif local_view["mcp_json_url"]:
-            status_cell = (
-                f"[yellow]! has different URL[/yellow] {local_view['mcp_json_url']}"
-            )
+            status_cell = f"[yellow]! has different URL[/yellow] {local_view['mcp_json_url']}"
         else:
             status_cell = "[yellow]! no taskmux entry[/yellow]"
     else:
@@ -2750,9 +2748,7 @@ def mcp_show_cmd(
 
     if client in ("codex", "codex-project"):
         toml_path = "~/.codex/config.toml" if client == "codex" else ".codex/config.toml"
-        console.print(
-            f"[bold]{toml_path}[/bold] — add under [italic]<root>[/italic]:"
-        )
+        console.print(f"[bold]{toml_path}[/bold] — add under [italic]<root>[/italic]:")
         console.print(
             f'[mcp_servers.taskmux]\nurl = "{serverUrl(api_port, mcp_path, pinned_session)}"',
             markup=False,
@@ -2808,10 +2804,14 @@ def _interactiveSelectClients() -> list[str]:
         console.print(f"  [bold]{i:>2})[/bold]  {c:<16} [dim]{hint}[/dim]")
     console.print("   [bold] a)[/bold]  all\n")
 
-    raw = typer.prompt(
-        "Select (e.g. '2,5' or 'a' for all)",
-        default="a",
-    ).strip().lower()
+    raw = (
+        typer.prompt(
+            "Select (e.g. '2,5' or 'a' for all)",
+            default="a",
+        )
+        .strip()
+        .lower()
+    )
     if raw in ("a", "all", ""):
         return list(ALL_CLIENTS)
 

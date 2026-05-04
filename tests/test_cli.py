@@ -549,9 +549,7 @@ class TestMcpInstall:
         body = _json.loads(target.read_text())
         assert body["mcpServers"]["taskmux"]["url"].endswith("?session=myproj")
 
-    def test_claude_project_from_subdir_writes_at_project_root(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_claude_project_from_subdir_writes_at_project_root(self, tmp_path: Path, monkeypatch):
         """Regression: `taskmux mcp install claude-project` from any
         descendant of a taskmux project writes `.mcp.json` at the
         project root, not the process cwd. Claude Code only loads

@@ -126,17 +126,13 @@ def testInstallCodexProjectWritesAtProjectRoot(tmp_path: Path, monkeypatch) -> N
     assert not (tmp_path / "fake-home" / ".codex" / "config.toml").exists()
 
 
-def testInstallCodexProjectPreservesExistingTomlEntries(
-    tmp_path: Path, monkeypatch
-) -> None:
+def testInstallCodexProjectPreservesExistingTomlEntries(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
     project_root = tmp_path / "proj"
     project_root.mkdir()
     (project_root / ".codex").mkdir()
     (project_root / ".codex" / "config.toml").write_text(
-        '# project-local codex config\n\n'
-        "[mcp_servers.linear]\n"
-        'url = "https://mcp.linear.app/mcp"\n'
+        '# project-local codex config\n\n[mcp_servers.linear]\nurl = "https://mcp.linear.app/mcp"\n'
     )
 
     install("codex-project", api_port=8765, session="proj", cwd=project_root)

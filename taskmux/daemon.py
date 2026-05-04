@@ -1327,9 +1327,7 @@ class TaskmuxDaemon:
             from .mcp.broadcaster import _activeSessions
 
             mcp_cfg = self.global_config.mcp
-            sessions = [
-                {"pin": getattr(s, "_taskmux_pin", None)} for s in list(_activeSessions)
-            ]
+            sessions = [{"pin": getattr(s, "_taskmux_pin", None)} for s in list(_activeSessions)]
             return {
                 "command": command,
                 "ok": True,
