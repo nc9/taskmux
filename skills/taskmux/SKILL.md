@@ -1,6 +1,6 @@
 ---
 name: taskmux
-version: 0.8.3
+version: 0.9.0
 description: Manage long-running dev tasks (servers, watchers, build processes) via taskmux — a daemon-supervised task runner driven by `taskmux.toml` with optional public exposure via Cloudflare Tunnel. TRIGGER when cwd has `taskmux.toml`, when the user mentions taskmux, or when the user wants to start/stop/inspect/tail-logs of long-running processes, or expose a service publicly via a tunnel. SKIP for one-shot commands (tests, builds) and for projects without `taskmux.toml`.
 ---
 
