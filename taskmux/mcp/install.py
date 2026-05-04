@@ -5,25 +5,38 @@ or JSON output. Config writes are atomic (temp file + rename); existing
 entries for other servers are preserved.
 
 Supported clients (v1):
-  * `claude`         — `~/.claude/settings.json`            (user-global)
-  * `claude-project` — `<project>/.mcp.json`                (project-shared)
-  * `cursor`         — `~/.cursor/mcp.json`                 (user-global)
-  * `codex`          — `~/.codex/config.toml`               (user-global)
-  * `codex-project`  — `<project>/.codex/config.toml`       (project-shared)
-  * `continue`       — `~/.continue/config.json`            (user-global)
+  * `claude`           — `~/.claude/settings.json`             (user-global)
+  * `claude-project`   — `<project>/.mcp.json`                 (project-shared)
+  * `cursor`           — `~/.cursor/mcp.json`                  (user-global)
+  * `cursor-project`   — `<project>/.cursor/mcp.json`          (project-shared)
+  * `codex`            — `~/.codex/config.toml`                (user-global)
+  * `codex-project`    — `<project>/.codex/config.toml`        (project-shared)
+  * `opencode`         — `~/.config/opencode/opencode.json`    (user-global)
+  * `opencode-project` — `<project>/opencode.json`             (project-shared)
 
 Notes:
   * `claude-project` writes `.mcp.json` at the repo root — Claude Code
     only honors that file for project MCP servers (NOT
     `.claude/settings.json`, which is for hooks/permissions/env).
+  * `cursor-project` writes `<project>/.cursor/mcp.json`. Cursor's docs:
+    project-level configs win over `~/.cursor/mcp.json` for that project,
+    and the JSON schema is identical (`mcpServers.<name>`). Same pattern
+    as Claude Code's `.mcp.json` — drop it in the repo and Cursor picks
+    it up after restart.
   * `codex-project` writes `.codex/config.toml` at the repo root. Codex
     CLI resolves config in this order: CLI flags → profile → project
     `.codex/config.toml` (closest cwd ancestor wins; trusted projects
     only) → user `~/.codex/config.toml`. So a per-project taskmux pin
     coexists cleanly with any user-global servers (chrome-devtools etc.).
+  * `opencode` / `opencode-project` use OpenCode's distinct schema:
+    top-level `mcp` table (not `mcpServers`) with entries shaped
+    `{type: "remote", url, enabled: true}`. Project `opencode.json`
+    overrides global `~/.config/opencode/opencode.json` per OpenCode's
+    config-merge order.
 
-Cline + Goose deliberately skipped — their config layouts are more invasive
-(VS Code settings JSON / YAML extension list); add later on demand.
+Cline + Goose + Continue deliberately skipped — their config layouts are
+more invasive or use schemas we'd have to maintain separately; add later
+on demand.
 """
 
 from __future__ import annotations
@@ -41,9 +54,11 @@ ALL_CLIENTS = (
     "claude",
     "claude-project",
     "cursor",
+    "cursor-project",
     "codex",
     "codex-project",
-    "continue",
+    "opencode",
+    "opencode-project",
 )
 
 
@@ -74,6 +89,16 @@ def jsonSnippet(api_port: int, path: str = "/mcp", session: str | None = None) -
 def tomlSnippet(api_port: int, path: str = "/mcp", session: str | None = None) -> dict[str, Any]:
     """Codex CLI flavor — TOML with `[mcp_servers.taskmux]` table."""
     return {"url": serverUrl(api_port, path, session)}
+
+
+def opencodeSnippet(
+    api_port: int, path: str = "/mcp", session: str | None = None
+) -> dict[str, Any]:
+    """OpenCode flavor — JSON entry under top-level `mcp.<name>`. Schema
+    requires `type: "remote"` (not `"http"`) and treats `enabled` as the
+    per-server kill switch.
+    """
+    return {"type": "remote", "url": serverUrl(api_port, path, session), "enabled": True}
 
 
 def _projectRootFromCwd(start: Path) -> Path | None:
@@ -160,6 +185,15 @@ def _upsertJsonMcp(path: Path, name: str, entry: Mapping[str, Any]) -> dict[str,
     return config
 
 
+def _upsertOpencodeJsonMcp(path: Path, name: str, entry: Mapping[str, Any]) -> dict[str, Any]:
+    """OpenCode shape: top-level `mcp` table, not `mcpServers`."""
+    config = _loadJson(path)
+    config.setdefault("$schema", "https://opencode.ai/config.json")
+    servers = config.setdefault("mcp", {})
+    servers[name] = dict(entry)
+    return config
+
+
 def _upsertTomlMcp(path: Path, name: str, entry: Mapping[str, Any]) -> tomlkit.TOMLDocument:
     doc = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
     servers = doc.setdefault("mcp_servers", tomlkit.table())
@@ -181,12 +215,16 @@ def _clientPath(client: str, cwd: Path | None = None) -> Path:
         return cwd / ".mcp.json"
     if client == "cursor":
         return home / ".cursor" / "mcp.json"
+    if client == "cursor-project":
+        return cwd / ".cursor" / "mcp.json"
     if client == "codex":
         return home / ".codex" / "config.toml"
     if client == "codex-project":
         return cwd / ".codex" / "config.toml"
-    if client == "continue":
-        return home / ".continue" / "config.json"
+    if client == "opencode":
+        return home / ".config" / "opencode" / "opencode.json"
+    if client == "opencode-project":
+        return cwd / "opencode.json"
     raise ValueError(f"unknown client: {client!r}; expected one of {ALL_CLIENTS}")
 
 
@@ -225,6 +263,22 @@ def install(
             "path": str(target),
             "wrote": write,
             "format": "toml",
+            "rendered": rendered,
+            "snippet": dict(entry),
+            "session": session,
+        }
+
+    if client in ("opencode", "opencode-project"):
+        entry = opencodeSnippet(api_port, mcp_path, session)
+        config = _upsertOpencodeJsonMcp(target, "taskmux", entry)
+        rendered = json.dumps(config, indent=2) + "\n"
+        if write:
+            _atomicWrite(target, rendered)
+        return {
+            "client": client,
+            "path": str(target),
+            "wrote": write,
+            "format": "json",
             "rendered": rendered,
             "snippet": dict(entry),
             "session": session,

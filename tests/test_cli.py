@@ -644,7 +644,7 @@ class TestMcpInstall:
         monkeypatch.setattr(
             _cli,
             "_interactiveSelectClients",
-            lambda: ["claude-project", "codex-project"],
+            lambda cwd=None: ["claude-project", "codex-project"],
         )
 
         result = runner.invoke(app, ["mcp", "install"])
@@ -668,7 +668,7 @@ class TestMcpInstall:
         monkeypatch.chdir(proj)
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
         monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
-        monkeypatch.setattr(_cli, "_interactiveSelectClients", lambda: list(ALL_CLIENTS))
+        monkeypatch.setattr(_cli, "_interactiveSelectClients", lambda cwd=None: list(ALL_CLIENTS))
 
         result = runner.invoke(app, ["mcp", "install"])
         assert result.exit_code == 0, result.output
@@ -688,8 +688,28 @@ class TestMcpInstall:
         monkeypatch.chdir(proj)
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
         monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
-        monkeypatch.setattr(_cli, "_interactiveSelectClients", lambda: [])
+        monkeypatch.setattr(_cli, "_interactiveSelectClients", lambda cwd=None: [])
 
         result = runner.invoke(app, ["mcp", "install"])
         assert result.exit_code == 1
         assert not (proj / ".mcp.json").exists()
+
+    def test_detect_installed_clients_project_only(self, tmp_path: Path, monkeypatch):
+        """`_detectInstalledClients` only returns project-scoped clients.
+
+        User-global agents never auto-check — a host-wide pin would expose
+        every project on the machine, defeating per-project scoping.
+        """
+        from taskmux import cli as _cli
+
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / ".cursor").mkdir()  # → cursor-project
+        (proj / ".mcp.json").write_text("{}")  # → claude-project
+        # User-global ~/.codex exists but MUST NOT be returned as detected.
+        home = tmp_path / "fake-home"
+        (home / ".codex").mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: home)
+
+        detected = _cli._detectInstalledClients(proj)
+        assert detected == {"claude-project", "cursor-project"}

@@ -2393,7 +2393,8 @@ def mcp_install_cmd(
         None,
         help=(
             "Which client config to write. One of: "
-            "claude, claude-project, cursor, codex, codex-project, continue, all. "
+            "claude, claude-project, cursor, cursor-project, codex, codex-project, "
+            "opencode, opencode-project, all. "
             "Omit to be prompted with a multi-select."
         ),
     ),
@@ -2450,7 +2451,9 @@ def mcp_install_cmd(
         if is_json_mode() or not _stdinIsTty():
             selected_clients = list(ALL_CLIENTS)
         else:
-            selected_clients = _interactiveSelectClients()
+            selected_clients = _interactiveSelectClients(
+                cwd=detectProjectRootFromCwd() or Path.cwd()
+            )
             if not selected_clients:
                 console.print("[yellow]No clients selected — aborting.[/yellow]")
                 raise typer.Exit(1)
@@ -2672,7 +2675,8 @@ def mcp_show_cmd(
         "claude",
         help=(
             "Which client snippet to print. One of: "
-            "claude, claude-project, cursor, codex, codex-project, continue."
+            "claude, claude-project, cursor, cursor-project, codex, codex-project, "
+            "opencode, opencode-project."
         ),
     ),
     unscoped: bool = typer.Option(
@@ -2746,6 +2750,8 @@ def mcp_show_cmd(
         )
         return
 
+    from .mcp.install import opencodeSnippet
+
     if client in ("codex", "codex-project"):
         toml_path = "~/.codex/config.toml" if client == "codex" else ".codex/config.toml"
         console.print(f"[bold]{toml_path}[/bold] — add under [italic]<root>[/italic]:")
@@ -2753,12 +2759,18 @@ def mcp_show_cmd(
             f'[mcp_servers.taskmux]\nurl = "{serverUrl(api_port, mcp_path, pinned_session)}"',
             markup=False,
         )
+    elif client in ("opencode", "opencode-project"):
+        oc_path = "~/.config/opencode/opencode.json" if client == "opencode" else "opencode.json"
+        console.print(f"[bold]{oc_path}[/bold] — add under [italic]mcp[/italic]:")
+        console.print(
+            json.dumps({"taskmux": opencodeSnippet(api_port, mcp_path, pinned_session)}, indent=2)
+        )
     else:
         client_path = {
             "claude": "~/.claude/settings.json",
             "claude-project": ".mcp.json",
             "cursor": "~/.cursor/mcp.json",
-            "continue": "~/.continue/config.json",
+            "cursor-project": ".cursor/mcp.json",
         }[client]
         console.print(f"[bold]{client_path}[/bold] — add under [italic]mcpServers[/italic]:")
         console.print(
@@ -2784,22 +2796,63 @@ _CLIENT_PATH_HINTS = {
     "claude": "~/.claude/settings.json (user-global)",
     "claude-project": "<project>/.mcp.json (project-shared)",
     "cursor": "~/.cursor/mcp.json (user-global)",
+    "cursor-project": "<project>/.cursor/mcp.json (project-shared)",
     "codex": "~/.codex/config.toml (user-global)",
     "codex-project": "<project>/.codex/config.toml (project-shared)",
-    "continue": "~/.continue/config.json (user-global)",
+    "opencode": "~/.config/opencode/opencode.json (user-global)",
+    "opencode-project": "<project>/opencode.json (project-shared)",
 }
 
 
-_PROJECT_SCOPED_CLIENTS = ("claude-project", "codex-project")
+_PROJECT_SCOPED_CLIENTS = (
+    "claude-project",
+    "cursor-project",
+    "codex-project",
+    "opencode-project",
+)
 
 
-def _interactiveSelectClients() -> list[str]:
+# Project-scoped detection: pre-check the row when this path already exists
+# in the project root (so the user is clearly already using that agent
+# locally). Falls back to "all project-scoped checked" when no signals match.
+_PROJECT_DETECTION_PATHS = {
+    "claude-project": (".mcp.json", ".claude"),
+    "cursor-project": (".cursor",),
+    "codex-project": (".codex",),
+    "opencode-project": ("opencode.json", "opencode.jsonc", ".opencode"),
+}
+
+# User-global detection is intentionally absent: a global install pins
+# the daemon connection host-wide, which defeats the per-project scoping
+# that's the whole point of taskmux MCP. The user-global rows stay
+# unchecked unless explicitly toggled — they're for diagnostic clients
+# only (e.g. your personal admin terminal) and emit a warning at install.
+
+
+def _detectInstalledClients(cwd: Path) -> set[str]:
+    """Return project-scoped clients whose config path already exists in cwd.
+
+    Only project-scoped detection runs — user-global rows stay unchecked
+    by design (a host-wide pin would expose every project on the machine
+    to the connecting agent, defeating per-project scoping).
+    """
+    detected: set[str] = set()
+    for client, rels in _PROJECT_DETECTION_PATHS.items():
+        if any((cwd / rel).exists() for rel in rels):
+            detected.add(client)
+    return detected
+
+
+def _interactiveSelectClients(cwd: Path | None = None) -> list[str]:
     """Arrow-key checkbox multi-select for `taskmux mcp install`.
 
-    Project-scoped clients (write into <cwd>) are pre-checked since that's
-    the recommended path. User-global clients sit below a separator and
-    require explicit opt-in (they expose every project on the host to the
-    agent — fine for a personal admin client, noisy/leaky as a default).
+    Pre-check rules:
+      * project-scoped row → checked when its detection path exists in
+        cwd (e.g. `.cursor/` for cursor-project). If NO project-scoped
+        rows match, all three default to checked so the recommended path
+        is at least one keystroke away.
+      * user-global row → checked when the matching `~/.<agent>` dir
+        exists, i.e. the user already runs that agent globally.
 
     Returns the chosen client names. Empty list = user picked nothing
     (caller aborts). Cancelled prompt (Ctrl-C / EOF) → empty list.
@@ -2827,22 +2880,32 @@ def _interactiveSelectClients() -> list[str]:
     project_scoped = [c for c in _PROJECT_SCOPED_CLIENTS if c in ALL_CLIENTS]
     user_global = [c for c in ALL_CLIENTS if c not in _PROJECT_SCOPED_CLIENTS]
 
+    detected = _detectInstalledClients((cwd or Path.cwd()).resolve())
+
+    # Fallback: if no project-scoped clients were detected locally, default
+    # them all to checked so the recommended setup still reads as the path
+    # of least resistance.
+    project_scoped_detected = {c for c in project_scoped if c in detected}
+    if not project_scoped_detected:
+        project_scoped_detected = set(project_scoped)
+
     def mkChoice(c: str, *, checked: bool) -> Choice:
+        marker = " [detected]" if c in detected else ""
         return Choice(
-            title=f"{c:<16}  {_CLIENT_PATH_HINTS.get(c, '')}",
+            title=f"{c:<16}  {_CLIENT_PATH_HINTS.get(c, '')}{marker}",
             value=c,
             checked=checked,
         )
 
     choices: list[Choice | Separator] = [Separator("── project-scoped (recommended) ──")]
-    choices.extend(mkChoice(c, checked=True) for c in project_scoped)
-    choices.append(Separator("── user-global (every project on this host) ──"))
+    choices.extend(mkChoice(c, checked=c in project_scoped_detected) for c in project_scoped)
+    choices.append(Separator("── user-global (host-wide, NOT recommended) ──"))
     choices.extend(mkChoice(c, checked=False) for c in user_global)
 
     answer = questionary.checkbox(
         "Install taskmux MCP for which coding agents?",
         choices=choices,
-        instruction="(↑↓ move · space toggles · enter confirms)",
+        instruction="(↑↓ move · space toggles · enter confirms · auto-checked from local config)",
         style=style,
     ).ask()
     return list(answer) if answer else []

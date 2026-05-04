@@ -203,6 +203,64 @@ def testInstallProjectWritesToCwdMcpJson(tmp_path: Path) -> None:
     assert not (project_root / ".claude" / "settings.json").exists()
 
 
+def testInstallOpencodeProjectShape(tmp_path: Path, monkeypatch) -> None:
+    """`opencode-project` writes `<project>/opencode.json` with OpenCode's
+    distinct schema: top-level `mcp.<name>` (not `mcpServers`), entry
+    shape `{type: "remote", url, enabled: true}`. The `$schema` pointer
+    is set so OpenCode's editor tooling can validate.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+
+    install("opencode-project", api_port=8765, session="proj", cwd=project_root)
+
+    target = project_root / "opencode.json"
+    body = json.loads(target.read_text())
+    assert body["$schema"] == "https://opencode.ai/config.json"
+    assert body["mcp"]["taskmux"] == {
+        "type": "remote",
+        "url": "http://localhost:8765/mcp/?session=proj",
+        "enabled": True,
+    }
+    # `mcpServers` (Claude/Cursor key) must NOT appear.
+    assert "mcpServers" not in body
+
+
+def testInstallOpencodeUserGlobalPath(tmp_path: Path, monkeypatch) -> None:
+    """`opencode` writes `~/.config/opencode/opencode.json` (XDG-style),
+    not a top-level `~/.opencode`."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    install("opencode", api_port=8765)
+
+    target = tmp_path / ".config" / "opencode" / "opencode.json"
+    assert target.exists()
+    body = json.loads(target.read_text())
+    assert body["mcp"]["taskmux"]["url"] == "http://localhost:8765/mcp/"
+
+
+def testInstallCursorProjectWritesAtProjectRoot(tmp_path: Path, monkeypatch) -> None:
+    """`cursor-project` writes `<project>/.cursor/mcp.json` — the
+    project-scoped file Cursor's docs document. Same JSON schema as the
+    user-global `~/.cursor/mcp.json`; project-level wins precedence.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+
+    install("cursor-project", api_port=8765, session="proj", cwd=project_root)
+
+    target = project_root / ".cursor" / "mcp.json"
+    body = json.loads(target.read_text())
+    assert body["mcpServers"]["taskmux"] == {
+        "type": "http",
+        "url": "http://localhost:8765/mcp/?session=proj",
+    }
+    # User-global ~/.cursor/mcp.json must NOT be touched.
+    assert not (tmp_path / "fake-home" / ".cursor" / "mcp.json").exists()
+
+
 def testDetectProjectRootFromCwdWalksAncestors(tmp_path: Path) -> None:
     """Anchor for `claude-project`: from a deep subdir, find the ancestor
     that contains `taskmux.toml`. Regression for the bug where running
