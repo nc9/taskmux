@@ -516,3 +516,159 @@ class TestCaTrustClients:
             result = runner.invoke(app, ["ca", "trust-clients", "--shell", "zsh"])
         assert result.exit_code == 1
         assert "system CA bundle not found" in result.output
+
+
+# ---------------------------------------------------------------------------
+# `taskmux mcp install` strict-mode rules
+# ---------------------------------------------------------------------------
+
+
+class TestMcpInstall:
+    def test_outside_project_no_flags_fails(self, tmp_path: Path, monkeypatch):
+        """No taskmux.toml in cwd or any ancestor → hard error with hint."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+        result = runner.invoke(app, ["mcp", "install", "claude"])
+        assert result.exit_code == 1
+        assert "taskmux.toml not found" in result.output
+        assert "--unscoped" in result.output
+
+    def test_inside_project_writes_session_pinned_url(self, tmp_path: Path, monkeypatch):
+        """`taskmux.toml` in cwd → install writes ?session=<name>."""
+        import json as _json
+
+        proj = tmp_path / "myproj"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "myproj"\n')
+        monkeypatch.chdir(proj)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+
+        result = runner.invoke(app, ["mcp", "install", "claude"])
+        assert result.exit_code == 0, result.output
+        target = tmp_path / "fake-home" / ".claude" / "settings.json"
+        body = _json.loads(target.read_text())
+        assert body["mcpServers"]["taskmux"]["url"].endswith("?session=myproj")
+
+    def test_claude_project_from_subdir_writes_at_project_root(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Regression: `taskmux mcp install claude-project` from any
+        descendant of a taskmux project writes `.mcp.json` at the
+        project root, not the process cwd. Claude Code only loads
+        `.mcp.json` from the repo root, so without this anchoring the
+        install silently fails to take effect."""
+        import json as _json
+
+        proj = tmp_path / "myproj"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "myproj"\n')
+        nested = proj / "src" / "deep"
+        nested.mkdir(parents=True)
+        monkeypatch.chdir(nested)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+
+        result = runner.invoke(app, ["mcp", "install", "claude-project"])
+        assert result.exit_code == 0, result.output
+
+        body = _json.loads((proj / ".mcp.json").read_text())
+        assert body["mcpServers"]["taskmux"]["url"].endswith("?session=myproj")
+        assert not (nested / ".mcp.json").exists()
+
+    def test_unscoped_flag_warns_and_writes_bare_url(self, tmp_path: Path, monkeypatch):
+        import json as _json
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+
+        result = runner.invoke(app, ["mcp", "install", "claude", "--unscoped"])
+        assert result.exit_code == 0, result.output
+        assert "UNSCOPED" in result.output
+        body = _json.loads((tmp_path / "fake-home" / ".claude" / "settings.json").read_text())
+        assert "?session=" not in body["mcpServers"]["taskmux"]["url"]
+
+    def test_session_flag_overrides_cwd_detection(self, tmp_path: Path, monkeypatch):
+        """`--session foo` works from anywhere, no warning."""
+        import json as _json
+
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+
+        result = runner.invoke(app, ["mcp", "install", "claude", "--session", "explicit"])
+        assert result.exit_code == 0, result.output
+        assert "UNSCOPED" not in result.output
+        body = _json.loads((tmp_path / "fake-home" / ".claude" / "settings.json").read_text())
+        assert body["mcpServers"]["taskmux"]["url"].endswith("?session=explicit")
+
+    def test_unknown_client_rejected(self, tmp_path: Path, monkeypatch):
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+        result = runner.invoke(app, ["mcp", "install", "notreal"])
+        assert result.exit_code == 1
+        assert "unknown client" in result.output
+
+    def test_bare_install_non_tty_falls_back_to_all(self, tmp_path: Path, monkeypatch):
+        """Script-friendly: no client arg + non-TTY (CliRunner) → install all,
+        no prompt. Preserves the historical default for piped invocations."""
+        import json as _json
+
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+
+        result = runner.invoke(app, ["mcp", "install"])
+        assert result.exit_code == 0, result.output
+
+        # Each user-global / project target got written
+        body = _json.loads((tmp_path / "fake-home" / ".claude" / "settings.json").read_text())
+        assert body["mcpServers"]["taskmux"]["url"].endswith("?session=p")
+        assert (proj / ".mcp.json").exists()
+        assert (proj / ".codex" / "config.toml").exists()
+
+    def test_bare_install_interactive_multi_select(self, tmp_path: Path, monkeypatch):
+        """TTY path: isatty stubbed True, stdin pipes '2,5' → installs
+        claude-project (idx 2) + codex-project (idx 5) only."""
+        from taskmux import cli as _cli
+
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+        monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
+
+        result = runner.invoke(app, ["mcp", "install"], input="2,5\n")
+        assert result.exit_code == 0, result.output
+
+        # claude-project + codex-project written
+        assert (proj / ".mcp.json").exists()
+        assert (proj / ".codex" / "config.toml").exists()
+        # Other targets NOT written
+        assert not (tmp_path / "fake-home" / ".claude" / "settings.json").exists()
+        assert not (tmp_path / "fake-home" / ".cursor" / "mcp.json").exists()
+
+    def test_bare_install_interactive_all_keyword(self, tmp_path: Path, monkeypatch):
+        """User types 'a' → install all clients."""
+        from taskmux import cli as _cli
+
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+        monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
+
+        result = runner.invoke(app, ["mcp", "install"], input="a\n")
+        assert result.exit_code == 0, result.output
+
+        # User-global + project targets all written
+        assert (tmp_path / "fake-home" / ".claude" / "settings.json").exists()
+        assert (proj / ".mcp.json").exists()
+        assert (proj / ".codex" / "config.toml").exists()

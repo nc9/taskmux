@@ -7,6 +7,8 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .event_bus import publishEventSync
+
 EVENTS_DIR = Path.home() / ".taskmux"
 EVENTS_FILE = EVENTS_DIR / "events.jsonl"
 MAX_LINES = 15_000
@@ -19,7 +21,11 @@ def recordEvent(
     task: str | None = None,
     **extra: str | int | bool | list[str] | None,
 ) -> dict:
-    """Append event to events.jsonl. Returns the event dict."""
+    """Append event to events.jsonl AND publish to the in-process event bus.
+
+    The bus push is best-effort: when no event loop is running (CLI one-shot
+    invocations) it's a no-op. JSONL write is the durable path.
+    """
     EVENTS_DIR.mkdir(exist_ok=True)
 
     entry: dict = {
@@ -39,6 +45,7 @@ def recordEvent(
         fcntl.flock(f, fcntl.LOCK_UN)
 
     _maybeRotate()
+    publishEventSync(entry)
     return entry
 
 

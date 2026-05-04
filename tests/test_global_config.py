@@ -77,3 +77,46 @@ def test_update_merges(isolated):
     on_disk = gc.loadGlobalConfig()
     assert on_disk.health_check_interval == 12
     assert on_disk.api_port == 9001
+
+
+# ---- [mcp] block ----
+
+
+def test_mcp_defaults(isolated):
+    cfg = gc.loadGlobalConfig()
+    assert cfg.mcp.enabled is True
+    assert cfg.mcp.path == "/mcp"
+    assert cfg.mcp.filter == []
+
+
+def test_mcp_partial_override(isolated):
+    (isolated / "config.toml").write_text(
+        '[mcp]\nenabled = false\nfilter = ["task_exited", "auto_restart"]\n'
+    )
+    cfg = gc.loadGlobalConfig()
+    assert cfg.mcp.enabled is False
+    assert cfg.mcp.path == "/mcp"
+    assert cfg.mcp.filter == ["task_exited", "auto_restart"]
+
+
+def test_mcp_invalid_path_rejected(isolated):
+    (isolated / "config.toml").write_text('[mcp]\npath = "mcp"\n')
+    with pytest.raises(TaskmuxError) as excinfo:
+        gc.loadGlobalConfig()
+    assert excinfo.value.code is ErrorCode.CONFIG_VALIDATION
+
+
+def test_mcp_default_section_omitted_on_write(isolated):
+    cfg = gc.GlobalConfig()
+    gc.writeGlobalConfig(cfg)
+    text = (isolated / "config.toml").read_text()
+    assert "[mcp]" not in text
+
+
+def test_mcp_overridden_section_round_trips(isolated):
+    cfg = gc.GlobalConfig(mcp=gc.McpGlobalConfig(enabled=False, filter=["task_exited"]))
+    gc.writeGlobalConfig(cfg)
+    reloaded = gc.loadGlobalConfig()
+    assert reloaded.mcp.enabled is False
+    assert reloaded.mcp.filter == ["task_exited"]
+    assert reloaded.mcp.path == "/mcp"

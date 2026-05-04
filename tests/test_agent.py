@@ -137,6 +137,11 @@ class TestBuildContextBlock:
         block = buildContextBlock(TaskmuxConfig(name="test"))
         assert "taskmux` skill" in block
         assert "taskmux --help" in block
+
+    def test_contains_mcp_pointer(self):
+        block = buildContextBlock(TaskmuxConfig(name="test"))
+        assert "taskmux mcp install" in block
+        assert "/mcp" in block
         assert "taskmux inspect" in block
 
 

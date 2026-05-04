@@ -80,6 +80,54 @@ class CloudflareGlobalConfig(BaseModel):
     )
 
 
+class McpGlobalConfig(BaseModel):
+    """Daemon-wide MCP server settings.
+
+    The MCP server lives inside the daemon and serves Streamable HTTP at
+    `http://localhost:{api_port}{path}`. Coding agents (Claude Code, Cursor,
+    Codex, Continue) connect to this URL to call tools and subscribe to
+    push notifications when tasks crash, restart, or fail health checks.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether to mount the MCP server. When False the daemon serves "
+            "only the legacy WebSocket API on api_port; agents that depend on "
+            "/mcp will fail to connect."
+        ),
+    )
+    path: str = Field(
+        default="/mcp",
+        description=(
+            "URL path at which the Streamable HTTP MCP endpoint is mounted. "
+            "Must start with '/'. Change only if /mcp clashes with another "
+            "service the daemon hosts."
+        ),
+    )
+    filter: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Event names to push to MCP clients via notifications/message. "
+            "Empty list = all events (default). Common subset for noise "
+            "reduction: ['task_exited', 'health_check_failed', "
+            "'auto_restart', 'task_killed']."
+        ),
+    )
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        if not v.startswith("/"):
+            raise TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=f"mcp.path must start with '/'; got {v!r}",
+            )
+        return v
+
+
 class TunnelGlobalConfig(BaseModel):
     """Container for per-backend defaults. One sub-block per supported provider."""
 
@@ -168,6 +216,11 @@ class GlobalConfig(BaseModel):
     tunnel: TunnelGlobalConfig = Field(
         default_factory=lambda: TunnelGlobalConfig(),
         description="Default tunnel-provider settings. Project [tunnel.*] blocks override.",
+    )
+
+    mcp: McpGlobalConfig = Field(
+        default_factory=lambda: McpGlobalConfig(),
+        description="Daemon-wide MCP server settings (enabled, path, filter).",
     )
 
     @field_validator("dns_managed_tld")
@@ -292,6 +345,27 @@ def _writeTunnelTable(tunnel: TunnelGlobalConfig):  # type: ignore[no-untyped-de
     return outer
 
 
+def _writeMcpTable(mcp: McpGlobalConfig):  # type: ignore[no-untyped-def]
+    """Emit `[mcp]` only when at least one field deviates from defaults.
+
+    Default-equal sections are noise — leave the file clean.
+    """
+    defaults = McpGlobalConfig()
+    fields_changed: dict[str, Any] = {}
+    if mcp.enabled != defaults.enabled:
+        fields_changed["enabled"] = mcp.enabled
+    if mcp.path != defaults.path:
+        fields_changed["path"] = mcp.path
+    if mcp.filter != defaults.filter:
+        fields_changed["filter"] = list(mcp.filter)
+    if not fields_changed:
+        return None
+    tbl = tomlkit.table()
+    for k, v in fields_changed.items():
+        tbl.add(k, v)
+    return tbl
+
+
 def writeGlobalConfig(config: GlobalConfig, path: Path | None = None) -> Path:
     """Write the config back to ~/.taskmux/config.toml.
 
@@ -303,6 +377,7 @@ def writeGlobalConfig(config: GlobalConfig, path: Path | None = None) -> Path:
     doc = tomlkit.document()
     flat = config.model_dump()
     flat.pop("tunnel", None)
+    flat.pop("mcp", None)
     for field, value in flat.items():
         if value is None:
             continue
@@ -311,6 +386,10 @@ def writeGlobalConfig(config: GlobalConfig, path: Path | None = None) -> Path:
     if tun_tbl is not None:
         doc.add(tomlkit.nl())
         doc.add("tunnel", tun_tbl)
+    mcp_tbl = _writeMcpTable(config.mcp)
+    if mcp_tbl is not None:
+        doc.add(tomlkit.nl())
+        doc.add("mcp", mcp_tbl)
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(tomlkit.dumps(doc))
     os.replace(tmp, p)

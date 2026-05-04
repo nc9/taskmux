@@ -24,7 +24,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import websockets
+import uvicorn
+from starlette.applications import Starlette
+from starlette.routing import Mount, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -32,6 +35,9 @@ from .config import addTask, loadConfig, removeTask
 from .errors import TaskmuxError
 from .events import recordEvent
 from .host_resolver import HostResolver, getResolver
+from .mcp.broadcaster import broadcasterLifespan
+from .mcp.scope import PinExtractionMiddleware
+from .mcp.server import buildServer as buildMcpServer
 from .models import TaskmuxConfig
 from .paths import (
     REGISTRY_PATH,
@@ -202,7 +208,7 @@ class TaskmuxDaemon:
         self.running = False
         self.health_check_interval = self.global_config.health_check_interval
         self.health_check_task: asyncio.Task | None = None
-        self.websocket_clients: set = set()
+        self.websocket_clients: set[WebSocket] = set()
         # session -> Supervisor / TaskmuxConfig / abs-path / state
         self.projects: dict[str, Supervisor] = {}
         self.configs: dict[str, TaskmuxConfig] = {}
@@ -1207,27 +1213,70 @@ class TaskmuxDaemon:
     # ---- WebSocket API ----
 
     async def _start_api_server(self) -> None:
-        async def handle_client(websocket) -> None:  # type: ignore[type-arg]
+        async def handle_client(websocket: WebSocket) -> None:
+            await websocket.accept()
             self.websocket_clients.add(websocket)
-            self.logger.info(f"WebSocket client connected: {websocket.remote_address}")
+            peer = websocket.client
+            self.logger.info(f"WebSocket client connected: {peer}")
             try:
-                async for message in websocket:
+                while True:
+                    message = await websocket.receive_text()
                     try:
                         data = json.loads(message)
                         response = await self._handle_api_request(data)
-                        await websocket.send(json.dumps(response, default=str))
+                        await websocket.send_text(json.dumps(response, default=str))
                     except json.JSONDecodeError:
-                        await websocket.send(json.dumps({"error": "Invalid JSON"}))
+                        await websocket.send_text(json.dumps({"error": "Invalid JSON"}))
                     except Exception as e:  # noqa: BLE001
-                        await websocket.send(json.dumps({"error": str(e)}))
-            except websockets.exceptions.ConnectionClosed:
+                        await websocket.send_text(json.dumps({"error": str(e)}))
+            except WebSocketDisconnect:
                 pass
             finally:
                 self.websocket_clients.discard(websocket)
-                self.logger.info(f"WebSocket client disconnected: {websocket.remote_address}")
+                self.logger.info(f"WebSocket client disconnected: {peer}")
 
-        async with websockets.serve(handle_client, "localhost", self.api_port):  # type: ignore[arg-type]
-            await asyncio.Future()
+        mcp_cfg = self.global_config.mcp
+        routes: list = [WebSocketRoute("/", handle_client)]
+        lifespan_to_use = None
+
+        if mcp_cfg.enabled:
+            mcp_server = buildMcpServer(self._handle_api_request)
+            mcp_app = mcp_server.streamable_http_app()
+            event_filter = list(mcp_cfg.filter) or None
+
+            @contextlib.asynccontextmanager
+            async def combinedLifespan(_app):
+                # FastMCP's session manager (process-scope) and the bus →
+                # MCP broadcaster, stitched into one parent Starlette
+                # lifespan. Order matters: start FastMCP first so
+                # `_installSessionTracker` runs before any session connects.
+                async with (
+                    mcp_app.router.lifespan_context(_app),
+                    broadcasterLifespan(eventFilter=event_filter),
+                ):
+                    yield
+
+            # Wrap with PinExtractionMiddleware so every request through
+            # this mount populates the per-request `currentPin` contextvar
+            # from the URL `?session=` query param. Tools/resources/
+            # notifications consult that pin to scope per-project clients.
+            routes.append(Mount(mcp_cfg.path, app=PinExtractionMiddleware(mcp_app)))
+            lifespan_to_use = combinedLifespan
+
+        app = Starlette(routes=routes, lifespan=lifespan_to_use)
+        config = uvicorn.Config(
+            app,
+            host="localhost",
+            port=self.api_port,
+            log_config=None,
+            access_log=False,
+            lifespan="on",
+        )
+        server = uvicorn.Server(config)
+        # Daemon owns SIGINT/SIGTERM via loop.add_signal_handler — disable
+        # uvicorn's signal install so the two don't fight.
+        server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+        await server.serve()
 
     KNOWN_COMMANDS = frozenset(
         {
@@ -1260,6 +1309,7 @@ class TaskmuxDaemon:
             "resync",
             "sync_registry",
             "ping",
+            "mcp_status",
         }
     )
 
@@ -1272,6 +1322,26 @@ class TaskmuxDaemon:
 
         if command == "ping":
             return {"command": command, "ok": True}
+
+        if command == "mcp_status":
+            from .mcp.broadcaster import _activeSessions
+
+            mcp_cfg = self.global_config.mcp
+            sessions = [
+                {"pin": getattr(s, "_taskmux_pin", None)} for s in list(_activeSessions)
+            ]
+            return {
+                "command": command,
+                "ok": True,
+                "enabled": mcp_cfg.enabled,
+                "url": (
+                    f"http://localhost:{self.api_port}{mcp_cfg.path}" if mcp_cfg.enabled else None
+                ),
+                "transport": "streamable_http",
+                "active_sessions": len(_activeSessions),
+                "sessions": sessions,
+                "filter": list(mcp_cfg.filter),
+            }
 
         if command == "sync_registry":
             await self._sync_with_registry()
@@ -1605,10 +1675,10 @@ class TaskmuxDaemon:
         if not self.websocket_clients:
             return
         payload = json.dumps(message, default=str)
-        disconnected = set()
+        disconnected: set[WebSocket] = set()
         for client in self.websocket_clients:
             try:
-                await client.send(payload)
+                await client.send_text(payload)
             except Exception:  # noqa: BLE001
                 disconnected.add(client)
         self.websocket_clients -= disconnected

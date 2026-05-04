@@ -2371,6 +2371,472 @@ def tunnel_logs_cmd(
 app.add_typer(tunnel_app)
 
 
+# ---------------------------------------------------------------------------
+# MCP sub-app: install per-client config + show server status
+# ---------------------------------------------------------------------------
+
+mcp_app = typer.Typer(
+    name="mcp",
+    help=(
+        "Wire taskmux into MCP-aware coding agents (Claude Code, Cursor, "
+        "Codex, Continue). Once installed, the agent connects to the daemon's "
+        "Streamable HTTP endpoint at /mcp and receives push notifications "
+        "when tasks crash, restart, or fail health checks."
+    ),
+    no_args_is_help=True,
+)
+
+
+@mcp_app.command("install")
+def mcp_install_cmd(
+    client: str | None = typer.Argument(
+        None,
+        help=(
+            "Which client config to write. One of: "
+            "claude, claude-project, cursor, codex, codex-project, continue, all. "
+            "Omit to be prompted with a multi-select."
+        ),
+    ),
+    print_only: bool = typer.Option(
+        False,
+        "--print",
+        help="Print the resulting config instead of writing it. Dry run.",
+    ),
+    unscoped: bool = typer.Option(
+        False,
+        "--unscoped",
+        help=(
+            "Install without binding the connection to a project. The agent "
+            "will see every project on this host. Use only for admin / "
+            "diagnostic clients."
+        ),
+    ),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help=(
+            "Override cwd-based session detection. Use this to install for a "
+            "project from outside its directory."
+        ),
+    ),
+) -> None:
+    """Write the taskmux MCP server entry into a coding agent's config file.
+
+    By default, requires a `taskmux.toml` in the current dir (or any
+    ancestor). The detected session name is encoded into the URL as
+    `?session=<name>` so the daemon scopes the connection to that project.
+
+    Pass `--unscoped` to opt out and install a host-wide MCP server (you'll
+    see a warning); `--session NAME` overrides cwd detection.
+    """
+    from .global_config import loadGlobalConfig
+    from .mcp.install import (
+        ALL_CLIENTS,
+        detectProjectRootFromCwd,
+        detectSessionFromCwd,
+        installAll,
+    )
+
+    gc = loadGlobalConfig()
+    api_port = gc.api_port
+    mcp_path = gc.mcp.path
+    write = not print_only
+
+    # Resolve which clients to install for. Explicit name → that one.
+    # "all" → every client. Omitted (None) → multi-select prompt when
+    # stdin is a TTY; fall back to "all" otherwise (script / JSON mode).
+    selected_clients: list[str]
+    if client is None:
+        if is_json_mode() or not _stdinIsTty():
+            selected_clients = list(ALL_CLIENTS)
+        else:
+            selected_clients = _interactiveSelectClients()
+            if not selected_clients:
+                console.print("[yellow]No clients selected — aborting.[/yellow]")
+                raise typer.Exit(1)
+    elif client == "all":
+        selected_clients = list(ALL_CLIENTS)
+    elif client in ALL_CLIENTS:
+        selected_clients = [client]
+    else:
+        from .errors import ErrorCode
+
+        err = TaskmuxError(
+            ErrorCode.CONFIG_VALIDATION,
+            detail=(
+                f"unknown client {client!r}; expected one of {', '.join(ALL_CLIENTS)}, or 'all'."
+            ),
+        )
+        if is_json_mode():
+            print_error(err)
+        else:
+            console.print(f"[red]Error:[/red] {err}", style="red")
+        raise typer.Exit(1)
+
+    # Resolve scope: explicit --session, --unscoped, or autodetect from cwd.
+    pinned_session: str | None
+    if session is not None:
+        pinned_session = session
+    elif unscoped:
+        pinned_session = None
+    else:
+        pinned_session = detectSessionFromCwd()
+        if pinned_session is None:
+            from .errors import ErrorCode
+
+            err = TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    f"taskmux.toml not found in {Path.cwd()} or any ancestor. "
+                    "cd into a project, or pass --unscoped (not recommended; "
+                    "agent sees every project on the host), or pass "
+                    "--session NAME to install for a specific project."
+                ),
+            )
+            if is_json_mode():
+                print_error(err)
+            else:
+                console.print(f"[red]Error:[/red] {err}", style="red")
+            raise typer.Exit(1)
+
+    # Resolve project root for `claude-project`: anchor `.mcp.json` at the
+    # ancestor that contains taskmux.toml, not the process cwd. Without this
+    # a user running from `repo/src` ends up with `repo/src/.mcp.json` —
+    # Claude Code only loads `.mcp.json` from the repo root, so the install
+    # silently fails to take effect.
+    project_root = detectProjectRootFromCwd()
+
+    warnings: list[str] = []
+    if unscoped:
+        warnings.append("unscoped_install")
+        if not is_json_mode():
+            console.print(
+                "[bold yellow]⚠ Installing UNSCOPED MCP server[/bold yellow] for "
+                f"[bold]{', '.join(selected_clients)}[/bold].\n"
+                "  Connected agents will see every project on this host —\n"
+                "  every status snapshot, every log path, every crash event.\n"
+                "  Use this only for admin / diagnostic clients (your own\n"
+                "  terminal, dotfiles repo, etc.). For per-project use, run\n"
+                "  [italic]taskmux mcp install[/italic] from inside a project dir.\n"
+            )
+
+    results = installAll(
+        api_port=api_port,
+        mcp_path=mcp_path,
+        session=pinned_session,
+        write=write,
+        cwd=project_root,
+        clients=tuple(selected_clients),
+    )
+
+    if is_json_mode():
+        payload: dict = {
+            "ok": True,
+            "client": client,
+            "session": pinned_session,
+            "results": results,
+        }
+        if warnings:
+            payload["warnings"] = warnings
+        print_result(payload)
+        return
+
+    for r in results:
+        if r.get("error"):
+            console.print(f"[yellow]✗[/yellow] {r['client']}: {r['error']}")
+            continue
+        action = "would write" if print_only else "wrote"
+        scope_note = f" (session={pinned_session})" if pinned_session else " (unscoped)"
+        console.print(f"[green]✓[/green] {r['client']}: {action} {r['path']}{scope_note}")
+        if print_only:
+            console.print(r["rendered"], style="dim")
+
+    if not print_only:
+        console.print(
+            "\nRestart your coding agent so it picks up the new config.",
+            style="dim",
+        )
+
+
+@mcp_app.command("status")
+def mcp_status_cmd() -> None:
+    """Show MCP endpoint health, active sessions (with pin), and the
+    URL that this project's clients should connect to.
+
+    Two views in one:
+      * Daemon (host-wide): endpoint URL, transport, list of every
+        currently-connected MCP client with its pinned session.
+      * This project (cwd-aware): the URL `taskmux mcp install` would
+        write here, and whether the local `.mcp.json` already has it.
+    """
+    from .mcp.install import detectProjectRootFromCwd, detectSessionFromCwd, serverUrl
+
+    response = ipc_client.call_no_ensure("mcp_status")
+    if response is None:
+        if is_json_mode():
+            print_result({"ok": False, "error": "daemon_not_running"})
+        else:
+            console.print("[yellow]Daemon not running.[/yellow]")
+            console.print("Start it with `taskmux daemon` or any taskmux command.")
+        raise typer.Exit(1)
+
+    project_session = detectSessionFromCwd()
+    project_root = detectProjectRootFromCwd()
+    local_view: dict | None = None
+    if project_session is not None and project_root is not None:
+        from .global_config import loadGlobalConfig
+        from .mcp.install import jsonSnippet
+
+        gc = loadGlobalConfig()
+        expected_url = serverUrl(gc.api_port, gc.mcp.path, project_session)
+        mcp_json = project_root / ".mcp.json"
+        installed_url: str | None = None
+        if mcp_json.exists():
+            try:
+                installed_url = (
+                    json.loads(mcp_json.read_text())
+                    .get("mcpServers", {})
+                    .get("taskmux", {})
+                    .get("url")
+                )
+            except Exception:  # noqa: BLE001
+                installed_url = None
+        local_view = {
+            "session": project_session,
+            "project_root": str(project_root),
+            "url": expected_url,
+            "mcp_json": str(mcp_json),
+            "mcp_json_present": mcp_json.exists(),
+            "mcp_json_url": installed_url,
+            "snippet": jsonSnippet(gc.api_port, gc.mcp.path, project_session),
+        }
+
+    if is_json_mode():
+        payload = {"ok": True, **response}
+        if local_view is not None:
+            payload["local"] = local_view
+        print_result(payload)
+        return
+
+    sessions = response.get("sessions") or []
+    active_count = response.get("active_sessions", len(sessions))
+
+    daemon_table = Table(show_header=False, box=None)
+    daemon_table.add_row("[bold]Daemon URL[/bold]", response.get("url", "?"))
+    daemon_table.add_row("[bold]Transport[/bold]", response.get("transport", "?"))
+    daemon_table.add_row("[bold]Active sessions[/bold]", str(active_count))
+    console.print(daemon_table)
+
+    if sessions:
+        console.print()
+        sess_table = Table(title="Connected MCP clients", show_header=True, box=None)
+        sess_table.add_column("#", style="dim", justify="right")
+        sess_table.add_column("Pin")
+        sess_table.add_column("Scope")
+        for i, s in enumerate(sessions, 1):
+            pin = s.get("pin")
+            sess_table.add_row(
+                str(i),
+                pin if pin else "[dim]—[/dim]",
+                "scoped" if pin else "[yellow]unscoped[/yellow]",
+            )
+        console.print(sess_table)
+
+    console.print()
+    if local_view is None:
+        console.print(
+            "[dim]This project: no taskmux.toml in cwd or any ancestor — "
+            "run `taskmux mcp install` from a project dir for a local view.[/dim]"
+        )
+        return
+
+    proj_table = Table(title=f"This project: {local_view['session']}", show_header=False, box=None)
+    proj_table.add_row("[bold]Root[/bold]", local_view["project_root"])
+    proj_table.add_row("[bold]URL for clients[/bold]", local_view["url"])
+    if local_view["mcp_json_present"]:
+        if local_view["mcp_json_url"] == local_view["url"]:
+            status_cell = "[green]✓ matches[/green]"
+        elif local_view["mcp_json_url"]:
+            status_cell = (
+                f"[yellow]! has different URL[/yellow] {local_view['mcp_json_url']}"
+            )
+        else:
+            status_cell = "[yellow]! no taskmux entry[/yellow]"
+    else:
+        status_cell = "[yellow]✗ missing — run `taskmux mcp install claude-project`[/yellow]"
+    proj_table.add_row("[bold].mcp.json[/bold]", status_cell)
+    console.print(proj_table)
+
+
+@mcp_app.command("show")
+def mcp_show_cmd(
+    client: str = typer.Argument(
+        "claude",
+        help=(
+            "Which client snippet to print. One of: "
+            "claude, claude-project, cursor, codex, codex-project, continue."
+        ),
+    ),
+    unscoped: bool = typer.Option(
+        False,
+        "--unscoped",
+        help="Print the unscoped (host-wide) snippet instead of the cwd's session.",
+    ),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Override cwd-based session detection.",
+    ),
+) -> None:
+    """Print just the taskmux MCP entry for one client (for copy-paste).
+
+    Shows only the snippet to paste, not the merged whole-file output —
+    use `install --print` for the full preview. Same scope-resolution
+    rules as `install`: cwd taskmux.toml by default, `--unscoped` opts
+    out (with a warning), `--session NAME` overrides.
+    """
+    from .global_config import loadGlobalConfig
+    from .mcp.install import ALL_CLIENTS, detectSessionFromCwd, jsonSnippet, serverUrl
+
+    if client not in ALL_CLIENTS:
+        console.print(
+            f"[red]Unknown client {client!r}.[/red] Expected one of: {', '.join(ALL_CLIENTS)}."
+        )
+        raise typer.Exit(1)
+
+    pinned_session: str | None
+    if session is not None:
+        pinned_session = session
+    elif unscoped:
+        pinned_session = None
+    else:
+        pinned_session = detectSessionFromCwd()
+        if pinned_session is None:
+            from .errors import ErrorCode
+
+            err = TaskmuxError(
+                ErrorCode.CONFIG_VALIDATION,
+                detail=(
+                    f"taskmux.toml not found in {Path.cwd()} or any ancestor. "
+                    "cd into a project, or pass --unscoped, or --session NAME."
+                ),
+            )
+            if is_json_mode():
+                print_error(err)
+            else:
+                console.print(f"[red]Error:[/red] {err}", style="red")
+            raise typer.Exit(1)
+
+    if unscoped and not is_json_mode():
+        console.print(
+            "[yellow]⚠ Showing UNSCOPED snippet[/yellow] — "
+            "connected agents will see every project on this host.\n",
+        )
+
+    gc = loadGlobalConfig()
+    api_port = gc.api_port
+    mcp_path = gc.mcp.path
+    if is_json_mode():
+        print_result(
+            {
+                "ok": True,
+                "client": client,
+                "session": pinned_session,
+                "url": serverUrl(api_port, mcp_path, pinned_session),
+                "snippet": jsonSnippet(api_port, mcp_path, pinned_session),
+            }
+        )
+        return
+
+    if client in ("codex", "codex-project"):
+        toml_path = "~/.codex/config.toml" if client == "codex" else ".codex/config.toml"
+        console.print(
+            f"[bold]{toml_path}[/bold] — add under [italic]<root>[/italic]:"
+        )
+        console.print(
+            f'[mcp_servers.taskmux]\nurl = "{serverUrl(api_port, mcp_path, pinned_session)}"',
+            markup=False,
+        )
+    else:
+        client_path = {
+            "claude": "~/.claude/settings.json",
+            "claude-project": ".mcp.json",
+            "cursor": "~/.cursor/mcp.json",
+            "continue": "~/.continue/config.json",
+        }[client]
+        console.print(f"[bold]{client_path}[/bold] — add under [italic]mcpServers[/italic]:")
+        console.print(
+            json.dumps({"taskmux": jsonSnippet(api_port, mcp_path, pinned_session)}, indent=2)
+        )
+
+
+app.add_typer(mcp_app)
+
+
+def _stdinIsTty() -> bool:
+    """Indirection so tests can override the TTY check.
+
+    `typer.testing.CliRunner` replaces `sys.stdin` with a piped buffer for
+    every invoke, so a `monkeypatch.setattr(sys.stdin, "isatty", ...)` set
+    before the call doesn't reach the runtime check. Patching this module
+    attribute does.
+    """
+    return sys.stdin.isatty()
+
+
+_CLIENT_PATH_HINTS = {
+    "claude": "~/.claude/settings.json (user-global)",
+    "claude-project": "<project>/.mcp.json (project-shared)",
+    "cursor": "~/.cursor/mcp.json (user-global)",
+    "codex": "~/.codex/config.toml (user-global)",
+    "codex-project": "<project>/.codex/config.toml (project-shared)",
+    "continue": "~/.continue/config.json (user-global)",
+}
+
+
+def _interactiveSelectClients() -> list[str]:
+    """Numeric multi-select for `taskmux mcp install` with no client arg.
+
+    Returns the chosen client names. Empty list = user picked nothing
+    (caller aborts). "a"/"all"/empty input → every supported client.
+    """
+    from .mcp.install import ALL_CLIENTS
+
+    console.print("\n[bold]Which coding agents to install taskmux MCP for?[/bold]\n")
+    for i, c in enumerate(ALL_CLIENTS, 1):
+        hint = _CLIENT_PATH_HINTS.get(c, "")
+        console.print(f"  [bold]{i:>2})[/bold]  {c:<16} [dim]{hint}[/dim]")
+    console.print("   [bold] a)[/bold]  all\n")
+
+    raw = typer.prompt(
+        "Select (e.g. '2,5' or 'a' for all)",
+        default="a",
+    ).strip().lower()
+    if raw in ("a", "all", ""):
+        return list(ALL_CLIENTS)
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            idx = int(tok)
+        except ValueError:
+            console.print(f"[yellow]Skipping invalid selection: {tok!r}[/yellow]")
+            continue
+        if not (1 <= idx <= len(ALL_CLIENTS)):
+            console.print(f"[yellow]Skipping out-of-range selection: {idx}[/yellow]")
+            continue
+        name = ALL_CLIENTS[idx - 1]
+        if name in seen:
+            continue
+        seen.add(name)
+        selected.append(name)
+    return selected
+
+
 def _hoist_global_flags(argv: list[str]) -> list[str]:
     """Move `--json` (and `-V`/`--version`) to before the first subcommand.
 

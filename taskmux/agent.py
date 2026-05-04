@@ -99,6 +99,11 @@ def buildContextBlock(config: TaskmuxConfig) -> str:
             "installed, prefer it for CLI details. Otherwise: `taskmux --help`, "
             "`taskmux status --json`, `taskmux inspect <task> --json`, "
             "`taskmux logs <task> --grep <pat>`.",
+            "",
+            "Daemon hosts an MCP server at `http://localhost:{api_port}/mcp` "
+            "(default `:8765/mcp`) — `taskmux mcp install <client>` to wire up "
+            "Claude Code, Cursor, Codex, or Continue for live tools and "
+            "push notifications on task crashes/restarts.",
             CONTEXT_END,
         ]
     )
