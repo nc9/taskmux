@@ -265,13 +265,16 @@ def testInstallAllReportsPerClientErrorOnMalformedJson(tmp_path: Path, monkeypat
     the rest. The bad file is preserved as-is.
     """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Pass cwd so project-scoped targets (claude-project, codex-project)
+    # write under tmp_path and don't leak into the actual repo.
+    monkeypatch.chdir(tmp_path)
 
     bad = tmp_path / ".cursor" / "mcp.json"
     bad.parent.mkdir(parents=True)
     original = '{"oops":'  # invalid
     bad.write_text(original)
 
-    results = installAll(api_port=8765)
+    results = installAll(api_port=8765, cwd=tmp_path)
 
     by_client = {r["client"]: r for r in results}
     assert "error" in by_client["cursor"], by_client["cursor"]
