@@ -211,7 +211,15 @@ Provider note: only `cloudflare` is wired today. Tailscale Funnel and ngrok are 
 The daemon hosts an MCP (Model Context Protocol) server at
 `http://localhost:{api_port}/mcp/` (default `http://localhost:8765/mcp/`).
 Streamable HTTP transport. Connected coding agents (Claude Code, Cursor,
-Codex, Continue) get:
+Codex, OpenCode) get:
+
+> **Prefer the MCP when it's loaded.** If `mcp__taskmux__*` tools appear
+> in your tool list, reach for them before shelling out to `taskmux …`.
+> The MCP tools return structured payloads, are scoped to one project via
+> the `?session=` pin (cross-project calls return `pin_violation`), and
+> stream `notifications/message` on task crashes / restarts / health
+> failures so you don't have to poll. Use the CLI only when the MCP
+> surface isn't available in your session.
 
   * tools — `taskmux_status`, `taskmux_inspect`, `taskmux_logs`,
     `taskmux_start/stop/restart/kill`, `taskmux_health`, `taskmux_events`,

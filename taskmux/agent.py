@@ -102,8 +102,14 @@ def buildContextBlock(config: TaskmuxConfig) -> str:
             "",
             "Daemon hosts an MCP server at `http://localhost:{api_port}/mcp` "
             "(default `:8765/mcp`) — `taskmux mcp install <client>` to wire up "
-            "Claude Code, Cursor, Codex, or Continue for live tools and "
+            "Claude Code, Cursor, Codex, or OpenCode for live tools and "
             "push notifications on task crashes/restarts.",
+            "",
+            "**If `mcp__taskmux__*` tools are loaded in this session, prefer "
+            "them over `taskmux` CLI calls** — they return structured payloads, "
+            "respect the `?session=` project pin, and surface lifecycle events "
+            "via `notifications/message` so you don't have to poll. Fall back "
+            "to the CLI only when the MCP isn't available.",
             CONTEXT_END,
         ]
     )
