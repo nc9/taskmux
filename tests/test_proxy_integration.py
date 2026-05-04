@@ -188,36 +188,79 @@ def test_proxy_serves_both_v4_and_v6_loopback(tmp_path):
     assert v6_status == 200
 
 
-def test_proxy_returns_502_for_unmatched_route(tmp_path):
+async def _send_request_via_proxy(proxy_port: int, hostname: str) -> tuple[int, bytes]:
+    """Open TLS to the proxy with the given SNI/Host and read the full response."""
+    ssl_ctx = ssl.create_default_context(cafile=str(_ca_root()))
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1",
+        proxy_port,
+        ssl=ssl_ctx,
+        server_hostname=hostname,
+    )
+    writer.write(f"GET / HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n".encode())
+    await writer.drain()
+    raw = await reader.read()
+    writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+    status_line = raw.split(b"\r\n", 1)[0].decode()
+    return int(status_line.split()[1]), raw
+
+
+def test_proxy_returns_503_with_diagnostic_body_for_unmatched_route(tmp_path):
     from taskmux.proxy import ProxyServer
 
     proxy_port = _free_port()
     cert, key = _make_cert(tmp_path / "certs" / "demo", "demo")
 
-    async def run() -> int:
+    async def run() -> tuple[int, bytes]:
         proxy = ProxyServer(https_port=proxy_port, bind="127.0.0.1")
         proxy.register_project("demo", cert, key)
-        # Note: NO set_route — so any host should 502.
+        # Note: NO set_route — so any host should 503 with a hint.
         await proxy.start()
         try:
-            ssl_ctx = ssl.create_default_context(cafile=str(_ca_root()))
-            reader, writer = await asyncio.open_connection(
-                "127.0.0.1",
-                proxy_port,
-                ssl=ssl_ctx,
-                server_hostname="ghost.demo.localhost",
-            )
-            writer.write(
-                b"GET / HTTP/1.1\r\nHost: ghost.demo.localhost\r\nConnection: close\r\n\r\n"
-            )
-            await writer.drain()
-            raw = await reader.read()
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-            status_line = raw.split(b"\r\n", 1)[0].decode()
-            return int(status_line.split()[1])
+            return await _send_request_via_proxy(proxy_port, "ghost.demo.localhost")
         finally:
             await proxy.stop()
 
-    assert asyncio.run(run()) == 502
+    status, raw = asyncio.run(run())
+    assert status == 503
+    body = raw.split(b"\r\n\r\n", 1)[1]
+    assert b"taskmux: no upstream" in body
+    assert b"taskmux start" in body
+
+
+def test_proxy_returns_503_and_notifies_on_econnrefused(tmp_path):
+    """Route is wired to a port nothing is listening on. Forwarding hits
+    ECONNREFUSED → proxy returns 503 with a `taskmux restart` hint and fires
+    on_upstream_dead with the task name."""
+    from taskmux.proxy import ProxyServer
+
+    proxy_port = _free_port()
+    cert, key = _make_cert(tmp_path / "certs" / "demo", "demo")
+
+    # A port we own briefly to learn its number, then close so connect refuses.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead_port = s.getsockname()[1]
+    s.close()
+
+    notified: list[tuple[str, str, str | None]] = []
+
+    async def run() -> tuple[int, bytes]:
+        proxy = ProxyServer(https_port=proxy_port, bind="127.0.0.1")
+        proxy.register_project("demo", cert, key)
+        proxy.on_upstream_dead = lambda p, h, t: notified.append((p, h, t))
+        proxy.set_route("demo", "api", dead_port, task="api-task")
+        await proxy.start()
+        try:
+            return await _send_request_via_proxy(proxy_port, "api.demo.localhost")
+        finally:
+            await proxy.stop()
+
+    status, raw = asyncio.run(run())
+    assert status == 503
+    body = raw.split(b"\r\n\r\n", 1)[1]
+    assert b"taskmux: upstream api-task not responding" in body
+    assert b"taskmux restart api-task" in body
+    assert notified and notified[0][2] == "api-task"

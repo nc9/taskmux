@@ -17,6 +17,130 @@ from taskmux import registry as reg
 from taskmux.daemon import TaskmuxDaemon
 
 
+class TestUpstreamDeadWakesHealthLoop:
+    """ECONNREFUSED through the proxy must short-circuit the health-loop sleep
+    so auto_restart_tasks runs within seconds rather than waiting out
+    health_check_interval (default 30 s)."""
+
+    def test_on_upstream_dead_sets_wakeup_event_and_notifies_supervisor(self):
+        async def run():
+            d = daemon_mod.TaskmuxDaemon(api_port=0)
+            d._loop = asyncio.get_running_loop()
+            d._health_wakeup = asyncio.Event()
+
+            class _FakeSup:
+                def __init__(self):
+                    self.dead_calls: list[str] = []
+
+                def notify_upstream_dead(self, task):
+                    self.dead_calls.append(task)
+
+            sup = _FakeSup()
+            d.projects["alpha"] = sup  # type: ignore[assignment]
+
+            d._on_upstream_dead("alpha", "api", "api-task")
+            # call_soon_threadsafe schedules the .set(); yield once.
+            await asyncio.sleep(0)
+
+            assert d._health_wakeup.is_set()
+            assert sup.dead_calls == ["api-task"]
+
+        asyncio.run(run())
+
+    def test_health_loop_wakes_early_on_signal(self):
+        async def run():
+            d = daemon_mod.TaskmuxDaemon(api_port=0)
+            d._loop = asyncio.get_running_loop()
+            d.health_check_interval = 30  # would normally block 30 s
+            d.running = True
+            sweeps = 0
+
+            class _CountingSup:
+                async def auto_restart_tasks(self):
+                    nonlocal sweeps
+                    sweeps += 1
+
+            d.projects["alpha"] = _CountingSup()  # type: ignore[assignment]
+            d.websocket_clients = set()  # skip broadcast path
+            loop_task = asyncio.create_task(d._health_check_loop())
+            try:
+                # Let the first sweep run, then signal the wake-up.
+                await asyncio.sleep(0.05)
+                d._wake_health_loop()
+                await asyncio.sleep(0.05)
+            finally:
+                d.running = False
+                d._wake_health_loop()  # let the loop exit
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
+            assert sweeps >= 2, (
+                f"expected the wake-up to trigger a second sweep within 100 ms, got {sweeps}"
+            )
+
+        asyncio.run(run())
+
+
+class TestNextSweepTimeout:
+    """Periodic cadence drops to HOST_BOUND_TCP_INTERVAL when a host-bound
+    TCP-only task is running, so detection doesn't wait 30s with no proxy
+    traffic to trigger the wake-up."""
+
+    @staticmethod
+    def _daemon_with(cfg, running_tasks):
+        d = daemon_mod.TaskmuxDaemon(api_port=0)
+        d.health_check_interval = 30
+        d.configs["alpha"] = cfg
+
+        class _SupStub:
+            def __init__(self, names):
+                self._tasks = dict.fromkeys(names, object())
+
+        d.projects["alpha"] = _SupStub(running_tasks)  # type: ignore[assignment]
+        return d
+
+    def test_cadence_drops_for_running_host_bound_tcp_task(self):
+        from taskmux.models import TaskConfig, TaskmuxConfig
+
+        cfg = TaskmuxConfig(
+            name="alpha",
+            tasks={"web": TaskConfig(command="echo", host="web")},
+        )
+        d = self._daemon_with(cfg, ["web"])
+        snapshot = list(d.projects.items())
+        assert d._next_sweep_timeout(snapshot) == float(
+            daemon_mod.TaskmuxDaemon.HOST_BOUND_TCP_INTERVAL
+        )
+
+    def test_cadence_keeps_default_when_host_task_has_explicit_health(self):
+        from taskmux.models import TaskConfig, TaskmuxConfig
+
+        cfg = TaskmuxConfig(
+            name="alpha",
+            tasks={
+                "web": TaskConfig(
+                    command="echo",
+                    host="web",
+                    health_check="true",
+                )
+            },
+        )
+        d = self._daemon_with(cfg, ["web"])
+        snapshot = list(d.projects.items())
+        assert d._next_sweep_timeout(snapshot) == 30
+
+    def test_cadence_keeps_default_when_host_task_not_running(self):
+        from taskmux.models import TaskConfig, TaskmuxConfig
+
+        cfg = TaskmuxConfig(
+            name="alpha",
+            tasks={"web": TaskConfig(command="echo", host="web")},
+        )
+        d = self._daemon_with(cfg, [])  # not running
+        snapshot = list(d.projects.items())
+        assert d._next_sweep_timeout(snapshot) == 30
+
+
 class TestProxyBindTargets:
     """Plan dual-stack pairs so v6-preferring resolvers reach the proxy."""
 
@@ -420,7 +544,8 @@ host = "api"
             def __init__(self):
                 self.routes: dict[tuple[str, str], int] = {}
 
-            def set_route(self, project, host, p):
+            def set_route(self, project, host, p, task=None):
+                del task  # fake doesn't track reverse-lookup
                 self.routes[(project, host)] = p
 
             def drop_route(self, project, host):

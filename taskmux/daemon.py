@@ -221,6 +221,11 @@ class TaskmuxDaemon:
         self.tunnels: dict[tuple[str, str], TunnelBackend] = {}
         self._lock = asyncio.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Interrupts the health-loop sleep so a proxy ECONNREFUSED (or any
+        # other event needing prompt sweep) can trigger a fresh
+        # auto_restart_tasks pass without waiting out health_check_interval.
+        # Created lazily in start() so it binds to the running loop.
+        self._health_wakeup: asyncio.Event | None = None
         self.logger = self._setup_logging()
 
     # ---- logging ----
@@ -966,24 +971,44 @@ class TaskmuxDaemon:
             self.logger.error(f"mkcert failed for '{session}': {e}")
             return
         self.proxy.register_project(session, cert, key)
+        self.proxy.on_upstream_dead = self._on_upstream_dead
         running = set(sup.list_windows()) if sup.session_exists() else set()
         for task_name, task_cfg in cfg.tasks.items():
             if task_cfg.host is None:
                 continue
             port = sup.assigned_ports.get(task_name)
             if port is not None and task_name in running:
-                self.proxy.set_route(session, task_cfg.host, port)
+                self.proxy.set_route(session, task_cfg.host, port, task=task_name)
         from .aliases import loadAliases as _loadAliases
 
         for alias_entry in _loadAliases(sup.config.name, sup.worktree_id).values():
             self.proxy.set_route(session, alias_entry["host"], alias_entry["port"])
+
+    def _on_upstream_dead(self, project: str, _host: str, task: str | None) -> None:
+        """Proxy → daemon hook fired on aiohttp.ClientConnectorError.
+
+        Invalidates the supervisor's TCP-probe cache and wakes the daemon's
+        health loop so auto_restart_tasks runs within seconds instead of
+        waiting out health_check_interval. Restart decisions still belong to
+        auto_restart_tasks itself (under its own lock).
+        """
+        if task is not None:
+            sup = self.projects.get(project)
+            if sup is not None:
+                notify = getattr(sup, "notify_upstream_dead", None)
+                if callable(notify):
+                    try:
+                        notify(task)
+                    except Exception:  # noqa: BLE001
+                        self.logger.debug("notify_upstream_dead raised", exc_info=True)
+        self._wake_health_loop()
 
     def _on_task_route_change(self, project: str, _task: str, host: str, port: int | None) -> None:
         if self.proxy is not None:
             if port is None:
                 self.proxy.drop_route(project, host)
             else:
-                self.proxy.set_route(project, host, port)
+                self.proxy.set_route(project, host, port, task=_task)
         # If this project has any tunneled tasks, re-sync the tunnel backend so
         # a `taskmux start <task>` (which only fires this sync callback, never
         # _resync_project_routes) actually wires Cloudflare ingress + spawns
@@ -1026,15 +1051,15 @@ class TaskmuxDaemon:
         except Exception as e:  # noqa: BLE001
             self.logger.warning(f"resync: list_windows failed for {session!r}: {e}")
 
-        desired: dict[str, int] = {}
+        desired: dict[str, tuple[int, str | None]] = {}
         for task_name, task_cfg in cfg.tasks.items():
             if task_cfg.host is None:
                 continue
             port = sup.assigned_ports.get(task_name)
             if task_name in running_windows and port is not None:
-                desired[task_cfg.host] = port
+                desired[task_cfg.host] = (port, task_name)
         for alias_entry in _loadAliases(sup.config.name, sup.worktree_id).values():
-            desired[alias_entry["host"]] = alias_entry["port"]
+            desired[alias_entry["host"]] = (alias_entry["port"], None)
 
         if self.proxy is not None:
             snapshot = (
@@ -1044,8 +1069,8 @@ class TaskmuxDaemon:
             for host in existing - desired.keys():
                 self.proxy.drop_route(session, host)
                 dropped.append(host)
-            for host, port in desired.items():
-                self.proxy.set_route(session, host, port)
+            for host, (port, task_name) in desired.items():
+                self.proxy.set_route(session, host, port, task=task_name)
                 added.append(host)
         else:
             added.extend(desired.keys())
@@ -1102,6 +1127,8 @@ class TaskmuxDaemon:
     # ---- health loop ----
 
     async def _health_check_loop(self) -> None:
+        if self._health_wakeup is None:
+            self._health_wakeup = asyncio.Event()
         while self.running:
             try:
                 async with self._lock:
@@ -1119,12 +1146,63 @@ class TaskmuxDaemon:
                     payload = await self._aggregate_status()
                     await self._broadcast_to_clients({"type": "health_check", "data": payload})
 
-                await asyncio.sleep(self.health_check_interval)
+                # Interruptible sleep — proxy ECONNREFUSED / other prompt
+                # signals call _wake_health_loop() to fire a fresh sweep
+                # within seconds rather than waiting out health_check_interval.
+                # When any project has a host-bound TCP-only task, cap the
+                # cadence at HOST_BOUND_TCP_INTERVAL so a port that dies with
+                # no follow-up proxy traffic is still caught within seconds.
+                self._health_wakeup.clear()
+                timeout = self._next_sweep_timeout(snapshot)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._health_wakeup.wait(), timeout=timeout)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
                 self.logger.error(f"Health check loop error: {e}")
                 await asyncio.sleep(5)
+
+    # Floor for the periodic health-loop cadence when any project has a
+    # running host-bound TCP-only task. Picked to match the user-facing
+    # "few-second" detection window in the original bug report.
+    HOST_BOUND_TCP_INTERVAL = 5
+
+    def _next_sweep_timeout(self, snapshot: list[tuple[str, Supervisor]]) -> float:
+        """Pick the next periodic-sweep cadence.
+
+        Default = global `health_check_interval` (30 s by default). When any
+        project has a running host-bound task without an explicit
+        `health_url` / `health_check`, drop to `HOST_BOUND_TCP_INTERVAL` so
+        a port that dies with no follow-up proxy request is still detected
+        within seconds.
+        """
+        base = float(self.health_check_interval)
+        for session, sup in snapshot:
+            cfg = self.configs.get(session)
+            if cfg is None:
+                continue
+            for task_name, task_cfg in cfg.tasks.items():
+                if task_cfg.host is None:
+                    continue
+                if task_cfg.health_url is not None or task_cfg.health_check is not None:
+                    continue
+                tasks = getattr(sup, "_tasks", None)
+                if tasks is None or task_name not in tasks:
+                    continue
+                return min(base, float(self.HOST_BOUND_TCP_INTERVAL))
+        return base
+
+    def _wake_health_loop(self) -> None:
+        """Wake the health-check sleep so the next sweep runs immediately.
+
+        Safe from any thread / sync context — schedules the set() onto the
+        daemon loop. No-op if the loop or event isn't ready yet.
+        """
+        loop = self._loop
+        ev = self._health_wakeup
+        if loop is None or ev is None:
+            return
+        loop.call_soon_threadsafe(ev.set)
 
     # ---- WebSocket API ----
 

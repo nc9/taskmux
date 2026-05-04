@@ -85,6 +85,8 @@ class TaskConfig(_StrictConfig):
     health_interval: int = 10
     health_timeout: int = 5
     health_retries: int = 3
+    health_retries_tcp: int = 1
+    boot_grace: int = 10
     stop_grace_period: int = 5
     max_restarts: int = 5
     restart_backoff: float = 2.0

@@ -3,7 +3,7 @@
 Daemon owns the lifecycle. Routes and SNI certs are mutated via:
   - register_project(project, cert, key)
   - unregister_project(project)
-  - set_route(project, host, port)
+  - set_route(project, host, port, task=None)
   - drop_route(project, host)
 """
 
@@ -13,6 +13,7 @@ import asyncio
 import logging
 import socket
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -84,10 +85,18 @@ class ProxyServer:
         self._socks: list[socket.socket] = list(socks) if socks else []
         self.logger = logging.getLogger("taskmux-daemon.proxy")
         self._routes: dict[tuple[str, str], int] = {}
+        # Reverse map for diagnostics + on_upstream_dead notifications. Aliases
+        # set a route without a task name; the diagnostic falls back to the
+        # host display in that case.
+        self._route_tasks: dict[tuple[str, str], str] = {}
         self._projects: dict[str, _ProjectCert] = {}
         self._runner: web.AppRunner | None = None
         self._sites: list[web.BaseSite] = []
         self._default_ctx: ssl.SSLContext | None = None
+        # Hook fired when forwarding hits a connection-refused error. The
+        # daemon wires this to supervisor.notify_upstream_dead so the cache
+        # invalidates immediately on the next status / health tick.
+        self.on_upstream_dead: Callable[[str, str, str | None], None] | None = None
 
     # ---- public mutators ----
 
@@ -103,12 +112,18 @@ class ProxyServer:
         self._projects.pop(project, None)
         for key in [k for k in self._routes if k[0] == project]:
             self._routes.pop(key, None)
+            self._route_tasks.pop(key, None)
 
-    def set_route(self, project: str, host: str, port: int) -> None:
+    def set_route(self, project: str, host: str, port: int, task: str | None = None) -> None:
         self._routes[(project, host)] = port
+        if task is not None:
+            self._route_tasks[(project, host)] = task
+        else:
+            self._route_tasks.pop((project, host), None)
 
     def drop_route(self, project: str, host: str) -> None:
         self._routes.pop((project, host), None)
+        self._route_tasks.pop((project, host), None)
 
     def routes_snapshot(self) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
@@ -195,18 +210,39 @@ class ProxyServer:
         # Lookup precedence: exact (project, host) → wildcard (project, "*").
         # Apex queries arrive with host == "" and never fall through to "*".
         port = self._routes.get((project, host))
+        matched_host = host
         if port is None and host != "":
             port = self._routes.get((project, "*"))
+            if port is not None:
+                matched_host = "*"
         if port is None:
             display = f"{host}.{project}.localhost" if host else f"{project}.localhost"
-            return web.Response(status=502, text=f"no upstream for {display}\n")
+            # 503 (not 502): nothing is wired here, so it's a configuration /
+            # lifecycle issue the user should resolve, not a transient
+            # upstream failure.
+            return web.Response(
+                status=503,
+                text=(
+                    f"taskmux: no upstream for {display}\n"
+                    f"  hint: run `taskmux start <task>` for the host '{host or '@'}' "
+                    f"in project '{project}'.\n"
+                ),
+            )
 
+        task = self._route_tasks.get((project, matched_host))
         # WebSocket upgrade?
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return await self._proxy_ws(request, port)
-        return await self._proxy_http(request, port)
+        return await self._proxy_http(request, port, project=project, task=task)
 
-    async def _proxy_http(self, request: web.Request, port: int) -> web.StreamResponse:
+    async def _proxy_http(
+        self,
+        request: web.Request,
+        port: int,
+        *,
+        project: str | None = None,
+        task: str | None = None,
+    ) -> web.StreamResponse:
         # Use `localhost` not `127.0.0.1` so the resolver picks IPv4 / IPv6 to
         # match whichever family the upstream actually bound (Vite + many Node
         # tools default to ::1; Python http.server defaults to 0.0.0.0).
@@ -233,6 +269,31 @@ class ProxyServer:
                         await response.write(chunk)
                     await response.write_eof()
                     return response
+            except aiohttp.ClientConnectorError as e:
+                # Upstream is wired but not answering — task crashed, hung, or
+                # never bound the port. Notify the supervisor so the cache
+                # invalidates immediately and the next health tick acts on
+                # fresh state. Return 503 with a directly-actionable hint.
+                cb = self.on_upstream_dead
+                if cb is not None and project is not None:
+                    try:
+                        cb(project, "", task)
+                    except Exception:  # noqa: BLE001
+                        self.logger.warning("on_upstream_dead callback raised", exc_info=True)
+                label = task or f"port {port}"
+                hint = (
+                    f"`taskmux restart {task}`"
+                    if task
+                    else f"checking the task bound to port {port}"
+                )
+                return web.Response(
+                    status=503,
+                    text=(
+                        f"taskmux: upstream {label} not responding on port {port}\n"
+                        f"  hint: try {hint}.\n"
+                        f"  detail: {e}\n"
+                    ),
+                )
             except aiohttp.ClientError as e:
                 return web.Response(status=502, text=f"upstream error: {e}\n")
 

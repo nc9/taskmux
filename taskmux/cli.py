@@ -794,9 +794,20 @@ def _status():
 
     fail_rows: list[tuple[str, str, str]] = []
     for t in tasks:
-        health_icon = "G" if t["healthy"] else "R" if t["running"] else "o"
-        icon_style = "green" if t["healthy"] else "red" if t["running"] else "dim"
-        status_text = "Healthy" if t["healthy"] else "Running" if t["running"] else "Stopped"
+        # `state` is the post-fix source of truth; legacy running/healthy are
+        # kept in the payload for back-compat with JSON consumers but the table
+        # uses state directly so "Starting" and "Unhealthy" are surfaced.
+        state = t.get("state") or (
+            "running" if t.get("healthy") else "unhealthy" if t.get("running") else "stopped"
+        )
+        if state == "running":
+            health_icon, icon_style, status_text = "G", "green", "Healthy"
+        elif state == "starting":
+            health_icon, icon_style, status_text = "~", "yellow", "Starting"
+        elif state == "unhealthy":
+            health_icon, icon_style, status_text = "X", "red", "Unhealthy"
+        else:
+            health_icon, icon_style, status_text = "o", "dim", "Stopped"
         notes: list[str] = []
         if not t["auto_start"]:
             notes.append("manual")

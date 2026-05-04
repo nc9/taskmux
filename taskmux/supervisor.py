@@ -329,6 +329,8 @@ class Supervisor(Protocol):
     def get_task_status(self, task_name: str) -> dict: ...
     def check_health(self, task_name: str) -> HealthResult: ...
     def is_task_healthy(self, task_name: str) -> bool: ...
+    def probe_upstream(self, task_name: str) -> HealthResult: ...
+    def notify_upstream_dead(self, task_name: str) -> None: ...
     def getLogPath(self, task_name: str) -> Path | None: ...
     def reload_state(self) -> None: ...
 
@@ -366,6 +368,9 @@ class PosixSupervisor:
         self.restart_tracker = RestartTracker()
         self.assigned_ports: dict[str, int] = self._load_state()
         self.on_task_route_change: Callable[[str, str, str, int | None], None] | None = None
+        # Short-lived TCP-probe cache (per-task). Used by status display +
+        # proxy hot path; the 1.5 s TTL keeps us from hammering localhost.
+        self._upstream_cache: dict[str, HealthResult] = {}
 
     def _lock_for(self, task_name: str) -> asyncio.Lock:
         lock = self._task_locks.get(task_name)
@@ -919,16 +924,42 @@ class PosixSupervisor:
 
     def get_task_status(self, task_name: str) -> dict:
         task_cfg = self.config.tasks.get(task_name)
+        running = task_name in self._tasks
         status: dict[str, str | bool] = {
             "name": task_name,
-            "running": task_name in self._tasks,
+            "running": running,
             "healthy": False,
+            "state": "stopped",
             "command": task_cfg.command if task_cfg else "",
             "last_check": datetime.now().isoformat(),
         }
-        if status["running"]:
+        if running:
             status["healthy"] = self.is_task_healthy(task_name)
+            status["state"] = self._compute_state(task_name, task_cfg, bool(status["healthy"]))
         return status
+
+    def _compute_state(self, task_name: str, task_cfg: TaskConfig | None, healthy: bool) -> str:
+        """Map (running, healthy, host, boot window) → state label.
+
+        - host-bound, port not answering, within boot_grace → "starting"
+        - port answering (or no host)                       → "running"
+        - host-bound, port not answering, past boot_grace   → "unhealthy"
+
+        When the user configured an explicit `health_url` / `health_check`,
+        that probe's verdict wins — `healthy=False` from a 500 response or a
+        failing shell check must not be masked by an open TCP port.
+        """
+        if task_cfg is None or task_cfg.host is None:
+            return "running" if healthy else "unhealthy"
+        if task_cfg.health_url is not None or task_cfg.health_check is not None:
+            return "running" if healthy else "unhealthy"
+        probe = self.probe_upstream(task_name)
+        if probe.ok:
+            return "running"
+        tp = self._tasks.get(task_name)
+        if tp is not None and time.time() - tp.started_at < task_cfg.boot_grace:
+            return "starting"
+        return "unhealthy"
 
     def inspect_task(self, task_name: str) -> dict:
         from .global_config import loadGlobalConfig
@@ -999,6 +1030,7 @@ class PosixSupervisor:
                     "name": task_name,
                     "running": status["running"],
                     "healthy": status["healthy"],
+                    "state": status["state"],
                     "command": task_cfg.command,
                     "auto_start": task_cfg.auto_start,
                     "host": task_cfg.host,
@@ -1053,6 +1085,36 @@ class PosixSupervisor:
         except (TimeoutError, OSError) as e:
             return HealthResult(False, "tcp", f"connect refused: {e}", now)
 
+    def probe_upstream(self, task_name: str) -> HealthResult:
+        """Cached TCP probe of a host-bound task's assigned port.
+
+        The proxy hot path and `taskmux status` both ask this question; the 1.5 s
+        cache keeps us from opening a fresh socket per HTTP request while still
+        catching a dead upstream within ~2 s. Returns a `no_host` result for
+        tasks that don't have a host/port — caller distinguishes from a real
+        TCP failure.
+        """
+        cfg = self.config.tasks.get(task_name)
+        port = self.assigned_ports.get(task_name)
+        now = time.time()
+        if cfg is None or cfg.host is None or port is None:
+            return HealthResult(False, "no_host", "no host/port for task", now)
+        cached = self._upstream_cache.get(task_name)
+        if cached is not None and now - cached.at < 1.5:
+            return cached
+        result = self._probe_tcp(port, 0.5)
+        self._upstream_cache[task_name] = result
+        return result
+
+    def notify_upstream_dead(self, task_name: str) -> None:
+        """Proxy → supervisor hook when forwarding hits ECONNREFUSED.
+
+        Invalidates the cache so the next status check / health tick picks up
+        the dead state immediately rather than waiting out the 1.5 s TTL.
+        Restart decisions stay owned by `auto_restart_tasks` under its lock.
+        """
+        self._upstream_cache.pop(task_name, None)
+
     def _probe_shell(self, command: str, timeout: float) -> HealthResult:
         now = time.time()
         try:
@@ -1085,7 +1147,9 @@ class PosixSupervisor:
         elif task_cfg.health_check:
             result = self._probe_shell(task_cfg.health_check, timeout)
         elif task_cfg.host is not None and assigned_port is not None:
-            result = self._probe_tcp(assigned_port, timeout)
+            # Route the host-bound TCP path through probe_upstream so the proxy
+            # hot path and `taskmux status` share a single 1.5 s cache window.
+            result = self.probe_upstream(task_name)
         else:
             ok = task_name in self._tasks
             result = HealthResult(ok, "proc", None if ok else "process not running", now)
@@ -1136,7 +1200,23 @@ class PosixSupervisor:
                     task=task_name,
                     attempt=failures,
                 )
-                if failures >= task_cfg.health_retries:
+                # Host-bound TCP failures past the boot grace window are
+                # unambiguous — one miss is enough. The general HTTP/shell path
+                # keeps `health_retries` (default 3) for tolerance to flapping
+                # apps, since those probes return false-negatives more often.
+                tp = self._tasks.get(task_name)
+                past_boot = tp is not None and now - tp.started_at >= task_cfg.boot_grace
+                tcp_only = (
+                    task_cfg.host is not None
+                    and task_cfg.health_url is None
+                    and task_cfg.health_check is None
+                )
+                threshold = (
+                    task_cfg.health_retries_tcp
+                    if tcp_only and past_boot
+                    else task_cfg.health_retries
+                )
+                if failures >= threshold:
                     should_restart = True
 
             if not should_restart:

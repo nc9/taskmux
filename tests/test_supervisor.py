@@ -705,6 +705,184 @@ class TestAutoRestart:
             _run(sup.auto_restart_tasks())
             m.assert_not_called()
 
+    def test_tcp_failure_past_boot_grace_restarts_after_one_miss(self, tmp_path):
+        """Host-bound TCP probe failure past boot_grace fires after a single miss
+        (health_retries_tcp=1), not the general health_retries=3."""
+        cfg = _make_config(
+            tasks={
+                "web": {
+                    "command": "echo",
+                    "host": "web",
+                    "restart_policy": RestartPolicy.ON_FAILURE,
+                    "boot_grace": 0,  # past boot immediately
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        # Simulate live process record + closed port → TCP probe fails.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        sup.assigned_ports["web"] = port
+        # Fake "process alive" so we go down the health-retry branch, not the
+        # process-dead branch.
+        fake_proc = MagicMock()
+        fake_proc.started_at = 0.0
+        sup._tasks["web"] = fake_proc
+
+        async def _ok(_name):
+            return {"ok": True}
+
+        with patch.object(sup, "_restart_task_locked", side_effect=_ok) as m:
+            _run(sup.auto_restart_tasks())
+            m.assert_called_once_with("web")
+
+    def test_tcp_failure_within_boot_grace_does_not_restart(self, tmp_path):
+        cfg = _make_config(
+            tasks={
+                "web": {
+                    "command": "echo",
+                    "host": "web",
+                    "restart_policy": RestartPolicy.ON_FAILURE,
+                    "boot_grace": 60,
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        sup.assigned_ports["web"] = port
+        fake_proc = MagicMock()
+        import time as _t
+
+        fake_proc.started_at = _t.time()  # just spawned
+        sup._tasks["web"] = fake_proc
+
+        with patch.object(sup, "_restart_task_locked") as m:
+            _run(sup.auto_restart_tasks())
+            # Within boot_grace + health_retries=3, one miss is not enough.
+            m.assert_not_called()
+
+
+class TestProbeUpstreamCache:
+    """probe_upstream caches results for 1.5 s and respects cache invalidation."""
+
+    def test_no_host_or_port_returns_no_host(self, tmp_path):
+        cfg = _make_config(tasks={"web": "echo"})
+        sup = _make_supervisor(cfg, tmp_path)
+        result = sup.probe_upstream("web")
+        assert not result.ok and result.method == "no_host"
+
+    def test_cache_hit(self, tmp_path):
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        sup = _make_supervisor(cfg, tmp_path)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        sup.assigned_ports["web"] = port
+
+        first = sup.probe_upstream("web")
+        with patch.object(sup, "_probe_tcp") as m:
+            second = sup.probe_upstream("web")
+            m.assert_not_called()
+        assert second is first
+
+    def test_notify_upstream_dead_invalidates(self, tmp_path):
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        sup = _make_supervisor(cfg, tmp_path)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        sup.assigned_ports["web"] = port
+
+        sup.probe_upstream("web")
+        sup.notify_upstream_dead("web")
+        with patch.object(
+            sup, "_probe_tcp", return_value=HealthResult(False, "tcp", "x", 0.0)
+        ) as m:
+            sup.probe_upstream("web")
+            m.assert_called_once()
+
+
+class TestStatusState:
+    """get_task_status emits a `state` field that distinguishes
+    starting / running / unhealthy / stopped."""
+
+    def test_stopped_when_not_running(self, tmp_path):
+        cfg = _make_config(tasks={"web": "echo"})
+        sup = _make_supervisor(cfg, tmp_path)
+        st = sup.get_task_status("web")
+        assert st["state"] == "stopped"
+        assert st["running"] is False
+
+    def test_running_when_no_host_and_alive(self, tmp_path):
+        cfg = _make_config(tasks={"web": "echo"})
+        sup = _make_supervisor(cfg, tmp_path)
+        sup._tasks["web"] = MagicMock()  # is_task_healthy → proc-alive → ok
+        st = sup.get_task_status("web")
+        assert st["state"] == "running"
+
+    def test_starting_when_within_boot_grace_and_port_dead(self, tmp_path):
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web", "boot_grace": 60}})
+        sup = _make_supervisor(cfg, tmp_path)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        sup.assigned_ports["web"] = port
+        import time as _t
+
+        proc = MagicMock()
+        proc.started_at = _t.time()
+        sup._tasks["web"] = proc
+        st = sup.get_task_status("web")
+        assert st["state"] == "starting"
+
+    def test_unhealthy_when_past_boot_grace_and_port_dead(self, tmp_path):
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web", "boot_grace": 0}})
+        sup = _make_supervisor(cfg, tmp_path)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        sup.assigned_ports["web"] = port
+        proc = MagicMock()
+        proc.started_at = 0.0
+        sup._tasks["web"] = proc
+        st = sup.get_task_status("web")
+        assert st["state"] == "unhealthy"
+
+    def test_explicit_health_check_failure_is_not_masked_by_open_port(self, http_server, tmp_path):
+        """A failing health_url must dominate state even if the TCP port is open.
+
+        Regression guard: an early version of _compute_state probed TCP
+        unconditionally for host-bound tasks and would mark a task `running`
+        whose configured HTTP probe was returning 500.
+        """
+        port, handler = http_server
+        handler.status = 500  # http_server is up (port open) but probe fails
+        cfg = _make_config(
+            tasks={
+                "web": {
+                    "command": "echo",
+                    "host": "web",
+                    "health_url": f"http://127.0.0.1:{port}/",
+                    "boot_grace": 0,
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.assigned_ports["web"] = port  # TCP probe would pass
+        sup._tasks["web"] = MagicMock()
+        st = sup.get_task_status("web")
+        assert st["healthy"] is False
+        assert st["state"] == "unhealthy"
+
 
 # ---------------------------------------------------------------------------
 # Factory

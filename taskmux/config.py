@@ -261,6 +261,10 @@ def writeConfig(path: Path | None, config: TaskmuxConfig) -> Path:
             inner.add("health_timeout", task_cfg.health_timeout)
         if task_cfg.health_retries != 3:
             inner.add("health_retries", task_cfg.health_retries)
+        if task_cfg.health_retries_tcp != 1:
+            inner.add("health_retries_tcp", task_cfg.health_retries_tcp)
+        if task_cfg.boot_grace != 10:
+            inner.add("boot_grace", task_cfg.boot_grace)
         if task_cfg.stop_grace_period != 5:
             inner.add("stop_grace_period", task_cfg.stop_grace_period)
         if task_cfg.max_restarts != 5:
