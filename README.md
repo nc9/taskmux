@@ -97,7 +97,7 @@ Aliases (external routes):
 - **Event history** — lifecycle events (start, stop, health failure, auto-restart, max-restarts-reached) appended to `~/.taskmux/events.jsonl`. Filter by task / time / event type.
 - **Health checks** — `health_url` (HTTP probe), `health_check` (shell exit code), or auto TCP probe for host-routed tasks. Retries gate dependents and trigger auto-restart.
 - **Agent context injection** — `taskmux init` patches a thin task table + pointer into the project's `CLAUDE.md` / `AGENTS.md`; re-rendered on every `taskmux add` / `remove` so agents never see a stale list. Pair with the [taskmux skill](#agent-skill) for cross-agent CLI guidance.
-- **MCP server (push notifications)** — daemon hosts a Model Context Protocol server at `http://localhost:{api_port}/mcp` (Streamable HTTP). MCP-aware agents (Claude Code, Cursor, Codex, Continue) get `taskmux_status`/`logs`/`restart` tools and live `notifications/message` events when tasks crash, restart, or fail health checks. Wire up with `taskmux mcp install <client>`. See [MCP integration](#mcp-integration).
+- **MCP server (push notifications)** — daemon hosts a Model Context Protocol server at `http://localhost:{api_port}/mcp` (Streamable HTTP). MCP-aware agents (Claude Code, Cursor, Codex, OpenCode) get `taskmux_status`/`logs`/`restart` tools and live `notifications/message` events when tasks crash, restart, or fail health checks. Wire up with `taskmux mcp install <client>`. See [MCP integration](#mcp-integration).
 
 ### Process supervision
 
@@ -130,7 +130,7 @@ npx skills add nc9/taskmux --skill taskmux -g
 
 `taskmux init` patches a small marked block (`<!-- taskmux:start --> ... <!-- taskmux:end -->`) into the project's existing `CLAUDE.md` and/or `AGENTS.md`. The block lists current tasks + URLs and points the agent at `taskmux --json status` / `inspect` / `logs`.
 
-The block also re-renders automatically on every `taskmux add` / `taskmux remove`, so the agent context never drifts from the live task list. Disable per-project in `taskmux.toml`:
+The block also re-renders automatically on every `taskmux add` / `taskmux remove`, so the agent context never drifts from the live task list. To pull in fresh wording after upgrading taskmux (new MCP pointers, skill hints, etc.) without churning a task, run `taskmux inject` — interactive checkbox by default (pre-checks files that already exist), or pass `CLAUDE.md` / `AGENTS.md` / `all`. Disable per-project in `taskmux.toml`:
 
 ```toml
 auto_inject_agents = false
@@ -183,6 +183,9 @@ taskmux add api "next dev" --host api  # expose at https://api.{project}.localho
 taskmux remove <task>            # remove task (kills if running)
 taskmux init                     # create taskmux.toml + inject agent context
 taskmux init --defaults          # non-interactive
+taskmux inject                   # refresh CLAUDE.md / AGENTS.md block
+                                 #   (or create them if missing)
+taskmux inject --print           # render block to stdout, no write
 
 # URLs / proxy
 taskmux url <name>               # print proxy URL for a task or alias
