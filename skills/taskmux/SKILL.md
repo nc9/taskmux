@@ -93,10 +93,13 @@ taskmux tunnel logs [cloudflare] [--follow]
 
 ```bash
 # Status with proxy reachability
-taskmux status --json | jq '{tasks: [.tasks[] | {name, healthy, url, last_health}], proxy}'
+taskmux status --json | jq '{tasks: [.tasks[] | {name, state, url, last_health}], proxy}'
 
-# Find unhealthy (proxy-down counts here too — last_health.method == "proxy")
-taskmux status --json | jq '.tasks[] | select(.healthy == false)'
+# Each task has a `state`: "running" | "starting" | "unhealthy" | "stopped".
+# `starting` = process up but TCP port not yet bound, within boot_grace (default 10s).
+# `unhealthy` = past boot_grace AND port not answering (or configured probe failing).
+# Find anything not currently serving traffic:
+taskmux status --json | jq '.tasks[] | select(.state != "running")'
 
 # Why did a task fail?
 taskmux inspect <task> --json
