@@ -2790,51 +2790,62 @@ _CLIENT_PATH_HINTS = {
 }
 
 
+_PROJECT_SCOPED_CLIENTS = ("claude-project", "codex-project")
+
+
 def _interactiveSelectClients() -> list[str]:
-    """Numeric multi-select for `taskmux mcp install` with no client arg.
+    """Arrow-key checkbox multi-select for `taskmux mcp install`.
+
+    Project-scoped clients (write into <cwd>) are pre-checked since that's
+    the recommended path. User-global clients sit below a separator and
+    require explicit opt-in (they expose every project on the host to the
+    agent — fine for a personal admin client, noisy/leaky as a default).
 
     Returns the chosen client names. Empty list = user picked nothing
-    (caller aborts). "a"/"all"/empty input → every supported client.
+    (caller aborts). Cancelled prompt (Ctrl-C / EOF) → empty list.
     """
+    import questionary
+    from questionary import Choice, Separator, Style
+
     from .mcp.install import ALL_CLIENTS
 
-    console.print("\n[bold]Which coding agents to install taskmux MCP for?[/bold]\n")
-    for i, c in enumerate(ALL_CLIENTS, 1):
-        hint = _CLIENT_PATH_HINTS.get(c, "")
-        console.print(f"  [bold]{i:>2})[/bold]  {c:<16} [dim]{hint}[/dim]")
-    console.print("   [bold] a)[/bold]  all\n")
-
-    raw = (
-        typer.prompt(
-            "Select (e.g. '2,5' or 'a' for all)",
-            default="a",
-        )
-        .strip()
-        .lower()
+    style = Style(
+        [
+            ("qmark", "fg:#5f87ff bold"),
+            ("question", "bold"),
+            ("instruction", "fg:#888888"),
+            ("pointer", "fg:#ff5f5f bold"),
+            ("highlighted", "fg:#ffffff bold noreverse"),
+            ("selected", "fg:#00d75f bold noreverse"),
+            ("text", "fg:#888888 noreverse"),
+            ("answer", "fg:#00d75f bold"),
+            ("separator", "fg:#5f5f5f"),
+            ("disabled", "fg:#444444"),
+        ]
     )
-    if raw in ("a", "all", ""):
-        return list(ALL_CLIENTS)
 
-    selected: list[str] = []
-    seen: set[str] = set()
-    for tok in raw.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            idx = int(tok)
-        except ValueError:
-            console.print(f"[yellow]Skipping invalid selection: {tok!r}[/yellow]")
-            continue
-        if not (1 <= idx <= len(ALL_CLIENTS)):
-            console.print(f"[yellow]Skipping out-of-range selection: {idx}[/yellow]")
-            continue
-        name = ALL_CLIENTS[idx - 1]
-        if name in seen:
-            continue
-        seen.add(name)
-        selected.append(name)
-    return selected
+    project_scoped = [c for c in _PROJECT_SCOPED_CLIENTS if c in ALL_CLIENTS]
+    user_global = [c for c in ALL_CLIENTS if c not in _PROJECT_SCOPED_CLIENTS]
+
+    def mkChoice(c: str, *, checked: bool) -> Choice:
+        return Choice(
+            title=f"{c:<16}  {_CLIENT_PATH_HINTS.get(c, '')}",
+            value=c,
+            checked=checked,
+        )
+
+    choices: list[Choice | Separator] = [Separator("── project-scoped (recommended) ──")]
+    choices.extend(mkChoice(c, checked=True) for c in project_scoped)
+    choices.append(Separator("── user-global (every project on this host) ──"))
+    choices.extend(mkChoice(c, checked=False) for c in user_global)
+
+    answer = questionary.checkbox(
+        "Install taskmux MCP for which coding agents?",
+        choices=choices,
+        instruction="(↑↓ move · space toggles · enter confirms)",
+        style=style,
+    ).ask()
+    return list(answer) if answer else []
 
 
 def _hoist_global_flags(argv: list[str]) -> list[str]:

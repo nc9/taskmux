@@ -631,8 +631,8 @@ class TestMcpInstall:
         assert (proj / ".codex" / "config.toml").exists()
 
     def test_bare_install_interactive_multi_select(self, tmp_path: Path, monkeypatch):
-        """TTY path: isatty stubbed True, stdin pipes '2,5' → installs
-        claude-project (idx 2) + codex-project (idx 5) only."""
+        """TTY path: questionary checkbox stubbed to return a subset →
+        only those clients get installed."""
         from taskmux import cli as _cli
 
         proj = tmp_path / "p"
@@ -641,8 +641,13 @@ class TestMcpInstall:
         monkeypatch.chdir(proj)
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
         monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
+        monkeypatch.setattr(
+            _cli,
+            "_interactiveSelectClients",
+            lambda: ["claude-project", "codex-project"],
+        )
 
-        result = runner.invoke(app, ["mcp", "install"], input="2,5\n")
+        result = runner.invoke(app, ["mcp", "install"])
         assert result.exit_code == 0, result.output
 
         # claude-project + codex-project written
@@ -652,8 +657,29 @@ class TestMcpInstall:
         assert not (tmp_path / "fake-home" / ".claude" / "settings.json").exists()
         assert not (tmp_path / "fake-home" / ".cursor" / "mcp.json").exists()
 
-    def test_bare_install_interactive_all_keyword(self, tmp_path: Path, monkeypatch):
-        """User types 'a' → install all clients."""
+    def test_bare_install_interactive_all_default(self, tmp_path: Path, monkeypatch):
+        """Confirming the prompt with everything checked → install all."""
+        from taskmux import cli as _cli
+        from taskmux.mcp.install import ALL_CLIENTS
+
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
+        monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
+        monkeypatch.setattr(_cli, "_interactiveSelectClients", lambda: list(ALL_CLIENTS))
+
+        result = runner.invoke(app, ["mcp", "install"])
+        assert result.exit_code == 0, result.output
+
+        # User-global + project targets all written
+        assert (tmp_path / "fake-home" / ".claude" / "settings.json").exists()
+        assert (proj / ".mcp.json").exists()
+        assert (proj / ".codex" / "config.toml").exists()
+
+    def test_bare_install_interactive_cancelled(self, tmp_path: Path, monkeypatch):
+        """Empty selection (Ctrl-C / no boxes ticked) → exit 1, no writes."""
         from taskmux import cli as _cli
 
         proj = tmp_path / "p"
@@ -662,11 +688,8 @@ class TestMcpInstall:
         monkeypatch.chdir(proj)
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "fake-home")
         monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
+        monkeypatch.setattr(_cli, "_interactiveSelectClients", lambda: [])
 
-        result = runner.invoke(app, ["mcp", "install"], input="a\n")
-        assert result.exit_code == 0, result.output
-
-        # User-global + project targets all written
-        assert (tmp_path / "fake-home" / ".claude" / "settings.json").exists()
-        assert (proj / ".mcp.json").exists()
-        assert (proj / ".codex" / "config.toml").exists()
+        result = runner.invoke(app, ["mcp", "install"])
+        assert result.exit_code == 1
+        assert not (proj / ".mcp.json").exists()
