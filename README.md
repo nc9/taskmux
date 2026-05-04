@@ -575,9 +575,9 @@ The daemon hosts a Model Context Protocol server at `http://localhost:{api_port}
 ```bash
 # From inside a project dir — auto-detects session.
 # Omit the client name for an interactive multi-select prompt:
-taskmux mcp install                              # → numbered list, pick which agents
+taskmux mcp install                              # → arrow-key checkbox; project-scoped pre-checked
 taskmux mcp install claude
-taskmux mcp install all                          # claude, claude-project, cursor, codex, codex-project, continue
+taskmux mcp install all                          # claude, claude-project, cursor, cursor-project, codex, codex-project, opencode, opencode-project
 taskmux mcp install --print                      # dry-run preview
 
 # Override or opt out
@@ -591,11 +591,13 @@ taskmux mcp status                               # daemon endpoint, per-session 
 ```
 
 **Project-scoped vs user-global**: every target has a sensible default. The
-`-project` variants (`claude-project` → `.mcp.json`, `codex-project` →
-`.codex/config.toml`) write to per-project files so the `?session=` pin
-stays bound to that project. The plain targets (`claude`, `cursor`,
-`codex`, `continue`) write to user-global config — convenient but every
-agent session on the host shares the same pin until reinstalled.
+`-project` variants (`claude-project` → `.mcp.json`, `cursor-project` →
+`.cursor/mcp.json`, `codex-project` → `.codex/config.toml`,
+`opencode-project` → `opencode.json`) write to per-project files so the
+`?session=` pin stays bound to that project. The plain targets (`claude`,
+`cursor`, `codex`, `opencode`) write to user-global config — convenient
+but every agent session on the host shares the same pin until
+reinstalled, so they're discouraged.
 
 Running `taskmux mcp install` outside any taskmux project errors with a hint — the fail-closed default keeps an agent scoped to one project unless you opt out explicitly.
 

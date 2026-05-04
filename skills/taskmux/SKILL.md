@@ -240,14 +240,20 @@ project. Use these only for diagnostic / dotfiles-style clients.
 
 ```bash
 # From inside a project dir — auto-detects session from taskmux.toml.
-# Omit the client name to get a multi-select prompt:
+# Omit the client name for an arrow-key checkbox prompt. Project-scoped
+# targets (claude-project, cursor-project, codex-project) are pre-checked
+# above a separator; user-global targets sit below as opt-in:
 taskmux mcp install
-#   1) claude          ~/.claude/settings.json (user-global)
-#   2) claude-project  <project>/.mcp.json (project-shared)
-#   3) cursor          ~/.cursor/mcp.json (user-global)
-#   4) codex           ~/.codex/config.toml (user-global)
-#   5) codex-project   <project>/.codex/config.toml (project-shared)
-#   6) continue        ~/.continue/config.json (user-global)
+#   ── project-scoped (recommended) ──
+#   ● claude-project    <project>/.mcp.json
+#   ● cursor-project    <project>/.cursor/mcp.json
+#   ● codex-project     <project>/.codex/config.toml
+#   ● opencode-project  <project>/opencode.json
+#   ── user-global (host-wide, NOT recommended) ──
+#   ○ claude            ~/.claude/settings.json
+#   ○ cursor            ~/.cursor/mcp.json
+#   ○ codex             ~/.codex/config.toml
+#   ○ opencode          ~/.config/opencode/opencode.json
 
 # Or specify directly (any of the above, or `all`):
 taskmux mcp install claude-project
