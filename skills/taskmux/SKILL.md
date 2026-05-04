@@ -54,6 +54,8 @@ taskmux logs-clean [<task>]                 # alias for `clean --logs`
 # Config
 taskmux add <task> "<cmd>" [--host api]     # adds to taskmux.toml
 taskmux remove <task>
+taskmux inject [CLAUDE.md|AGENTS.md|all]    # refresh agent context block
+                                            #   (or create file if missing)
 
 # Aliases — proxy a non-taskmux port (Docker, external dev server)
 taskmux alias add <name> <port> [--host h]  # https://h.{project}.localhost

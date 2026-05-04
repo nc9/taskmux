@@ -14,7 +14,7 @@ import contextlib
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional  # noqa: UP035
+from typing import Any, List, Optional  # noqa: UP035
 
 import typer
 from rich.console import Console
@@ -212,6 +212,92 @@ def init(
                 "config_path": "taskmux.toml",
             }
         )
+
+
+@app.command()
+def inject(
+    target: str | None = typer.Argument(
+        None,
+        help=(
+            "Specific file to inject (CLAUDE.md, AGENTS.md, or all). "
+            "Omit for an interactive prompt that pre-checks files which "
+            "already exist."
+        ),
+    ),
+    print_only: bool = typer.Option(
+        False, "--print", help="Render the block to stdout, do not write."
+    ),
+):
+    """Refresh (or create) the taskmux context block in agent context files.
+
+    Updates `CLAUDE.md` / `AGENTS.md` at the project root: replaces the
+    `<!-- taskmux:start --> … <!-- taskmux:end -->` block in place when the
+    file already exists, creates the file with just the block when it
+    doesn't. Use this after upgrading taskmux to pull in new wording (MCP
+    pointers, skill hints, etc.) without churning a task add/remove.
+    """
+    from .agent import CONTEXT_FILES, buildContextBlock, injectIntoFile
+    from .errors import ErrorCode
+    from .mcp.install import detectProjectRootFromCwd
+
+    project_root = detectProjectRootFromCwd()
+    if project_root is None:
+        err = TaskmuxError(
+            ErrorCode.CONFIG_VALIDATION,
+            detail=("taskmux.toml not found in cwd or any ancestor — run `taskmux init` first."),
+        )
+        if is_json_mode():
+            print_error(err)
+        else:
+            console.print(f"[red]Error:[/red] {err}", style="red")
+        raise typer.Exit(1)
+    cli_local = TaskmuxCLI(config_path=project_root / "taskmux.toml")
+    config = cli_local.config
+
+    if print_only:
+        console.print(buildContextBlock(config), markup=False, highlight=False)
+        return
+
+    if target == "all":
+        files = list(CONTEXT_FILES)
+    elif target in CONTEXT_FILES:
+        files = [target]
+    elif target is None:
+        if is_json_mode() or not _stdinIsTty():
+            files = list(CONTEXT_FILES)
+        else:
+            files = _interactiveSelectContextFiles(project_root)
+            if not files:
+                console.print("[yellow]Nothing selected — aborting.[/yellow]")
+                raise typer.Exit(1)
+    else:
+        err = TaskmuxError(
+            ErrorCode.CONFIG_VALIDATION,
+            detail=(
+                f"unknown target {target!r}; expected one of {', '.join(CONTEXT_FILES)}, or 'all'."
+            ),
+        )
+        if is_json_mode():
+            print_error(err)
+        else:
+            console.print(f"[red]Error:[/red] {err}", style="red")
+        raise typer.Exit(1)
+
+    written: list[dict[str, Any]] = []
+    for name in files:
+        path = project_root / name
+        existed = path.exists()
+        injectIntoFile(path, config)
+        written.append({"path": str(path), "action": "updated" if existed else "created"})
+
+    if is_json_mode():
+        print_result({"ok": True, "wrote": written})
+        return
+
+    for entry in written:
+        action = entry["action"]
+        color = "cyan" if action == "updated" else "green"
+        console.print(f"[{color}]✓ {action}[/{color}] {entry['path']}")
 
 
 def _warn_unprivileged_daemon() -> None:
@@ -2906,6 +2992,56 @@ def _interactiveSelectClients(cwd: Path | None = None) -> list[str]:
         "Install taskmux MCP for which coding agents?",
         choices=choices,
         instruction="(↑↓ move · space toggles · enter confirms · auto-checked from local config)",
+        style=style,
+    ).ask()
+    return list(answer) if answer else []
+
+
+def _interactiveSelectContextFiles(project_root: Path) -> list[str]:
+    """Arrow-key checkbox for `taskmux inject` with no target arg.
+
+    Pre-checks the agent context files that already exist at project_root
+    (so "update what's there" is one keystroke). When neither file exists
+    both are pre-checked, so a fresh project gets both with a single
+    enter. Returns selected filenames; empty list = user cancelled.
+    """
+    import questionary
+    from questionary import Choice, Style
+
+    from .agent import CONTEXT_FILES
+
+    style = Style(
+        [
+            ("qmark", "fg:#5f87ff bold"),
+            ("question", "bold"),
+            ("instruction", "fg:#888888"),
+            ("pointer", "fg:#ff5f5f bold"),
+            ("highlighted", "fg:#ffffff bold noreverse"),
+            ("selected", "fg:#00d75f bold noreverse"),
+            ("text", "fg:#888888 noreverse"),
+            ("answer", "fg:#00d75f bold"),
+            ("disabled", "fg:#444444"),
+        ]
+    )
+
+    existing = {name for name in CONTEXT_FILES if (project_root / name).exists()}
+    defaults = existing if existing else set(CONTEXT_FILES)
+
+    choices = [
+        Choice(
+            title=(
+                f"{name:<10}  "
+                + ("[detected — will update]" if name in existing else "[will create]")
+            ),
+            value=name,
+            checked=name in defaults,
+        )
+        for name in CONTEXT_FILES
+    ]
+    answer = questionary.checkbox(
+        "Update which agent context files?",
+        choices=choices,
+        instruction="(↑↓ move · space toggles · enter confirms)",
         style=style,
     ).ask()
     return list(answer) if answer else []

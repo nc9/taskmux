@@ -137,6 +137,113 @@ class TestInitCommand:
         mock_init.assert_called_once_with(defaults=False)
 
 
+class TestInjectCommand:
+    """`taskmux inject` refreshes / creates the agent context block in
+    CLAUDE.md and AGENTS.md without going through `add`/`remove`."""
+
+    def test_inject_creates_both_files_when_missing(self, tmp_path: Path, monkeypatch):
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+
+        result = runner.invoke(app, ["inject", "all"])
+        assert result.exit_code == 0, result.output
+
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            text = (proj / name).read_text()
+            assert "<!-- taskmux:start -->" in text
+            assert "<!-- taskmux:end -->" in text
+            assert "# Taskmux — p" in text
+
+    def test_inject_replaces_existing_block_in_place(self, tmp_path: Path, monkeypatch):
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        (proj / "CLAUDE.md").write_text(
+            "# Project notes\n\nKeep me\n\n"
+            "<!-- taskmux:start -->\nstale block\n<!-- taskmux:end -->\n"
+        )
+        monkeypatch.chdir(proj)
+
+        result = runner.invoke(app, ["inject", "CLAUDE.md"])
+        assert result.exit_code == 0, result.output
+
+        text = (proj / "CLAUDE.md").read_text()
+        assert "Keep me" in text  # prior content preserved
+        assert "stale block" not in text  # old block replaced
+        assert "# Taskmux — p" in text  # fresh block in place
+        # Only one taskmux block — no duplicate appended.
+        assert text.count("<!-- taskmux:start -->") == 1
+
+    def test_inject_print_does_not_write(self, tmp_path: Path, monkeypatch):
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+
+        result = runner.invoke(app, ["inject", "--print"])
+        assert result.exit_code == 0
+        assert "<!-- taskmux:start -->" in result.output
+        assert not (proj / "CLAUDE.md").exists()
+        assert not (proj / "AGENTS.md").exists()
+
+    def test_inject_unknown_target_errors(self, tmp_path: Path, monkeypatch):
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(proj)
+
+        result = runner.invoke(app, ["inject", "GEMINI.md"])
+        assert result.exit_code != 0
+        assert "unknown target" in result.output
+
+    def test_inject_no_taskmux_toml_errors(self, tmp_path: Path, monkeypatch):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        monkeypatch.chdir(empty)
+
+        result = runner.invoke(app, ["inject"])
+        assert result.exit_code != 0
+        assert "taskmux.toml not found" in result.output
+
+    def test_inject_walks_up_to_project_root_from_subdir(self, tmp_path: Path, monkeypatch):
+        """Run from a deep subdir → inject still writes at the project
+        root (where `taskmux.toml` lives), not the cwd."""
+        proj = tmp_path / "p"
+        nested = proj / "src" / "deep"
+        nested.mkdir(parents=True)
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        monkeypatch.chdir(nested)
+
+        result = runner.invoke(app, ["inject", "CLAUDE.md"])
+        assert result.exit_code == 0, result.output
+        assert (proj / "CLAUDE.md").exists()
+        assert not (nested / "CLAUDE.md").exists()
+
+    def test_inject_interactive_prompt_pre_checks_existing(self, tmp_path: Path, monkeypatch):
+        """Interactive prompt: prefer the helper that picks files, mocked
+        to return only the existing one."""
+        from taskmux import cli as _cli
+
+        proj = tmp_path / "p"
+        proj.mkdir()
+        (proj / "taskmux.toml").write_text('name = "p"\n')
+        (proj / "CLAUDE.md").write_text("# notes\n")
+        monkeypatch.chdir(proj)
+        monkeypatch.setattr(_cli, "_stdinIsTty", lambda: True)
+        monkeypatch.setattr(
+            _cli,
+            "_interactiveSelectContextFiles",
+            lambda root: ["CLAUDE.md"],
+        )
+
+        result = runner.invoke(app, ["inject"])
+        assert result.exit_code == 0, result.output
+        assert (proj / "CLAUDE.md").exists()
+        assert not (proj / "AGENTS.md").exists()
+
+
 def _ipc_dispatch(command, params=None, **_):
     """Default fake ipc_client.call dispatch — returns ok results."""
     params = params or {}
