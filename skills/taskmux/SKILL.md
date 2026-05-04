@@ -206,6 +206,99 @@ When user says "expose this" / "make it public" / "tunnel": always default to `t
 
 Provider note: only `cloudflare` is wired today. Tailscale Funnel and ngrok are deferred (single-funnel-per-node and free-tier-no-BYO-domain limits respectively). Self-hosted (frp / sish / Caddy) → set `tunnel = "noop"`; taskmux records the public hostname for status display while you wire exposure outside.
 
+## MCP server (coding-agent integration)
+
+The daemon hosts an MCP (Model Context Protocol) server at
+`http://localhost:{api_port}/mcp/` (default `http://localhost:8765/mcp/`).
+Streamable HTTP transport. Connected coding agents (Claude Code, Cursor,
+Codex, Continue) get:
+
+  * tools — `taskmux_status`, `taskmux_inspect`, `taskmux_logs`,
+    `taskmux_start/stop/restart/kill`, `taskmux_health`, `taskmux_events`,
+    `taskmux_list_projects`
+  * resources — `taskmux://status`, `taskmux://projects`,
+    `taskmux://events/recent`, `taskmux://logs/{session}/{task}`
+  * push notifications — `notifications/message` on every lifecycle event
+    (severity mapped: `error` for crashes/health fails / max-restarts,
+    `warning` for auto-restarts/kills, `info` otherwise)
+
+### Connection scoping (per-project default)
+
+The daemon is host-wide — one process serves every project on the host.
+By default each agent's connection is **pinned to one project** via a
+`?session=<name>` URL query param the installer writes into the agent's
+config. Pinned connections see only their project's status, only their
+project's events, and reject cross-project tool calls with
+`{"error": "pin_violation"}`. `taskmux_list_projects` and
+`taskmux://projects` stay global — pinned agents can still discover what
+sibling projects exist.
+
+Unpinned (admin) connections — installed with `--unscoped` — see every
+project. Use these only for diagnostic / dotfiles-style clients.
+
+### Wiring an agent
+
+```bash
+# From inside a project dir — auto-detects session from taskmux.toml.
+# Omit the client name to get a multi-select prompt:
+taskmux mcp install
+#   1) claude          ~/.claude/settings.json (user-global)
+#   2) claude-project  <project>/.mcp.json (project-shared)
+#   3) cursor          ~/.cursor/mcp.json (user-global)
+#   4) codex           ~/.codex/config.toml (user-global)
+#   5) codex-project   <project>/.codex/config.toml (project-shared)
+#   6) continue        ~/.continue/config.json (user-global)
+
+# Or specify directly (any of the above, or `all`):
+taskmux mcp install claude-project
+taskmux mcp install all
+
+# Dry-run preview (full merged config)
+taskmux mcp install --print
+
+# Override cwd detection (install for a project from outside its dir)
+taskmux mcp install --session myproj
+
+# Host-wide, sees every project — admin only, emits a warning
+taskmux mcp install --unscoped
+
+# Snippet for copy-paste (same scope rules as install)
+taskmux mcp show <client>
+
+# Daemon endpoint, transport, active sessions (with pin), and a
+# "this project" block showing the local URL + .mcp.json status
+taskmux mcp status
+```
+
+For project-scoped MCP, prefer the `*-project` targets — they write to
+files Claude Code (`.mcp.json`) and Codex CLI (`.codex/config.toml`)
+load per-project, so the `?session=` pin is bound to the project rather
+than leaking host-wide. Codex CLI's "closest wins" precedence resolves
+the project entry inside trusted projects without disturbing user-global
+servers (chrome-devtools, linear, etc.).
+
+Running `taskmux mcp install` outside any taskmux project (no
+`taskmux.toml` in cwd or any ancestor) errors with a hint — fail-closed
+default keeps an agent's surface scoped to one project unless you opt out
+explicitly. Restart the agent after install so it re-reads its config
+and connects.
+
+### Tuning ~/.taskmux/config.toml
+
+```toml
+[mcp]
+enabled = true                          # default; set false to disable mounting
+path = "/mcp"                           # default; only change on path collision
+filter = []                             # default = every event;
+                                        # quiet subset:
+                                        # ["task_exited", "health_check_failed",
+                                        #  "auto_restart", "task_killed"]
+```
+
+`enabled = false` keeps the daemon running on the legacy WS port without
+exposing MCP. The durable `~/.taskmux/events.jsonl` log captures every
+event regardless of the filter.
+
 ## Worktrees
 
 Linked git worktrees get an auto-suffixed `project_id` (e.g. `myproject-feat-foo`) so logs, registry entries, and proxy URLs (`https://api.myproject-feat-foo.localhost`) don't collide with the primary checkout. The user-facing `name` in `taskmux.toml` stays the same; everything routed by `project_id` namespaces automatically.
@@ -238,6 +331,34 @@ max_restarts = 10
 restart_backoff = 3.0
 ```
 Daemon picks up changes via file watcher.
+
+### "Task hits `max_restarts_reached` repeatedly on a stale lock file"
+
+Common with frameworks that protect their dev server with a file lock (Next.js
+`.next/dev/lock`, Vite cache locks, Yarn/pnpm/Bun install locks, esbuild
+service sockets). When taskmux SIGKILLs the previous instance — via
+`taskmux kill`, the SIGINT→SIGTERM→SIGKILL escalation in `stop`, or
+`_cleanup_port` reclaiming a contested port — the lock file is left behind.
+The next spawn refuses to start, exits non-zero, and within 5 retries the
+task hits `max_restarts` and parks.
+
+Fix with a `before_start` hook — fires for every spawn (manual *and*
+auto-restart), runs in the task's `cwd`:
+
+```toml
+[tasks.web]
+command = "bun run dev"
+cwd = "web"
+
+[tasks.web.hooks]
+before_start = "rm -f .next/dev/lock"     # Next.js
+# before_start = "rm -f node_modules/.vite/deps/_metadata.json.lock"   # Vite
+# before_start = "rm -f /tmp/esbuild-*.sock"                            # esbuild service
+```
+
+Diagnose with `taskmux logs <task> --grep "lock\\|EADDRINUSE\\|already in use"`
+and `taskmux events --task <task>` — a `max_restarts_reached` cluster within
+~30s of `task_started` is the smoking gun.
 
 ## Anti-patterns — DO NOT
 

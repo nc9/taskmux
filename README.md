@@ -97,6 +97,7 @@ Aliases (external routes):
 - **Event history** — lifecycle events (start, stop, health failure, auto-restart, max-restarts-reached) appended to `~/.taskmux/events.jsonl`. Filter by task / time / event type.
 - **Health checks** — `health_url` (HTTP probe), `health_check` (shell exit code), or auto TCP probe for host-routed tasks. Retries gate dependents and trigger auto-restart.
 - **Agent context injection** — `taskmux init` patches a thin task table + pointer into the project's `CLAUDE.md` / `AGENTS.md`; re-rendered on every `taskmux add` / `remove` so agents never see a stale list. Pair with the [taskmux skill](#agent-skill) for cross-agent CLI guidance.
+- **MCP server (push notifications)** — daemon hosts a Model Context Protocol server at `http://localhost:{api_port}/mcp` (Streamable HTTP). MCP-aware agents (Claude Code, Cursor, Codex, Continue) get `taskmux_status`/`logs`/`restart` tools and live `notifications/message` events when tasks crash, restart, or fail health checks. Wire up with `taskmux mcp install <client>`. See [MCP integration](#mcp-integration).
 
 ### Process supervision
 
@@ -564,6 +565,56 @@ taskmux daemon unregister NAME    # remove a project from the registry
 Each project carries a `state`: `ok` while loaded, `config_missing` if its `taskmux.toml` is absent or was deleted (entry stays in the registry, health checks pause), `error` if loading the config raised. Surfaced in `daemon list` and the `list_projects` WS command.
 
 If you move `taskmux.toml` to a new directory and re-register, the registry auto-heals when the old path no longer exists on disk. If both paths still exist, `register` rejects the collision (E305) — pass `--force` to make the new path win.
+
+### MCP integration
+
+The daemon hosts a Model Context Protocol server at `http://localhost:{api_port}/mcp/` alongside the WebSocket API on the same port. Streamable HTTP transport (per the 2025-11-25 MCP spec). Coding agents that speak MCP get tools to inspect and control tasks, plus push notifications when tasks change state.
+
+**Connections are project-scoped by default.** The installer reads `taskmux.toml` from the current directory and writes the URL with `?session=<name>` so the daemon pins each agent's view to that one project. Pinned agents see only their project's status, get only their project's events, and reject cross-project tool calls with `{"error": "pin_violation"}`. `--unscoped` opts out (admin / diagnostic clients only — emits a warning).
+
+```bash
+# From inside a project dir — auto-detects session.
+# Omit the client name for an interactive multi-select prompt:
+taskmux mcp install                              # → numbered list, pick which agents
+taskmux mcp install claude
+taskmux mcp install all                          # claude, claude-project, cursor, codex, codex-project, continue
+taskmux mcp install --print                      # dry-run preview
+
+# Override or opt out
+taskmux mcp install claude --session myproj      # explicit session
+taskmux mcp install claude --unscoped            # host-wide, warns
+
+taskmux mcp show codex                           # snippet for copy-paste
+taskmux mcp status                               # daemon endpoint, per-session list,
+                                                 # and "this project" view (local URL +
+                                                 # .mcp.json status)
+```
+
+**Project-scoped vs user-global**: every target has a sensible default. The
+`-project` variants (`claude-project` → `.mcp.json`, `codex-project` →
+`.codex/config.toml`) write to per-project files so the `?session=` pin
+stays bound to that project. The plain targets (`claude`, `cursor`,
+`codex`, `continue`) write to user-global config — convenient but every
+agent session on the host shares the same pin until reinstalled.
+
+Running `taskmux mcp install` outside any taskmux project errors with a hint — the fail-closed default keeps an agent scoped to one project unless you opt out explicitly.
+
+**Tools** — `taskmux_status`, `taskmux_list_projects`, `taskmux_inspect`, `taskmux_logs`, `taskmux_start`, `taskmux_stop`, `taskmux_restart`, `taskmux_kill`, `taskmux_health`, `taskmux_events`. Each is a thin wrapper over the same handler the WS API uses. On pinned connections, the `session` parameter is optional (defaults to the pin) and rejected with `pin_violation` when it disagrees. `taskmux_list_projects` stays global so pinned agents can still discover sibling projects.
+
+**Resources** — `taskmux://status` (filtered to pin), `taskmux://projects` (global), `taskmux://events/recent` (filtered to pin), `taskmux://logs/{session}/{task}` (template; pin-checked). All subscribable; `notifications/resources/updated` fires on every lifecycle event for the pinned project.
+
+**Push notifications** — every `recordEvent` site fans out via an in-process bus to every connected MCP session as `notifications/message` (severity mapped: `error` for crashes/health-check failures/max-restarts, `warning` for auto-restarts/kills, `info` for normal lifecycle). Pinned sessions only receive events for their project; unpinned (admin) sessions get the full firehose. Filter further via `[mcp].filter` in `~/.taskmux/config.toml`.
+
+```toml
+# ~/.taskmux/config.toml
+[mcp]
+enabled = true                                           # default
+path    = "/mcp"                                         # default
+filter  = ["task_exited", "health_check_failed",         # quiet subset
+           "auto_restart", "task_killed"]                # default = all events
+```
+
+Disabling `[mcp]` keeps the daemon running with WS only — useful when running on a host where exposing /mcp is undesirable.
 
 ### WebSocket API
 
