@@ -111,38 +111,51 @@ class TestBuildContextBlock:
         block = buildContextBlock(TaskmuxConfig(name="my-project"))
         assert "my-project" in block
 
-    def test_lists_tasks(self):
+    def test_does_not_render_task_table(self):
+        """Pointer-only inject — block must NOT include per-task command
+        strings, URLs, or autostart booleans, even when tasks are
+        configured. Live state goes through taskmux_status, not the
+        context file.
+        """
         cfg = TaskmuxConfig(
             name="test",
             tasks={
-                "server": TaskConfig(command="npm start"),
+                "server": TaskConfig(command="npm start", host="api"),
                 "worker": TaskConfig(command="celery worker", auto_start=False),
             },
         )
         block = buildContextBlock(cfg)
-        assert "server" in block
-        assert "npm start" in block
-        assert "| no |" in block
+        # No per-task command, URL, or autostart leak.
+        assert "npm start" not in block
+        assert "celery worker" not in block
+        assert "https://api.test.localhost" not in block
+        assert "| no |" not in block
+        # No markdown table separator.
+        assert "|------" not in block
 
-    def test_table_includes_url(self):
-        cfg = TaskmuxConfig(name="test", tasks={"api": TaskConfig(command="bun dev", host="api")})
-        block = buildContextBlock(cfg)
-        assert "https://api.test.localhost" in block
+    def test_directive_renders_regardless_of_task_count(self):
+        """Probe-live-state directive shows up whether or not tasks exist."""
+        empty = buildContextBlock(TaskmuxConfig(name="test"))
+        with_tasks = buildContextBlock(
+            TaskmuxConfig(name="test", tasks={"a": TaskConfig(command="x")})
+        )
+        for block in (empty, with_tasks):
+            assert "Probe live state" in block
+            assert "don't rely on this file" in block.lower()
 
-    def test_empty_tasks_message(self):
-        block = buildContextBlock(TaskmuxConfig(name="test"))
-        assert "No tasks configured yet" in block
-
-    def test_contains_skill_pointer(self):
+    def test_contains_skill_and_cli_pointer(self):
         block = buildContextBlock(TaskmuxConfig(name="test"))
         assert "taskmux` skill" in block
         assert "taskmux --help" in block
+        assert "taskmux status --json" in block
 
     def test_contains_mcp_pointer(self):
         block = buildContextBlock(TaskmuxConfig(name="test"))
         assert "taskmux mcp install" in block
-        assert "/mcp" in block
-        assert "taskmux inspect" in block
+        # Tool names the agent should reach for first.
+        assert "mcp__taskmux__" in block
+        assert "taskmux_status" in block
+        assert "taskmux_logs" in block
 
 
 class TestInjectIntoFile:
@@ -193,12 +206,16 @@ class TestReinjectIfEnabled:
 
         rewrote = reinjectIfEnabled(
             tmp_path,
-            TaskmuxConfig(name="orig", tasks={"new": TaskConfig(command="bun dev")}),
+            TaskmuxConfig(name="renamed", tasks={"new": TaskConfig(command="celery worker")}),
         )
         assert rewrote == [tmp_path / AGENTS_FILE]
         content = (tmp_path / AGENTS_FILE).read_text()
-        assert "bun dev" in content
-        assert "| new |" in content
+        # Block was actually rewritten — project name reflects the second
+        # config. The inject is pointer-only and never embeds task
+        # commands or names, so the new command must NOT appear.
+        assert "# Taskmux — renamed" in content
+        assert "# Taskmux — orig" not in content
+        assert "celery worker" not in content  # snapshot-leak regression guard
 
     def test_no_op_when_no_files_exist(self, tmp_path: Path, monkeypatch):
         monkeypatch.setattr(

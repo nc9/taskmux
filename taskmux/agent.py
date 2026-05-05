@@ -72,47 +72,39 @@ def skillInstalled(project_path: Path | None = None) -> bool:
 
 
 def buildContextBlock(config: TaskmuxConfig) -> str:
-    """Render the markdown block describing the project's taskmux setup."""
+    """Render the marker-delimited taskmux block patched into agent context files.
+
+    Pointer-only: no per-task table. The agent should probe
+    `mcp__taskmux__taskmux_status` (preferred) or `taskmux status --json`
+    (fallback) for live task state — that data goes stale the moment a
+    task is added/removed and an in-flight agent already past its
+    system-prompt load won't re-read this file. Keeping the block
+    short keeps token cost flat regardless of project size.
+    """
     lines = [
         CONTEXT_START,
         f"# Taskmux — {config.name}",
         "",
-        "## Tasks",
+        "This project uses **taskmux** for long-running processes (dev servers, "
+        "watchers, queues). Don't run those directly (`bun dev &`, `cargo "
+        "watch`) — always go through taskmux so logs, restarts, and proxied "
+        "URLs work.",
         "",
+        "**Probe live state — don't rely on this file.** Tasks change; this "
+        "block won't always reflect that.",
+        "",
+        "  * If `mcp__taskmux__*` tools are loaded → prefer them "
+        "(`taskmux_status`, `taskmux_inspect`, `taskmux_logs`, "
+        "`taskmux_events`). Structured payloads, scoped to this project via "
+        "the `?session=` pin, plus push notifications on crashes / restarts.",
+        "  * Otherwise CLI: `taskmux status --json`, "
+        "`taskmux inspect <task> --json`, `taskmux logs <task> --grep <pat>`. "
+        "`taskmux --help` for the full surface; install the `taskmux` skill "
+        "for cross-agent guidance.",
+        "",
+        "If the MCP isn't wired up yet, run `taskmux mcp install` from this dir.",
+        CONTEXT_END,
     ]
-
-    if config.tasks:
-        lines.append("| Task | URL | Auto-start | Command |")
-        lines.append("|------|-----|------------|---------|")
-        for name, task in config.tasks.items():
-            url = f"https://{task.host}.{config.name}.localhost" if task.host is not None else "—"
-            auto = "yes" if task.auto_start else "no"
-            lines.append(f"| {name} | {url} | {auto} | `{task.command}` |")
-    else:
-        lines.append('_No tasks configured yet. Use `taskmux add <name> "<command>"` to add._')
-
-    lines.extend(
-        [
-            "",
-            "Always use taskmux to manage long-running processes (servers, watchers, "
-            "queues) instead of running them directly. If the `taskmux` skill is "
-            "installed, prefer it for CLI details. Otherwise: `taskmux --help`, "
-            "`taskmux status --json`, `taskmux inspect <task> --json`, "
-            "`taskmux logs <task> --grep <pat>`.",
-            "",
-            "Daemon hosts an MCP server at `http://localhost:{api_port}/mcp` "
-            "(default `:8765/mcp`) — `taskmux mcp install <client>` to wire up "
-            "Claude Code, Cursor, Codex, or OpenCode for live tools and "
-            "push notifications on task crashes/restarts.",
-            "",
-            "**If `mcp__taskmux__*` tools are loaded in this session, prefer "
-            "them over `taskmux` CLI calls** — they return structured payloads, "
-            "respect the `?session=` project pin, and surface lifecycle events "
-            "via `notifications/message` so you don't have to poll. Fall back "
-            "to the CLI only when the MCP isn't available.",
-            CONTEXT_END,
-        ]
-    )
     return "\n".join(lines) + "\n"
 
 

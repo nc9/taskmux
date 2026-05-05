@@ -96,7 +96,7 @@ Aliases (external routes):
 - **Persistent timestamped logs** — survive task kill / daemon restart at `~/.taskmux/projects/{project_id}/logs/`. Rotated by size; greppable with `taskmux logs -g <pat> -C N --since 5m`.
 - **Event history** — lifecycle events (start, stop, health failure, auto-restart, max-restarts-reached) appended to `~/.taskmux/events.jsonl`. Filter by task / time / event type.
 - **Health checks** — `health_url` (HTTP probe), `health_check` (shell exit code), or auto TCP probe for host-routed tasks. Retries gate dependents and trigger auto-restart.
-- **Agent context injection** — `taskmux init` patches a thin task table + pointer into the project's `CLAUDE.md` / `AGENTS.md`; re-rendered on every `taskmux add` / `remove` so agents never see a stale list. Pair with the [taskmux skill](#agent-skill) for cross-agent CLI guidance.
+- **Agent context injection** — `taskmux init` patches a short discovery block into the project's `CLAUDE.md` / `AGENTS.md` telling the agent this is a taskmux project and to probe `mcp__taskmux__taskmux_status` / `taskmux status` for live state instead of relying on a stale snapshot. Pair with the [taskmux skill](#agent-skill) for cross-agent CLI guidance.
 - **MCP server (push notifications)** — daemon hosts a Model Context Protocol server at `http://localhost:{api_port}/mcp` (Streamable HTTP). MCP-aware agents (Claude Code, Cursor, Codex, OpenCode) get `taskmux_status`/`logs`/`restart` tools and live `notifications/message` events when tasks crash, restart, or fail health checks. Wire up with `taskmux mcp install <client>`. See [MCP integration](#mcp-integration).
 
 ### Process supervision
@@ -116,7 +116,7 @@ uv tool install taskmux
 
 ### Agent skill
 
-Generic CLI guidance (when to invoke, JSON patterns, anti-patterns) lives in a portable agent skill at [`skills/taskmux/`](skills/taskmux/SKILL.md). It works with Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Copilot, and any other agent that speaks the [`vercel-labs/skills`](https://github.com/vercel-labs/skills) convention. Project task tables still come from `taskmux init` patching `CLAUDE.md` / `AGENTS.md`.
+Generic CLI guidance (when to invoke, JSON patterns, anti-patterns) lives in a portable agent skill at [`skills/taskmux/`](skills/taskmux/SKILL.md). It works with Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Copilot, and any other agent that speaks the [`vercel-labs/skills`](https://github.com/vercel-labs/skills) convention. Per-project context (taskmux is in use here, prefer MCP, probe `taskmux_status`) comes from `taskmux init` patching `CLAUDE.md` / `AGENTS.md`.
 
 Install via:
 
@@ -128,7 +128,7 @@ npx skills add nc9/taskmux --skill taskmux -g
 
 ### Agent context files (`taskmux init`)
 
-`taskmux init` patches a small marked block (`<!-- taskmux:start --> ... <!-- taskmux:end -->`) into the project's existing `CLAUDE.md` and/or `AGENTS.md`. The block lists current tasks + URLs and points the agent at `taskmux --json status` / `inspect` / `logs`.
+`taskmux init` patches a small marked block (`<!-- taskmux:start --> ... <!-- taskmux:end -->`) into the project's existing `CLAUDE.md` and/or `AGENTS.md`. The block is **pointer-only** — no task table, no URLs, no command strings. It tells the agent: this is a taskmux project, prefer `mcp__taskmux__*` tools when loaded, fall back to `taskmux status --json` / `inspect` / `logs`. Stays a fixed ~900 chars regardless of how many tasks the project has, and never goes stale because the agent always probes for live state.
 
 The block also re-renders automatically on every `taskmux add` / `taskmux remove`, so the agent context never drifts from the live task list. To pull in fresh wording after upgrading taskmux (new MCP pointers, skill hints, etc.) without churning a task, run `taskmux inject` — interactive checkbox by default (pre-checks files that already exist), or pass `CLAUDE.md` / `AGENTS.md` / `all`. Disable per-project in `taskmux.toml`:
 
