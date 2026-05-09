@@ -820,3 +820,119 @@ class TestMcpInstall:
 
         detected = _cli._detectInstalledClients(proj)
         assert detected == {"claude-project", "cursor-project"}
+
+
+class TestStartIfStopped:
+    """`taskmux start --if-stopped` translates E301 into a clean no-op."""
+
+    @patch("taskmux.cli.registerProject")
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_already_running_emits_noop(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+
+        def _busy(command, params=None, **_):
+            assert command == "start_all"
+            return {
+                "result": {
+                    "ok": False,
+                    "error_code": "E301",
+                    "error": "Session 'demo' already exists",
+                }
+            }
+
+        with _patch_ipc(_busy):
+            result = runner.invoke(app, ["start", "--if-stopped"])
+        assert result.exit_code == 0
+        assert "E301" not in result.output
+        assert "already exists" not in result.output
+
+    @patch("taskmux.cli.registerProject")
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_fresh_start_unchanged(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        with _patch_ipc(_ipc_dispatch):
+            result = runner.invoke(app, ["start", "--if-stopped"])
+        assert result.exit_code == 0
+
+    @patch("taskmux.cli.registerProject")
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_other_errors_pass_through(self, mock_load, _mock_reg, sample_toml: Path, monkeypatch):
+        """Only E301 gets normalised — other failures stay visible."""
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+
+        def _broken(command, params=None, **_):
+            return {
+                "result": {
+                    "ok": False,
+                    "error_code": "E500",
+                    "error": "Daemon unavailable",
+                }
+            }
+
+        with _patch_ipc(_broken):
+            result = runner.invoke(app, ["start", "--if-stopped"])
+        assert "E500" in result.output
+
+
+class TestEnvCommand:
+    """`taskmux env` emits eval-able exports for the cwd's worktree identity."""
+
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_emits_default_payload(self, mock_load, sample_toml: Path, monkeypatch):
+        # sample_toml has tasks `server` (no host) and `watcher` (no host) — so
+        # only identity vars get emitted by default. Build a config with hosts.
+        cfg = TaskmuxConfig.model_validate(
+            {
+                "name": "demo",
+                "tasks": {
+                    "api": {"command": "echo api", "host": "api"},
+                    "web": {"command": "echo web", "host": "@"},
+                    "wild": {"command": "echo w", "host": "*"},
+                },
+            }
+        )
+        mock_load.return_value = _identity("demo", config=cfg)
+        monkeypatch.chdir(sample_toml.parent)
+        result = runner.invoke(app, ["env", "--shell", "posix"])
+        assert result.exit_code == 0
+        assert "export TASKMUX_PROJECT=demo" in result.output
+        assert "export TASKMUX_BASE_HOST=demo.localhost" in result.output
+        assert "export TASKMUX_URL_API=https://api.demo.localhost" in result.output
+        assert "export TASKMUX_URL_WEB=https://demo.localhost" in result.output
+        # Wildcard host excluded.
+        assert "TASKMUX_URL_WILD" not in result.output
+
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_prefix_replaces_namespace(self, mock_load, sample_toml: Path, monkeypatch):
+        cfg = TaskmuxConfig.model_validate(
+            {"name": "demo", "tasks": {"api": {"command": "echo", "host": "api"}}}
+        )
+        mock_load.return_value = _identity("demo", config=cfg)
+        monkeypatch.chdir(sample_toml.parent)
+        result = runner.invoke(app, ["env", "--shell", "posix", "--prefix", "MYPROJ_"])
+        assert result.exit_code == 0
+        assert "export MYPROJ_PROJECT_ID=demo" in result.output
+        assert "TASKMUX_" not in result.output
+
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_no_urls_skips_task_urls(self, mock_load, sample_toml: Path, monkeypatch):
+        cfg = TaskmuxConfig.model_validate(
+            {"name": "demo", "tasks": {"api": {"command": "echo", "host": "api"}}}
+        )
+        mock_load.return_value = _identity("demo", config=cfg)
+        monkeypatch.chdir(sample_toml.parent)
+        result = runner.invoke(app, ["env", "--shell", "posix", "--no-urls"])
+        assert result.exit_code == 0
+        assert "TASKMUX_URL_" not in result.output
+        assert "TASKMUX_PROJECT_ID" in result.output
+
+    @patch("taskmux.cli.loadProjectIdentity")
+    def test_invalid_prefix_rejected(self, mock_load, sample_toml: Path, monkeypatch):
+        mock_load.return_value = _identity("demo")
+        monkeypatch.chdir(sample_toml.parent)
+        result = runner.invoke(app, ["env", "--prefix", "1bad-prefix"])
+        assert result.exit_code == 1
+        assert "invalid --prefix" in result.output

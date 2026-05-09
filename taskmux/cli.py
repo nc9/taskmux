@@ -408,6 +408,11 @@ def start(
     daemon: bool = typer.Option(  # noqa: B008
         False, "-d", "--daemon", help="(deprecated; daemon always runs)"
     ),
+    if_stopped: bool = typer.Option(  # noqa: B008
+        False,
+        "--if-stopped",
+        help="Idempotent: succeed quietly if the session is already running.",
+    ),
 ):
     """Start tasks (all auto_start tasks if none specified)."""
     _ = monitor, daemon  # back-compat no-ops
@@ -415,9 +420,31 @@ def start(
     _ensure_session_known(cli.project_id, cli.config_path)
     if tasks:
         results = [_call_session("start", cli.project_id, task=t) for t in tasks]
+        if if_stopped:
+            results = [_normalize_already_running(r, session=cli.project_id) for r in results]
         _handle_results(results)
     else:
-        _handle_result(_call_session("start_all", cli.project_id))
+        result = _call_session("start_all", cli.project_id)
+        if if_stopped:
+            result = _normalize_already_running(result, session=cli.project_id)
+        _handle_result(result)
+
+
+def _normalize_already_running(result: dict, *, session: str) -> dict:
+    """Translate E301 (session/task already exists) into an ok no-op result.
+
+    `--if-stopped` callers (eg. SessionStart hooks) want a clean exit when
+    the session is already up. The daemon still emits E301 so other code
+    paths see the precise reason; we just rewrite it on the way out.
+    """
+    if result.get("ok") or result.get("error_code") != "E301":
+        return result
+    return {
+        "ok": True,
+        "action": "noop",
+        "session": session,
+        "already_running": True,
+    }
 
 
 @app.command()
@@ -1083,6 +1110,98 @@ def url(
             )
         if public_url:
             console.print(f"public: {public_url}", style="cyan")
+
+
+@app.command()
+def env(
+    shell: str | None = typer.Option(  # noqa: B008
+        None,
+        "--shell",
+        help="Output dialect: zsh, bash, fish, or posix. Defaults to $SHELL (posix fallback).",
+    ),
+    prefix: str = typer.Option(  # noqa: B008
+        "TASKMUX_",
+        "--prefix",
+        help="Env-var prefix. Defaults to TASKMUX_.",
+    ),
+    no_urls: bool = typer.Option(  # noqa: B008
+        False,
+        "--no-urls",
+        help="Skip per-task URL exports — emit only project/worktree identity.",
+    ),
+):
+    """Emit shell-evalable env vars for the current worktree.
+
+    Pipe into `eval` (or direnv) to populate `${PREFIX}PROJECT_ID`,
+    `${PREFIX}BASE_HOST`, `${PREFIX}URL_<TASK>`, etc. so a static `.envrc`
+    can derive every per-worktree URL without rewriting itself.
+
+    Example .envrc:
+
+        eval "$(taskmux env --prefix MYPROJ_)"
+        export DASHBOARD_URL="$MYPROJ_URL_WEBSITE"
+        export API_BASE_URL="$MYPROJ_URL_API/api/v1"
+    """
+    import os as _os
+
+    from .env_export import SUPPORTED_SHELLS, renderEnv, renderEnvJson
+
+    if shell is None:
+        rawShell = _os.environ.get("SHELL", "")
+        detected = Path(rawShell).name if rawShell else ""
+        shell = detected if detected in SUPPORTED_SHELLS else "posix"
+
+    if not _isValidVarPrefix(prefix):
+        err = f"invalid --prefix {prefix!r}: must match [A-Za-z_][A-Za-z0-9_]*"
+        if is_json_mode():
+            print_result({"ok": False, "error": err})
+        else:
+            console.print(f"Error: {err}", style="red")
+        sys.exit(1)
+
+    cli = TaskmuxCLI()
+    ident = cli.identity
+    tasks: list[tuple[str, str]] = [
+        (name, cfg.host) for name, cfg in cli.config.tasks.items() if cfg.host is not None
+    ]
+
+    if is_json_mode():
+        sys.stdout.write(
+            renderEnvJson(
+                project=ident.project,
+                project_id=ident.project_id,
+                branch=ident.branch,
+                worktree=ident.worktree_id,
+                is_linked=ident.worktree_id is not None,
+                tasks=tasks,
+                prefix=prefix,
+                include_urls=not no_urls,
+            )
+        )
+        return
+
+    sys.stdout.write(
+        renderEnv(
+            project=ident.project,
+            project_id=ident.project_id,
+            branch=ident.branch,
+            worktree=ident.worktree_id,
+            is_linked=ident.worktree_id is not None,
+            tasks=tasks,
+            shell=shell,
+            prefix=prefix,
+            include_urls=not no_urls,
+        )
+    )
+
+
+def _isValidVarPrefix(p: str) -> bool:
+    """Empty prefix OK (caller wants un-prefixed names); else POSIX-name shape."""
+    if p == "":
+        return True
+    import re as _re
+
+    return bool(_re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", p))
 
 
 def open_url(
