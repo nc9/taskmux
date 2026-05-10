@@ -152,6 +152,7 @@ All commands support `--json` for machine-readable output.
 # Lifecycle
 taskmux start                    # start all auto_start tasks in dependency order
 taskmux start <task> [task2...]  # start specific tasks
+taskmux start --if-stopped       # idempotent: exit 0 if session already running (for hooks/CI)
 taskmux stop                     # graceful stop all (SIGINT → SIGTERM → SIGKILL on process group)
 taskmux stop <task> [task2...]   # stop specific tasks
 taskmux restart                  # restart all
@@ -186,6 +187,13 @@ taskmux init --defaults          # non-interactive
 taskmux inject                   # refresh CLAUDE.md / AGENTS.md block
                                  #   (or create them if missing)
 taskmux inject --print           # render block to stdout, no write
+
+# Worktree env exports — for direnv / .envrc / SessionStart hooks
+taskmux env                      # emit TASKMUX_PROJECT_ID, BASE_HOST, URL_<TASK> ...
+taskmux env --prefix MYPROJ_     # custom var prefix (default TASKMUX_)
+taskmux env --shell fish         # zsh | bash | fish | posix (auto-detects $SHELL)
+taskmux env --no-urls            # identity only, skip per-task URLs
+taskmux env --json               # JSON dict for non-shell consumers
 
 # URLs / proxy
 taskmux url <name>               # print proxy URL for a task or alias
@@ -375,6 +383,63 @@ Every command takes `--json` and emits a stable schema for agent scripting.
 If anything is missing the daemon logs the gap and disables the cloudflare backend — tunneled tasks still serve locally. Apex hosts (`host = "@"`) tunnel to `<project>.localhost`. Wildcard hosts (`host = "*"`) cannot be tunneled — there's no single FQDN to point at.
 
 > **Tailscale Funnel** and **ngrok** are deferred for now. Tailscale Funnel is one funnel per node and limits the public URL to your tailnet; ngrok's free tier blocks BYO domains. For self-hosted tunnels (frp, sish, Caddy), set `tunnel = "noop"` on a task — taskmux records the public hostname for display and you wire the actual exposure outside.
+
+## Worktree workflows
+
+Linked git worktrees auto-namespace their `project_id` (`myproject-feat-foo`) so URLs, logs, and registry entries don't collide with the primary checkout. Two helpers wire that into a project's local dev setup:
+
+- **`taskmux env`** — emit the worktree's identity + per-task URLs as shell exports.
+- **`taskmux start --if-stopped`** — boot the project's tasks idempotently; no-op if the daemon already has the session.
+
+### Per-worktree URLs via `.envrc`
+
+Drop one `eval` into your `.envrc` (or any direnv-style hook). Every checkout — primary or linked — resolves URLs from the cwd's git worktree state, no hand-edits per branch:
+
+```bash
+# .envrc
+eval "$(taskmux env --prefix MYPROJ_)"
+
+export DASHBOARD_URL="$MYPROJ_URL_WEBSITE"
+export API_BASE_URL="$MYPROJ_URL_API/api/v1"
+```
+
+What `taskmux env` exports (default prefix `TASKMUX_`):
+
+| Var | Example |
+|-----|---------|
+| `TASKMUX_PROJECT` | `myproject` |
+| `TASKMUX_PROJECT_ID` | `myproject-feat-foo` (primary: `myproject`) |
+| `TASKMUX_BASE_HOST` | `myproject-feat-foo.localhost` |
+| `TASKMUX_BRANCH` | `feat/foo` (omitted on detached HEAD) |
+| `TASKMUX_WORKTREE` | `feat-foo` (omitted in primary checkout) |
+| `TASKMUX_IS_LINKED` | `1` for linked worktrees, `0` for primary |
+| `TASKMUX_URL_<TASK>` | `https://api.myproject-feat-foo.localhost` (one per host-routed task; wildcard `host = "*"` skipped; apex `host = "@"` collapses to base URL) |
+
+Task names normalise to var-safe form: `web-1` → `WEB_1`. Shell dialect is auto-detected from `$SHELL` (override with `--shell zsh|bash|fish|posix`).
+
+### Booting on agent / shell startup
+
+Pair `taskmux env` with `taskmux start --if-stopped` to make session startup safe to re-run from any hook — the flag swallows the daemon's `E301 session already running` and exits 0:
+
+```typescript
+// scripts/worktree-init.ts
+import { spawnSync } from "node:child_process"
+spawnSync("taskmux", ["start", "--if-stopped"], { stdio: "inherit" })
+```
+
+```jsonc
+// .claude/settings.json
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup",
+        "hooks": [{ "type": "command", "command": "bun run scripts/worktree-init.ts" }] }
+    ]
+  }
+}
+```
+
+Re-runs across agent restarts, fresh shells, or parallel worktrees are all no-ops once the session is up.
 
 ### stop vs kill vs restart
 
