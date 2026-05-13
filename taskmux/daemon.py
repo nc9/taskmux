@@ -220,6 +220,10 @@ class TaskmuxDaemon:
         self._proxy_eligible = False
         self._proxy_started = False
         self._proxy_socks: list[socket.socket] = []
+        # session -> last-warned missing config_path. Re-warn if the path
+        # changes; clear on successful load or unregister so a later miss
+        # re-warns once.
+        self._warned_missing_configs: dict[str, str] = {}
         self.host_resolver: HostResolver | None = None
         self.dns_server: object | None = None
         # (project_id, backend_name) -> TunnelBackend. Lazily created on
@@ -405,7 +409,12 @@ class TaskmuxDaemon:
         if session in self.projects:
             return
         if not config_path.exists():
-            self.logger.warning(f"Registry entry for '{session}' points to missing {config_path}")
+            last_warned = self._warned_missing_configs.get(session)
+            if last_warned != str(config_path):
+                self.logger.warning(
+                    f"Registry entry for '{session}' points to missing {config_path}"
+                )
+                self._warned_missing_configs[session] = str(config_path)
             self.project_states[session] = "config_missing"
             return
         try:
@@ -433,6 +442,7 @@ class TaskmuxDaemon:
         self.configs[session] = cfg
         self.projects[session] = sup
         self.project_states[session] = "ok"
+        self._warned_missing_configs.pop(session, None)
 
         if self._proxy_eligible and self.proxy is not None:
             self._mint_and_register_proxy(session)
@@ -483,6 +493,7 @@ class TaskmuxDaemon:
         self.configs.pop(session, None)
         self.project_states.pop(session, None)
         self.config_paths.pop(session, None)
+        self._warned_missing_configs.pop(session, None)
         for sess, kind in list(self.tunnels.keys()):
             if sess != session:
                 continue
