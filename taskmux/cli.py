@@ -331,6 +331,87 @@ def _warn_unprivileged_daemon() -> None:
         )
 
 
+def _identifyPortHolder(host: str, port: int) -> str | None:
+    """Best-effort: return a 'COMMAND/pid' string for whatever LISTENs on host:port.
+
+    Uses `lsof -nP -iTCP:<port> -sTCP:LISTEN`. Returns None if lsof is unavailable
+    or the holder runs as a different user (lsof without sudo can't see it).
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("lsof") is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    for line in out.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            return f"{parts[0]} (pid {parts[1]})"
+    return None
+
+
+def _warn_port_conflict() -> None:
+    """Probe the configured proxy port; warn if a non-taskmux process is already listening.
+
+    Uses TCP connect (not bind) so the check works unprivileged — EACCES from
+    bind() on port <1024 would otherwise produce false positives.
+    """
+    import os as _os
+    import socket as _socket
+
+    from .global_config import loadGlobalConfig
+
+    cfg = loadGlobalConfig()
+    if _os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+        return
+    if not cfg.proxy_enabled:
+        return
+    if get_daemon_pid() is not None:
+        return  # daemon already running; nothing to warn about
+
+    port = cfg.proxy_https_port
+    host = cfg.proxy_bind or "127.0.0.1"
+    listener_found = False
+    try:
+        addrs = _socket.getaddrinfo(host, port, type=_socket.SOCK_STREAM)
+    except _socket.gaierror:
+        return
+    for family, _type, _proto, _canon, sockaddr in addrs:
+        s = _socket.socket(family, _socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            s.connect(sockaddr)
+            listener_found = True
+        except OSError:
+            pass
+        finally:
+            s.close()
+        if listener_found:
+            break
+    if not listener_found:
+        return
+    holder = _identifyPortHolder(host, port) or "another process (run with sudo to identify)"
+    if not is_json_mode():
+        console.print(
+            f"[red]:{port} already has a listener ({holder}). "
+            f"Proxy will fail to bind — taskmux URLs (https://*.<project>.localhost) "
+            f"won't resolve.[/red]\n"
+            f"[yellow]Common culprits: Tailscale Serve (`tailscale serve status`), "
+            f"OrbStack, another local HTTPS server. Stop it, or set "
+            f"`proxy_https_port` in ~/.taskmux/config.toml.[/yellow]"
+        )
+
+
 def _spawn_detached_daemon(port: int | None = None) -> int | None:
     """Fork the global taskmux daemon as a detached background process."""
     import subprocess
@@ -1291,6 +1372,7 @@ def daemon(
     if ctx.invoked_subcommand is not None:
         return
     _warn_unprivileged_daemon()
+    _warn_port_conflict()
     d = TaskmuxDaemon(api_port=port)
     asyncio.run(d.start())
 
@@ -1330,6 +1412,7 @@ def daemon_start(
         return
     _autoRegisterCwd()
     _warn_unprivileged_daemon()
+    _warn_port_conflict()
     pid = _spawn_detached_daemon(port=port)
     if pid is None:
         if is_json_mode():
