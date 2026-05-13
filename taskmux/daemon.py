@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import logging.handlers
 import os
 import signal
 import socket
@@ -258,10 +259,20 @@ class TaskmuxDaemon:
             logger.addHandler(console)
 
         ensureTaskmuxDir()
-        file_h = logging.FileHandler(globalDaemonLogPath())
+        file_h = logging.handlers.RotatingFileHandler(
+            globalDaemonLogPath(),
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
         file_h.setLevel(logging.DEBUG)
         file_h.setFormatter(formatter)
         logger.addHandler(file_h)
+
+        # Quiet noisy third-party loggers — every WS connect from a CLI or
+        # MCP poll otherwise emits 2-3 INFO lines into daemon.log.
+        for name in ("websockets", "websockets.server", "uvicorn", "uvicorn.error"):
+            logging.getLogger(name).setLevel(logging.WARNING)
         return logger
 
     # ---- lifecycle ----
