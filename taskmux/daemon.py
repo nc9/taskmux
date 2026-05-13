@@ -100,6 +100,14 @@ def _clear_daemon_pid() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Atomic rename-over (editors + Write-by-tmp-then-rename) manifests as
+# delete+create on macOS FSEvents. Without a debounce, every save flips the
+# project to config_missing and re-registers it — which kills + relaunches
+# every task on reload. 0.5s comfortably covers the rename window without
+# noticeably delaying a real deletion.
+MISSING_DEBOUNCE_SECONDS = 0.5
+
+
 class ConfigWatcher(FileSystemEventHandler):
     """Watches one project's taskmux.toml; calls back on change/missing."""
 
@@ -117,6 +125,10 @@ class ConfigWatcher(FileSystemEventHandler):
         self.on_reload = on_reload
         self.on_missing = on_missing
         self.logger = logging.getLogger("taskmux-daemon")
+        # Pending missing-fire timer. Set when on_deleted / on_moved-out
+        # fires; cancelled by a reload event arriving inside the debounce
+        # window or by re-checking that the file is back on disk.
+        self._missing_handle: asyncio.TimerHandle | None = None
 
     def _matches(self, event: FileSystemEvent) -> bool:
         if str(event.src_path) == self.target_path:
@@ -144,10 +156,32 @@ class ConfigWatcher(FileSystemEventHandler):
             self.loop.call_soon_threadsafe(self._fire_missing)
 
     def _fire_reload(self) -> None:
+        # A reload means the file IS present — cancel any pending
+        # missing-fire from a delete event that races just ahead of the
+        # rename's create event.
+        if self._missing_handle is not None:
+            self._missing_handle.cancel()
+            self._missing_handle = None
         if self.on_reload:
             self.on_reload(self.session)
 
     def _fire_missing(self) -> None:
+        if self.on_missing is None:
+            return
+        # Debounce: schedule the missing-fire and re-check the file is
+        # actually gone in MISSING_DEBOUNCE_SECONDS. Cancel any existing
+        # pending check first so back-to-back delete events don't pile up.
+        if self._missing_handle is not None:
+            self._missing_handle.cancel()
+        self._missing_handle = self.loop.call_later(
+            MISSING_DEBOUNCE_SECONDS, self._check_missing
+        )
+
+    def _check_missing(self) -> None:
+        self._missing_handle = None
+        # File is back — atomic write completed mid-debounce. No-op.
+        if Path(self.target_path).exists():
+            return
         if self.on_missing:
             self.on_missing(self.session)
 
@@ -1696,7 +1730,11 @@ class TaskmuxDaemon:
             return
         payload = json.dumps(message, default=str)
         disconnected: set[WebSocket] = set()
-        for client in self.websocket_clients:
+        # Snapshot before iterating — handle_client may add/discard from
+        # self.websocket_clients between awaits, which would otherwise
+        # raise "Set changed size during iteration" and abort the
+        # health-check sweep that drives this broadcast.
+        for client in list(self.websocket_clients):
             try:
                 await client.send_text(payload)
             except Exception:  # noqa: BLE001

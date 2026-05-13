@@ -141,6 +141,113 @@ class TestNextSweepTimeout:
         assert d._next_sweep_timeout(snapshot) == 30
 
 
+class TestConfigWatcherDebounce:
+    """Atomic rename-over (editor saves, Write-by-tmp-then-rename) manifests
+    as delete+create on macOS FSEvents. Without a debounce, the daemon
+    unregisters the project on the delete and re-registers on the create,
+    killing every task in the project on every save."""
+
+    def test_delete_followed_by_create_within_debounce_skips_missing(
+        self, tmp_path: Path
+    ):
+        async def run():
+            cfg_path = tmp_path / "taskmux.toml"
+            cfg_path.write_text('name = "alpha"\n')
+            fired: list[str] = []
+            watcher = daemon_mod.ConfigWatcher(
+                session="alpha",
+                config_path=cfg_path,
+                loop=asyncio.get_running_loop(),
+                on_missing=fired.append,
+            )
+            # Simulate the delete half of a rename-over: file briefly gone…
+            cfg_path.unlink()
+            watcher._fire_missing()
+            # …then re-appears before the debounce expires.
+            cfg_path.write_text('name = "alpha"\n')
+            await asyncio.sleep(daemon_mod.MISSING_DEBOUNCE_SECONDS + 0.1)
+            assert fired == [], (
+                "missing should not fire when the file reappears inside the "
+                "debounce window"
+            )
+
+        asyncio.run(run())
+
+    def test_delete_with_no_recreate_fires_after_debounce(self, tmp_path: Path):
+        async def run():
+            cfg_path = tmp_path / "taskmux.toml"
+            cfg_path.write_text('name = "alpha"\n')
+            fired: list[str] = []
+            watcher = daemon_mod.ConfigWatcher(
+                session="alpha",
+                config_path=cfg_path,
+                loop=asyncio.get_running_loop(),
+                on_missing=fired.append,
+            )
+            cfg_path.unlink()
+            watcher._fire_missing()
+            await asyncio.sleep(daemon_mod.MISSING_DEBOUNCE_SECONDS + 0.1)
+            assert fired == ["alpha"], "missing must still fire for a real delete"
+
+        asyncio.run(run())
+
+    def test_reload_cancels_pending_missing(self, tmp_path: Path):
+        async def run():
+            cfg_path = tmp_path / "taskmux.toml"
+            cfg_path.write_text('name = "alpha"\n')
+            missing: list[str] = []
+            reloaded: list[str] = []
+            watcher = daemon_mod.ConfigWatcher(
+                session="alpha",
+                config_path=cfg_path,
+                loop=asyncio.get_running_loop(),
+                on_reload=reloaded.append,
+                on_missing=missing.append,
+            )
+            watcher._fire_missing()
+            # Reload (from the rename's create event) arrives mid-debounce.
+            watcher._fire_reload()
+            await asyncio.sleep(daemon_mod.MISSING_DEBOUNCE_SECONDS + 0.1)
+            assert missing == []
+            assert reloaded == ["alpha"]
+
+        asyncio.run(run())
+
+
+class TestBroadcastToClientsSnapshot:
+    """`handle_client` mutates `websocket_clients` between awaits during a
+    broadcast. Iterating the live set raised 'Set changed size during
+    iteration' and aborted the health-loop sweep that drives broadcasts."""
+
+    def test_concurrent_discard_during_send_does_not_raise(self):
+        async def run():
+            d = daemon_mod.TaskmuxDaemon(api_port=0)
+
+            class _MutatingClient:
+                """Removes another client from the set during its own send."""
+
+                def __init__(self, daemon: TaskmuxDaemon, victim: object):
+                    self.daemon = daemon
+                    self.victim = victim
+
+                async def send_text(self, payload: str) -> None:
+                    # Mimics a peer disconnecting mid-broadcast.
+                    self.daemon.websocket_clients.discard(self.victim)
+
+            class _NoopClient:
+                async def send_text(self, payload: str) -> None:
+                    return
+
+            noop = _NoopClient()
+            mutating = _MutatingClient(d, noop)
+            d.websocket_clients = {noop, mutating}  # type: ignore[assignment]
+
+            # Pre-fix this raised RuntimeError("Set changed size during iteration").
+            await d._broadcast_to_clients({"type": "health_check", "data": {}})
+
+        asyncio.run(run())
+
+
 class TestProxyBindTargets:
     """Plan dual-stack pairs so v6-preferring resolvers reach the proxy."""
 
