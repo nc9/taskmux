@@ -316,6 +316,8 @@ def _warn_unprivileged_daemon() -> None:
     needs: list[str] = []
     if cfg.proxy_https_port < 1024:
         needs.append(f"bind :{cfg.proxy_https_port}")
+    if 0 < cfg.proxy_http_redirect_port < 1024:
+        needs.append(f"bind :{cfg.proxy_http_redirect_port}")
     if cfg.host_resolver in ("etc_hosts", "dns_server"):
         target = (
             "/etc/hosts"
