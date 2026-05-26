@@ -808,6 +808,10 @@ ws.send(JSON.stringify({ command: "logs", params: { task: "server", lines: 50 } 
 
 Each task runs as a child of the daemon, in its own process group, with a PTY attached so `isatty()` keeps returning true and ANSI colors survive into log files. `taskmux daemon stop` (or any clean SIGTERM) signal-cascades into every task's process group.
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## Links
 
 - [PyPI](https://pypi.org/project/taskmux/)
