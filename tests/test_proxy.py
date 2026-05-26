@@ -133,3 +133,52 @@ def test_route_lookup_no_match_returns_none():
     assert _route_lookup(proxy, "p", "unknown") is None
     assert _route_lookup(proxy, "p", "") is None
     assert _route_lookup(proxy, "other", "api") is None
+
+
+# ---------------------------------------------------------------------------
+# RedirectServer
+# ---------------------------------------------------------------------------
+
+
+import asyncio  # noqa: E402
+
+from aiohttp.test_utils import make_mocked_request  # noqa: E402
+
+from taskmux.proxy import RedirectServer  # noqa: E402
+
+
+def _redirect(host_header: str, *, https_port: int = 443, path: str = "/") -> str:
+    r = RedirectServer(http_port=80, https_port=https_port)
+    req = make_mocked_request("GET", path, headers={"Host": host_header})
+    resp = asyncio.run(r._handle(req))
+    assert resp.status == 301
+    return resp.headers["Location"]
+
+
+def test_redirect_default_port_omits_port():
+    assert _redirect("api.proj.localhost") == "https://api.proj.localhost/"
+
+
+def test_redirect_strips_incoming_port():
+    assert _redirect("api.proj.localhost:80") == "https://api.proj.localhost/"
+
+
+def test_redirect_preserves_path_and_query():
+    assert (
+        _redirect("api.proj.localhost", path="/v1/items?id=5&t=a")
+        == "https://api.proj.localhost/v1/items?id=5&t=a"
+    )
+
+
+def test_redirect_appends_non_default_https_port():
+    assert (
+        _redirect("api.proj.localhost:80", https_port=4443)
+        == "https://api.proj.localhost:4443/"
+    )
+
+
+def test_redirect_rejects_empty_host():
+    r = RedirectServer(http_port=80, https_port=443)
+    req = make_mocked_request("GET", "/", headers={"Host": ""})
+    resp = asyncio.run(r._handle(req))
+    assert resp.status == 400

@@ -321,6 +321,77 @@ class ProxyServer:
         return client_ws
 
 
+class RedirectServer:
+    """Plain-HTTP listener that 301-redirects every request to HTTPS.
+
+    Lets users hit `http://api.proj.localhost` (or just type
+    `api.proj.localhost` and let the browser pick http) without an
+    ERR_CONNECTION_REFUSED dead-end. Lifecycle mirrors `ProxyServer`:
+    daemon pre-binds sockets as root, hands them here after privilege
+    drop.
+    """
+
+    def __init__(
+        self,
+        http_port: int,
+        https_port: int,
+        bind: str = "127.0.0.1",
+        socks: list[socket.socket] | None = None,
+    ) -> None:
+        self.http_port = http_port
+        self.https_port = https_port
+        self.bind = bind
+        self._socks: list[socket.socket] = list(socks) if socks else []
+        self.logger = logging.getLogger("taskmux-daemon.proxy.redirect")
+        self._runner: web.AppRunner | None = None
+        self._sites: list[web.BaseSite] = []
+
+    async def start(self) -> None:
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", self._handle)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+
+        if self._socks:
+            for sk in self._socks:
+                site = web.SockSite(self._runner, sk)
+                await site.start()
+                self._sites.append(site)
+                fam = "v6" if sk.family == socket.AF_INET6 else "v4"
+                self.logger.info(
+                    f"HTTP→HTTPS redirect on http://{self.bind}:{self.http_port} ({fam})"
+                )
+        else:
+            site = web.TCPSite(self._runner, host=self.bind, port=self.http_port)
+            await site.start()
+            self._sites.append(site)
+            self.logger.info(
+                f"HTTP→HTTPS redirect on http://{self.bind}:{self.http_port}"
+            )
+
+    async def stop(self) -> None:
+        for site in self._sites:
+            await site.stop()
+        self._sites = []
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        host_header = request.headers.get("Host", "")
+        # Strip any incoming :port so we can substitute the HTTPS port.
+        host = host_header.split(":", 1)[0]
+        if not host:
+            return web.Response(status=400, text="invalid host header\n")
+        # Omit the port when it's the default 443; preserves clean URLs.
+        suffix = "" if self.https_port == 443 else f":{self.https_port}"
+        location = f"https://{host}{suffix}{request.rel_url.raw_path_qs}"
+        return web.Response(
+            status=301,
+            headers={"Location": location, "Cache-Control": "no-store"},
+        )
+
+
 def _filter_hop(headers) -> dict[str, str]:  # noqa: ANN001
     """Strip hop-by-hop headers per RFC 7230."""
     return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}

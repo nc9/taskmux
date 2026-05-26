@@ -170,6 +170,16 @@ class GlobalConfig(BaseModel):
             "0.0.0.0 to expose to the LAN — only do this on trusted networks."
         ),
     )
+    proxy_http_redirect_port: int = Field(
+        default=80,
+        ge=0,
+        le=65535,
+        description=(
+            "HTTP port that serves a 301 redirect to the HTTPS proxy so "
+            "`{project}.localhost` (without protocol) works in browsers. "
+            "Set to 0 to disable. Binding <1024 needs root (same as proxy)."
+        ),
+    )
     host_resolver: str = Field(
         default="etc_hosts",
         description=(

@@ -47,7 +47,7 @@ from .paths import (
     globalDaemonPidPath,
     projectLogsDir,
 )
-from .proxy import ProxyServer
+from .proxy import ProxyServer, RedirectServer
 from .registry import readRegistry
 from .supervisor import Supervisor, _parseSince, make_supervisor, readLogFile
 from .tunnels import (
@@ -255,6 +255,8 @@ class TaskmuxDaemon:
         self._proxy_eligible = False
         self._proxy_started = False
         self._proxy_socks: list[socket.socket] = []
+        self.redirect: RedirectServer | None = None
+        self._redirect_socks: list[socket.socket] = []
         # session -> last-warned missing config_path. Re-warn if the path
         # changes; clear on successful load or unregister so a later miss
         # re-warns once.
@@ -319,6 +321,7 @@ class TaskmuxDaemon:
 
         self._warn_if_unprivileged()
         self._proxy_socks = self._pre_bind_proxy_sockets()
+        self._redirect_socks = self._pre_bind_redirect_sockets()
         self._install_resolver_root()
         self._drop_privileges()
 
@@ -400,6 +403,10 @@ class TaskmuxDaemon:
         if self.proxy is not None and self._loop is not None:
             with contextlib.suppress(Exception):
                 asyncio.run_coroutine_threadsafe(self.proxy.stop(), self._loop)
+
+        if self.redirect is not None and self._loop is not None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(self.redirect.stop(), self._loop)
 
         if self.dns_server is not None and self._loop is not None:
             with contextlib.suppress(Exception):
@@ -567,6 +574,9 @@ class TaskmuxDaemon:
         needs_priv: list[str] = []
         if self.global_config.proxy_https_port < 1024:
             needs_priv.append(f"binding the proxy on :{self.global_config.proxy_https_port}")
+        rport = self.global_config.proxy_http_redirect_port
+        if 0 < rport < 1024:
+            needs_priv.append(f"binding the http→https redirect on :{rport}")
         if self.global_config.host_resolver in ("etc_hosts", "dns_server"):
             target = (
                 "/etc/hosts"
@@ -605,24 +615,18 @@ class TaskmuxDaemon:
         family = socket.AF_INET6 if ":" in bind else socket.AF_INET
         return [(family, bind)]
 
-    def _pre_bind_proxy_sockets(self) -> list[socket.socket]:
-        """Bind proxy listeners as root, before privilege drop.
+    def _pre_bind_one_port(
+        self, port: int, label: str, *, fatal: bool
+    ) -> list[socket.socket]:
+        """Bind listeners for one port across the bind's address families.
 
-        macOS libc maps `*.localhost` → both 127.0.0.1 *and* ::1, with v6
-        preferred by getaddrinfo. Listening only on v4 means TLS handshake
-        fails for any client that tries v6 first (curl, browsers). When the
-        operator picks a loopback bind we mirror to the matching v6/v4 family
-        so connections land regardless of address selection. Operators who
-        bind to a specific non-loopback address get exactly what they asked
-        for — no surprises.
+        `fatal=True`: a primary-bind failure logs an error and returns []
+        (the HTTPS proxy can't run without its port). `fatal=False`: a
+        failure logs a warning and returns [] (redirect is optional —
+        the HTTPS proxy still works). Secondary-family failures always
+        warn and continue.
         """
-        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
-            return []
-        if not self.global_config.proxy_enabled:
-            return []
-
         bind = self.global_config.proxy_bind
-        port = self.global_config.proxy_https_port
         targets = self._proxy_bind_targets(bind)
 
         socks: list[socket.socket] = []
@@ -645,25 +649,59 @@ class TaskmuxDaemon:
                 if s is not None:
                     s.close()
                 primary = not socks
-                if primary:
+                if primary and fatal:
                     self.logger.error(
-                        f"Pre-bind to {display} failed: {e}. "
+                        f"Pre-bind {label} to {display} failed: {e}. "
                         f"Run with `sudo taskmux daemon` (the daemon binds :{port} as root "
-                        f"then drops privileges immediately) or set proxy_https_port to "
-                        f"a non-privileged port (>=1024) in ~/.taskmux/config.toml."
+                        f"then drops privileges immediately) or pick a port >=1024 "
+                        f"in ~/.taskmux/config.toml."
+                    )
+                    return []
+                if primary:
+                    self.logger.warning(
+                        f"Pre-bind {label} to {display} failed: {e}; "
+                        f"continuing without it."
                     )
                     return []
                 self.logger.warning(
-                    f"Pre-bind to {display} failed: {e}; serving without "
+                    f"Pre-bind {label} to {display} failed: {e}; serving without "
                     f"this address family. macOS clients preferring this "
                     f"family will fail to connect."
                 )
                 continue
             socks.append(s)
-            self.logger.info(
-                f"Pre-bound proxy listener on {display} (will TLS-wrap after privilege drop)"
-            )
+            self.logger.info(f"Pre-bound {label} listener on {display}")
         return socks
+
+    def _pre_bind_proxy_sockets(self) -> list[socket.socket]:
+        """Bind proxy listeners as root, before privilege drop.
+
+        macOS libc maps `*.localhost` → both 127.0.0.1 *and* ::1, with v6
+        preferred by getaddrinfo. Listening only on v4 means TLS handshake
+        fails for any client that tries v6 first (curl, browsers). When the
+        operator picks a loopback bind we mirror to the matching v6/v4 family
+        so connections land regardless of address selection. Operators who
+        bind to a specific non-loopback address get exactly what they asked
+        for — no surprises.
+        """
+        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+            return []
+        if not self.global_config.proxy_enabled:
+            return []
+        return self._pre_bind_one_port(
+            self.global_config.proxy_https_port, "proxy (https)", fatal=True
+        )
+
+    def _pre_bind_redirect_sockets(self) -> list[socket.socket]:
+        """Bind the optional HTTP→HTTPS redirect port. Failure is non-fatal."""
+        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+            return []
+        if not self.global_config.proxy_enabled:
+            return []
+        port = self.global_config.proxy_http_redirect_port
+        if port == 0:
+            return []
+        return self._pre_bind_one_port(port, "http→https redirect", fatal=False)
 
     def _install_resolver_root(self) -> None:
         if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
@@ -995,6 +1033,26 @@ class TaskmuxDaemon:
             for session in list(self.projects.keys()):
                 self._mint_and_register_proxy(session)
             await self._start_proxy_listener()
+            await self._start_redirect_listener()
+
+    async def _start_redirect_listener(self) -> None:
+        if not self._redirect_socks or self.redirect is not None:
+            return
+        self.redirect = RedirectServer(
+            http_port=self.global_config.proxy_http_redirect_port,
+            https_port=self.global_config.proxy_https_port,
+            bind=self.global_config.proxy_bind,
+            socks=self._redirect_socks,
+        )
+        try:
+            await self.redirect.start()
+        except (PermissionError, OSError) as e:
+            self.logger.warning(
+                f"HTTP→HTTPS redirect failed to start: {e}. "
+                f"http://<name>.localhost will return ERR_CONNECTION_REFUSED; "
+                f"https:// still works."
+            )
+            self.redirect = None
 
     async def _start_proxy_listener(self) -> None:
         if self.proxy is None or self._proxy_started:
