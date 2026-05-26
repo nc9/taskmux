@@ -127,3 +127,149 @@ def test_config_set_accepts_known_key(isolated):
     from taskmux.global_config import loadGlobalConfig
 
     assert loadGlobalConfig().health_check_interval == 12
+
+
+# ---------------------------------------------------------------------------
+# R-002 — daemon stop/restart SIGTERM→SIGKILL escalation
+# ---------------------------------------------------------------------------
+
+
+def _spawn_sleeping_child(*, trap_sigterm: bool):
+    """Fork a long-sleeping subprocess and write its pid to GLOBAL_DAEMON_PID.
+
+    Synchronizes on a "READY" stdout marker so SIGTERM races with handler
+    installation don't pre-kill a child that's meant to trap SIGTERM.
+
+    Returns the Popen handle — caller must `.wait()` it to reap the zombie
+    after the test (otherwise `kill -0` still succeeds because the test
+    runner is the child's parent rather than launchd/shell).
+    """
+    import subprocess
+    import sys as _sys
+
+    if trap_sigterm:
+        script = (
+            "import signal, sys, time;"
+            "signal.signal(signal.SIGTERM, lambda *a: None);"
+            "sys.stdout.write('READY\\n');sys.stdout.flush();"
+            "time.sleep(60)"
+        )
+    else:
+        script = (
+            "import sys, time;"
+            "sys.stdout.write('READY\\n');sys.stdout.flush();"
+            "time.sleep(60)"
+        )
+    proc = subprocess.Popen(
+        ["python3", "-c", script], stdout=subprocess.PIPE, text=True
+    )
+    # Block until child has installed its handler and reached time.sleep.
+    line = proc.stdout.readline()
+    if line.strip() != "READY":
+        proc.kill()
+        raise RuntimeError(f"child failed to signal ready: got {line!r}")
+    paths_mod.GLOBAL_DAEMON_PID.write_text(str(proc.pid))
+    _ = _sys  # unused
+    return proc
+
+
+def test_stop_escalates_to_sigkill_when_sigterm_ignored(isolated):
+    """SIGTERM-trapping daemon → stop should escalate to SIGKILL and remove pidfile."""
+    import os
+
+    proc = _spawn_sleeping_child(trap_sigterm=True)
+    try:
+        runner = CliRunner()
+        result = runner.invoke(cli_mod.app, ["daemon", "stop", "--timeout", "0.5"])
+        proc.wait(timeout=3.0)  # reap zombie so kill -0 starts returning ESRCH
+        assert result.exit_code == 0, result.output
+        assert "force-killed" in result.output
+        with pytest.raises(OSError):
+            os.kill(proc.pid, 0)
+        assert not paths_mod.GLOBAL_DAEMON_PID.exists()
+    finally:
+        with contextlib_suppress():
+            os.kill(proc.pid, 9)
+        with contextlib_suppress():
+            proc.wait(timeout=1.0)
+
+
+def test_stop_uses_sigterm_when_daemon_exits_gracefully(isolated):
+    """Daemon that respects SIGTERM → stop returns "term", no force-kill."""
+    import os
+
+    proc = _spawn_sleeping_child(trap_sigterm=False)
+    try:
+        runner = CliRunner()
+        result = runner.invoke(cli_mod.app, ["daemon", "stop", "--timeout", "3.0"])
+        proc.wait(timeout=3.0)
+        assert result.exit_code == 0, result.output
+        assert "stopped" in result.output.lower()
+        assert "force-killed" not in result.output
+        with pytest.raises(OSError):
+            os.kill(proc.pid, 0)
+        assert not paths_mod.GLOBAL_DAEMON_PID.exists()
+    finally:
+        with contextlib_suppress():
+            os.kill(proc.pid, 9)
+        with contextlib_suppress():
+            proc.wait(timeout=1.0)
+
+
+def test_stop_no_daemon_running(isolated):
+    """No pidfile → stop reports gracefully, doesn't crash."""
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["daemon", "stop"])
+    assert result.exit_code == 0
+    assert "No daemon running" in result.output
+
+
+def test_stop_cleans_stale_pidfile_for_dead_process(isolated):
+    """Pidfile points at a dead pid → escalation reports "already_gone" cleanly."""
+    import os
+    import subprocess
+
+    proc = subprocess.Popen(["python3", "-c", "pass"])
+    proc.wait()
+    paths_mod.GLOBAL_DAEMON_PID.write_text(str(proc.pid))
+    runner = CliRunner()
+    result = runner.invoke(cli_mod.app, ["daemon", "stop"])
+    # get_daemon_pid auto-removes stale pidfile, so the user sees "No daemon
+    # running" rather than "already gone" — either is acceptable; assert no
+    # crash + pidfile gone.
+    assert result.exit_code == 0
+    assert not paths_mod.GLOBAL_DAEMON_PID.exists()
+    with pytest.raises(OSError):
+        os.kill(proc.pid, 0)
+
+
+def test_restart_escalates_then_spawns_fresh(isolated):
+    """Restart against a SIGTERM-trapping daemon: SIGKILL, then new spawn."""
+    import os
+    from unittest.mock import MagicMock, patch
+
+    proc = _spawn_sleeping_child(trap_sigterm=True)
+    fake_new_pid = 99_999_999
+    try:
+        with (
+            patch("subprocess.Popen", return_value=MagicMock(pid=fake_new_pid)),
+            patch.object(cli_mod, "get_daemon_pid", side_effect=[proc.pid, fake_new_pid]),
+        ):
+            runner = CliRunner()
+            result = runner.invoke(cli_mod.app, ["daemon", "restart", "--timeout", "0.5"])
+        proc.wait(timeout=3.0)
+        assert result.exit_code == 0, result.output
+        assert "SIGKILL" in result.output or "restarted" in result.output.lower()
+        with pytest.raises(OSError):
+            os.kill(proc.pid, 0)
+    finally:
+        with contextlib_suppress():
+            os.kill(proc.pid, 9)
+        with contextlib_suppress():
+            proc.wait(timeout=1.0)
+
+
+def contextlib_suppress():
+    import contextlib
+
+    return contextlib.suppress(ProcessLookupError, OSError)

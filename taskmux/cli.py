@@ -34,6 +34,7 @@ from .output import is_json_mode, print_error, print_result, set_json_mode
 from .paths import (
     ensureTaskmuxDir,
     globalDaemonLogPath,
+    globalDaemonPidPath,
     taskLogPath,
 )
 from .paths import migrate as migrateLayout
@@ -1377,22 +1378,91 @@ def daemon(
     asyncio.run(d.start())
 
 
+def _reap_if_zombie(pid: int) -> None:
+    """Best-effort non-blocking waitpid so a zombie child stops accepting kill(0).
+
+    Production path: daemon's parent (launchd/shell) reaps it via SIGCHLD.
+    Test path: the test runner is the child's parent, so without this the
+    zombie keeps `kill -0` succeeding until the test process itself exits.
+    """
+    import os
+
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
 def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
     import os
     import time as _t
 
     deadline = _t.monotonic() + timeout
     while _t.monotonic() < deadline:
+        _reap_if_zombie(pid)
         try:
             os.kill(pid, 0)
         except OSError:
             return True
         _t.sleep(0.1)
+    _reap_if_zombie(pid)
     try:
         os.kill(pid, 0)
     except OSError:
         return True
     return False
+
+
+def _remove_stale_daemon_pidfile(pid: int) -> bool:
+    """Remove daemon.pid iff it still points at `pid`. Returns True if removed."""
+    path = globalDaemonPidPath()
+    try:
+        if path.exists() and path.read_text().strip() == str(pid):
+            path.unlink()
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _stop_daemon_with_escalation(pid: int, *, term_timeout: float = 5.0) -> tuple[bool, str]:
+    """SIGTERM → wait → SIGKILL → cleanup pidfile. Returns (ok, action).
+
+    action ∈ {"term", "kill", "term_then_gone", "already_gone"} on success;
+    on failure it carries a human-readable error string (e.g. "EPERM").
+    """
+    import os
+    import signal as _sig
+
+    try:
+        os.kill(pid, _sig.SIGTERM)
+    except ProcessLookupError:
+        _remove_stale_daemon_pidfile(pid)
+        return True, "already_gone"
+    except PermissionError:
+        return False, "EPERM (daemon owned by another user — try with sudo)"
+    except OSError as e:
+        return False, f"SIGTERM failed: {e}"
+
+    if _wait_for_pid_exit(pid, timeout=term_timeout):
+        _remove_stale_daemon_pidfile(pid)
+        return True, "term"
+
+    try:
+        os.kill(pid, _sig.SIGKILL)
+    except ProcessLookupError:
+        _remove_stale_daemon_pidfile(pid)
+        return True, "term_then_gone"
+    except PermissionError:
+        return False, "EPERM on SIGKILL (daemon owned by another user — try with sudo)"
+    except OSError as e:
+        return False, f"SIGKILL failed: {e}"
+
+    if not _wait_for_pid_exit(pid, timeout=2.0):
+        return False, f"pid {pid} survived SIGKILL"
+
+    _remove_stale_daemon_pidfile(pid)
+    return True, "kill"
 
 
 @daemon_app.command("start")
@@ -1441,11 +1511,14 @@ def daemon_pid():
 
 
 @daemon_app.command("stop")
-def daemon_stop():
-    """SIGTERM the global daemon."""
-    import os
-    import signal as _sig
-
+def daemon_stop(
+    timeout: float = typer.Option(  # noqa: B008
+        5.0,
+        "--timeout",
+        help="Seconds to wait for graceful SIGTERM shutdown before escalating to SIGKILL.",
+    ),
+):
+    """Stop the global daemon. SIGTERM → wait → SIGKILL escalation; stale pidfile cleaned."""
     pid = get_daemon_pid()
     if pid is None:
         if is_json_mode():
@@ -1453,18 +1526,25 @@ def daemon_stop():
         else:
             console.print("No daemon running")
         return
-    try:
-        os.kill(pid, _sig.SIGTERM)
-    except OSError as e:
+
+    ok, action = _stop_daemon_with_escalation(pid, term_timeout=timeout)
+    if not ok:
         if is_json_mode():
-            print_result({"ok": False, "error": str(e)})
+            print_result({"ok": False, "pid": pid, "error": action})
         else:
-            console.print(f"Failed to signal daemon: {e}", style="red")
+            console.print(f"Failed to stop daemon (pid {pid}): {action}", style="red")
         return
+
     if is_json_mode():
-        print_result({"ok": True, "pid": pid, "action": "stopped"})
+        print_result({"ok": True, "pid": pid, "action": action})
     else:
-        console.print(f"Sent SIGTERM to daemon (pid {pid})")
+        messages = {
+            "term": f"Daemon stopped (pid {pid})",
+            "kill": f"Daemon force-killed (pid {pid}) — graceful shutdown timed out after {timeout}s",
+            "term_then_gone": f"Daemon stopped (pid {pid})",
+            "already_gone": f"Daemon was already gone (cleaned stale pidfile for {pid})",
+        }
+        console.print(messages.get(action, f"Daemon stopped (pid {pid})"))
 
 
 @daemon_app.command("status")
@@ -1486,27 +1566,24 @@ def daemon_restart(
     port: int | None = typer.Option(  # noqa: B008
         None, "--port", help="WebSocket API port (overrides ~/.taskmux/config.toml)"
     ),
+    timeout: float = typer.Option(  # noqa: B008
+        5.0,
+        "--timeout",
+        help="Seconds to wait for graceful SIGTERM shutdown before escalating to SIGKILL.",
+    ),
 ):
-    """Stop the global daemon (if any) and spawn a fresh one."""
-    import os
-    import signal as _sig
-
+    """Stop (SIGTERM → SIGKILL escalation) the global daemon and spawn a fresh one."""
     pid = get_daemon_pid()
+    stop_action: str | None = None
     if pid is not None:
-        try:
-            os.kill(pid, _sig.SIGTERM)
-        except OSError as e:
+        ok, action = _stop_daemon_with_escalation(pid, term_timeout=timeout)
+        if not ok:
             if is_json_mode():
-                print_result({"ok": False, "error": f"failed to stop: {e}"})
+                print_result({"ok": False, "pid": pid, "error": action})
             else:
-                console.print(f"Failed to stop daemon: {e}", style="red")
+                console.print(f"Failed to stop daemon (pid {pid}): {action}", style="red")
             return
-        if not _wait_for_pid_exit(pid, timeout=5.0):
-            if is_json_mode():
-                print_result({"ok": False, "error": f"daemon pid {pid} did not exit"})
-            else:
-                console.print(f"Daemon pid {pid} did not exit within 5s", style="red")
-            return
+        stop_action = action
     new_pid = _spawn_detached_daemon(port=port)
     if new_pid is None:
         if is_json_mode():
@@ -1515,9 +1592,23 @@ def daemon_restart(
             console.print("Daemon failed to start", style="red")
         return
     if is_json_mode():
-        print_result({"ok": True, "pid": new_pid, "action": "restarted", "old_pid": pid})
+        print_result(
+            {
+                "ok": True,
+                "pid": new_pid,
+                "action": "restarted",
+                "old_pid": pid,
+                "stop_action": stop_action,
+            }
+        )
     else:
-        console.print(f"Daemon restarted (pid {new_pid})")
+        if stop_action == "kill":
+            console.print(
+                f"Daemon restarted (pid {new_pid}) — previous pid {pid} required SIGKILL "
+                f"after {timeout}s SIGTERM grace"
+            )
+        else:
+            console.print(f"Daemon restarted (pid {new_pid})")
 
 
 @daemon_app.command("list")
