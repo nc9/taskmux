@@ -483,6 +483,11 @@ class TaskmuxDaemon:
                 f"for {config_path}; using registry key"
             )
 
+        # No shared boot_id: each supervisor self-generates a per-instance id.
+        # A daemon can drop+recreate a supervisor (config delete→recreate) while
+        # its old tasks still run; a shared id would make those orphans look
+        # "current" and escape reaping. Config *reload* mutates in place (same
+        # instance), so per-instance ids don't trigger spurious reaps.
         sup = make_supervisor(
             cfg,
             config_dir=config_path.parent,
@@ -533,7 +538,34 @@ class TaskmuxDaemon:
             observer.start()
             self.observers[session] = observer
 
+            # Reap task process groups orphaned by a prior daemon (macOS keeps
+            # setsid'd tasks alive across a daemon crash). Runs concurrently;
+            # each task's own _spawn dup-guard independently prevents doubles,
+            # so ordering vs the health loop doesn't matter.
+            reconcile = getattr(sup, "reconcile_orphans", None)
+            if reconcile is not None:
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._reconcile_project(session, reconcile))
+                )
+
         self.logger.info(f"Registered project '{session}' from {config_path}")
+
+    async def _reconcile_project(self, session: str, reconcile) -> None:  # type: ignore[no-untyped-def]
+        """Run a supervisor's orphan reaping and log the outcome. Best-effort."""
+        try:
+            result = await reconcile()
+        except Exception as e:  # noqa: BLE001
+            self.logger.error(f"Orphan reconcile failed for '{session}': {e}")
+            return
+        reaped = result.get("reaped") if isinstance(result, dict) else None
+        skipped = result.get("skipped") if isinstance(result, dict) else None
+        if reaped:
+            self.logger.info(f"Reaped {len(reaped)} orphaned task(s) for '{session}': {reaped}")
+        if skipped:
+            self.logger.warning(
+                f"Left {len(skipped)} unverifiable orphan(s) for '{session}' running "
+                f"(could not confirm ownership via ps): {skipped}"
+            )
 
     def _unregister_locked(self, session: str) -> None:
         observer = self.observers.pop(session, None)

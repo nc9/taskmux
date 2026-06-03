@@ -26,6 +26,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -368,9 +369,17 @@ class PosixSupervisor:
         config_dir: Path | None = None,
         project_id: str | None = None,
         worktree_id: str | None = None,
+        boot_id: str | None = None,
     ):
         self.config = config
         self.config_dir = config_dir
+        # Per-instance id. Persisted with each process record + embedded in the
+        # ps marker so a freshly created supervisor distinguishes its own
+        # children from orphans left by a prior instance — a prior daemon, OR a
+        # prior supervisor for the same project in THIS daemon (config
+        # delete→recreate) — and reaps the latter. Self-generated; `boot_id`
+        # arg only lets tests pin it.
+        self.boot_id = boot_id or uuid.uuid4().hex[:16]
         # `project_id` is the canonical session/registry/URL key. For primary
         # worktrees it's `config.name`; for linked worktrees it's
         # `config.name-{worktree_id}`. Defaulted to config.name for callers
@@ -378,6 +387,10 @@ class PosixSupervisor:
         self.project_id: str = project_id or config.name
         self.worktree_id: str | None = worktree_id
         self._tasks: dict[str, TaskProcess] = {}
+        # task_name -> {pid, pgid, started_at, boot_id}. Mirrors live tasks but
+        # PERSISTS to state.json (unlike _tasks), so a restarted daemon can find
+        # and reap process groups orphaned by a prior crash. See reconcile_orphans.
+        self._running: dict[str, dict] = {}
         # Per-task lock — serializes start/stop/restart/kill for the same task
         # so two concurrent RPCs can't both pass the "not running" check and
         # spawn duplicate processes. See review R-002.
@@ -423,14 +436,33 @@ class PosixSupervisor:
     def reload_state(self) -> None:
         self.assigned_ports = self._load_state()
 
+    def _load_running_records(self) -> dict:
+        """Read persisted process records (task -> {pid,pgid,started_at,boot_id}).
+
+        Returns {} when absent/unreadable. Used at startup to find orphans from a
+        prior daemon; current-boot records carry self.boot_id and are skipped.
+        """
+        try:
+            data = json.loads(self._state_path().read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        rec = data.get("running", {})
+        return rec if isinstance(rec, dict) else {}
+
     def _save_state(self) -> None:
         from .paths import ensureProjectDir
 
         ensureProjectDir(self.config.name, self.worktree_id)
+        payload = json.dumps(
+            {"assigned_ports": self.assigned_ports, "running": self._running}, indent=2
+        )
+        path = self._state_path()
+        tmp = path.parent / f"{path.name}.tmp"
+        # Atomic write — state.json is now the duplicate-process guard's source
+        # of truth, so a crash mid-write must not truncate it to invalid JSON.
         with contextlib.suppress(OSError):
-            self._state_path().write_text(
-                json.dumps({"assigned_ports": self.assigned_ports}, indent=2)
-            )
+            tmp.write_text(payload)
+            os.replace(tmp, path)
 
     @staticmethod
     def _pick_free_port() -> int:
@@ -457,12 +489,38 @@ class PosixSupervisor:
         with contextlib.suppress(Exception):
             cb(self.project_id, task_name, cfg.host, port)
 
+    # Embedded in every task's `/bin/sh -c` argv as a `:` no-op label so the
+    # process group is identifiable via `ps` independent of in-memory state —
+    # the ownership guard before reaping an orphan by pgid (vs killing a reused
+    # pid). Kept first in the command so `ps` truncation can't drop it.
+    _MARKER_TAG = "taskmux-task"
+
+    @staticmethod
+    def _marker_safe(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", s)
+
+    def _task_marker_prefix(self, task_name: str) -> str:
+        """Boot-agnostic marker prefix — matches this task across any daemon boot."""
+        proj = self._marker_safe(self.project_id)
+        task = self._marker_safe(task_name)
+        return f"{self._MARKER_TAG}:{proj}:{task}:"
+
+    def _task_marker(self, task_name: str) -> str:
+        return f"{self._task_marker_prefix(task_name)}{self.boot_id}"
+
     def _wrap_command(self, task_name: str, command: str) -> str:
+        # Run the user command in a subshell so an `exec`-style command replaces
+        # the SUBSHELL, never the marked `/bin/sh -c` leader. The leader keeps the
+        # ps marker for its whole life → reaping identifies the group exactly (no
+        # pid-reuse heuristics); killpg still reaps the subshell tree. `(` / `)`
+        # go on their own lines so a trailing `# comment` or a heredoc delimiter
+        # in the user command can't swallow or collide with the closing paren.
         cfg = self.config.tasks.get(task_name)
-        if cfg is None or cfg.host is None:
-            return command
-        port = self._ensure_port(task_name)
-        return f"export PORT={port}; {command}"
+        prefix = f": {self._task_marker(task_name)};"
+        if cfg is not None and cfg.host is not None:
+            port = self._ensure_port(task_name)
+            prefix += f" export PORT={port};"
+        return f"{prefix} (\n{command}\n)"
 
     def _build_log_decor(
         self, task_name: str, task_cfg: TaskConfig
@@ -527,6 +585,11 @@ class PosixSupervisor:
             return None
 
     async def _spawn(self, task_name: str) -> TaskProcess:
+        # Kill any prior-boot orphan owning this task before we start a second
+        # copy — the core duplicate guard, robust to a daemon crash having wiped
+        # in-memory _tasks.
+        await self._reap_stale_task(task_name)
+
         task_cfg = self.config.tasks[task_name]
         cwd_abs = self._resolve_cwd(task_cfg.cwd)
         wrapped = self._wrap_command(task_name, task_cfg.command)
@@ -579,6 +642,13 @@ class PosixSupervisor:
         )
         tp.exit_task = asyncio.create_task(self._wait_for_exit(task_name, proc))
         self._tasks[task_name] = tp
+        self._running[task_name] = {
+            "pid": proc.pid,
+            "pgid": pgid,
+            "started_at": tp.started_at,
+            "boot_id": self.boot_id,
+        }
+        self._save_state()
         return tp
 
     def _on_pty_data(self, task_name: str, master_fd: int, log_writer: LogWriter) -> None:
@@ -605,6 +675,8 @@ class PosixSupervisor:
 
     def _on_task_exited(self, task_name: str, exit_code: int) -> None:
         tp = self._tasks.pop(task_name, None)
+        if self._running.pop(task_name, None) is not None:
+            self._save_state()
         if tp is None:
             return
         tp.exit_code = exit_code
@@ -631,6 +703,127 @@ class PosixSupervisor:
     def _killpg(self, pgid: int, signum: int) -> None:
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(pgid, signum)
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True  # exists but we lack permission to signal it
+        return True
+
+    @staticmethod
+    def _pgid_alive(pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
+    async def _pid_is_our_task(self, pid: int, task_name: str, boot_id: str | None) -> bool:
+        """Confirm a live `pid` is the task recorded under `boot_id` before reaping.
+
+        Matches the FULL marker `…:<task>:<boot_id>` (not the boot-agnostic
+        prefix), so a pid reused by a NEWER leader for the same task — different
+        boot_id — can't be mistakenly killed. Because the user command runs in a
+        subshell, an `exec` can't strip the marker off the leader, so this exact
+        match holds for the process's whole life. Async `ps` so verifying many
+        orphans at startup doesn't stall the loop. Conservative: False when ps
+        fails or the record carries no boot_id.
+        """
+        if not boot_id:
+            return False
+        marker = f"{self._task_marker_prefix(task_name)}{boot_id}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ps",
+                "-o",
+                "command=",
+                "-p",
+                str(pid),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        except (OSError, TimeoutError):
+            return False
+        return marker in out.decode(errors="replace")
+
+    async def _areap_pgid(self, pgid: int) -> None:
+        """SIGTERM a process group, wait briefly, then SIGKILL survivors."""
+        self._killpg(pgid, signal.SIGTERM)
+        for _ in range(20):  # ~2s grace
+            if not self._pgid_alive(pgid):
+                return
+            await asyncio.sleep(0.1)
+        self._killpg(pgid, signal.SIGKILL)
+        await asyncio.sleep(0.1)
+
+    async def _reap_stale_task(self, task_name: str) -> None:
+        """Reap a prior-boot orphan for this task before (re)spawning it.
+
+        The duplicate-process guard: in-memory _tasks is empty after a daemon
+        crash, so the only thing standing between a respawn and a duplicate is
+        the persisted record. If a live, marker-verified process group from a
+        DIFFERENT boot owns this task, kill it first.
+        """
+        rec = self._load_running_records().get(task_name)
+        if not rec or rec.get("boot_id") == self.boot_id:
+            return
+        pid, pgid = rec.get("pid"), rec.get("pgid")
+        if not isinstance(pid, int) or not isinstance(pgid, int):
+            return
+        if not self._pid_alive(pid):
+            return
+        if not await self._pid_is_our_task(pid, task_name, rec.get("boot_id")):
+            return
+        await self._areap_pgid(pgid)
+        recordEvent("orphan_reaped", session=self.project_id, task=task_name, pid=pid)
+
+    async def reconcile_orphans(self) -> dict:
+        """Reap every prior-boot task process group still alive for this project.
+
+        Run once when the supervisor is (re)created. macOS leaves setsid'd tasks
+        running when the daemon is SIGKILLed/crashes; without this they linger
+        with a broken PTY while the fresh daemon respawns them → duplicates.
+        Per-task _spawn dup-guards also cover this, but tasks that won't be
+        auto-respawned (restart_policy=no) would otherwise never get cleaned.
+        """
+        prior = self._load_running_records()
+        reaped: list[str] = []
+        skipped: list[str] = []
+        pending: list[tuple[str, int, int]] = []  # (task, pgid, pid)
+        for task_name, rec in prior.items():
+            if not isinstance(rec, dict) or rec.get("boot_id") == self.boot_id:
+                continue
+            pid, pgid = rec.get("pid"), rec.get("pgid")
+            if not isinstance(pid, int) or not isinstance(pgid, int):
+                continue
+            if not self._pid_alive(pid):
+                continue
+            if not await self._pid_is_our_task(pid, task_name, rec.get("boot_id")):
+                skipped.append(task_name)
+                continue
+            self._killpg(pgid, signal.SIGTERM)
+            pending.append((task_name, pgid, pid))
+        if pending:
+            for _ in range(20):  # ~2s shared grace
+                if all(not self._pgid_alive(pg) for _, pg, _ in pending):
+                    break
+                await asyncio.sleep(0.1)
+            for task_name, pgid, pid in pending:
+                if self._pgid_alive(pgid):
+                    self._killpg(pgid, signal.SIGKILL)
+                reaped.append(task_name)
+                recordEvent("orphan_reaped", session=self.project_id, task=task_name, pid=pid)
+        # Drop prior-boot records; current boot starts from a clean slate.
+        if prior:
+            self._save_state()
+        return {"reaped": reaped, "skipped": skipped}
 
     async def _wait_proc_exit(self, proc: asyncio.subprocess.Process, timeout: float) -> bool:
         try:
@@ -1272,6 +1465,7 @@ def make_supervisor(
     config_dir: Path | None = None,
     project_id: str | None = None,
     worktree_id: str | None = None,
+    boot_id: str | None = None,
 ) -> Supervisor:
     sysname = platform.system()
     if sysname in ("Darwin", "Linux"):
@@ -1280,6 +1474,7 @@ def make_supervisor(
             config_dir=config_dir,
             project_id=project_id,
             worktree_id=worktree_id,
+            boot_id=boot_id,
         )
     raise NotImplementedError(
         f"No Supervisor implementation for platform {sysname!r}. "

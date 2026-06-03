@@ -382,6 +382,7 @@ class FakeSupervisor:
         config_dir=None,  # noqa: ARG002
         project_id: str | None = None,
         worktree_id: str | None = None,
+        boot_id: str | None = None,  # noqa: ARG002
     ):
         self.config = config
         self.project_id = project_id or config.name
