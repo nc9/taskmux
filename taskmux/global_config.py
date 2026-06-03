@@ -290,6 +290,43 @@ def loadGlobalConfig(path: Path | None = None) -> GlobalConfig:
         raise TaskmuxError(ErrorCode.CONFIG_VALIDATION, detail=str(e)) from e
 
 
+def privilegedNeeds(config: GlobalConfig) -> list[str]:
+    """Root-only resources the daemon must acquire at bootstrap, given `config`.
+
+    Empty list => the daemon can run fully unprivileged. The daemon binds these
+    as root then drops to the invoking user, so this is the single source of
+    truth for "does (re)starting the daemon require sudo". Mirrors the gate the
+    daemon itself applies; the CLI/IPC spawn paths consult it to refuse an
+    unprivileged (re)spawn that would fail to bind :443/:80 (see issue: a
+    non-root start/stop/restart replacing a root-bootstrapped daemon).
+
+    Honors TASKMUX_DISABLE_PROXY=1 and proxy_enabled=false (both => no root
+    need, since the proxy + its hostnames are the only privileged consumers).
+    """
+    if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+        return []
+    if not config.proxy_enabled:
+        return []
+    needs: list[str] = []
+    if config.proxy_https_port < 1024:
+        needs.append(f"bind :{config.proxy_https_port}")
+    if 0 < config.proxy_http_redirect_port < 1024:
+        needs.append(f"bind :{config.proxy_http_redirect_port}")
+    if config.host_resolver in ("etc_hosts", "dns_server"):
+        target = (
+            "/etc/hosts"
+            if config.host_resolver == "etc_hosts"
+            else f"/etc/resolver/{config.dns_managed_tld}"
+        )
+        needs.append(f"write {target}")
+    return needs
+
+
+def requiresRoot(config: GlobalConfig) -> bool:
+    """True iff starting the daemon under this config needs root. See privilegedNeeds."""
+    return bool(privilegedNeeds(config))
+
+
 def hasEmbeddedToken(config: GlobalConfig) -> bool:
     """Whether the in-memory config carries a Cloudflare API token directly."""
     return bool(config.tunnel.cloudflare.api_token)

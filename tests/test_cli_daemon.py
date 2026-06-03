@@ -155,14 +155,8 @@ def _spawn_sleeping_child(*, trap_sigterm: bool):
             "time.sleep(60)"
         )
     else:
-        script = (
-            "import sys, time;"
-            "sys.stdout.write('READY\\n');sys.stdout.flush();"
-            "time.sleep(60)"
-        )
-    proc = subprocess.Popen(
-        ["python3", "-c", script], stdout=subprocess.PIPE, text=True
-    )
+        script = "import sys, time;sys.stdout.write('READY\\n');sys.stdout.flush();time.sleep(60)"
+    proc = subprocess.Popen(["python3", "-c", script], stdout=subprocess.PIPE, text=True)
     # Block until child has installed its handler and reached time.sleep.
     line = proc.stdout.readline()
     if line.strip() != "READY":
@@ -256,7 +250,10 @@ def test_restart_escalates_then_spawns_fresh(isolated):
             patch.object(cli_mod, "get_daemon_pid", side_effect=[proc.pid, fake_new_pid]),
         ):
             runner = CliRunner()
-            result = runner.invoke(cli_mod.app, ["daemon", "restart", "--timeout", "0.5"])
+            # --force: default config needs root; this test exercises escalation, not the gate.
+            result = runner.invoke(
+                cli_mod.app, ["daemon", "restart", "--timeout", "0.5", "--force"]
+            )
         proc.wait(timeout=3.0)
         assert result.exit_code == 0, result.output
         assert "SIGKILL" in result.output or "restarted" in result.output.lower()

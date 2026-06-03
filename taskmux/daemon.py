@@ -564,31 +564,20 @@ class TaskmuxDaemon:
     # ---- privileged bootstrap ----
 
     def _warn_if_unprivileged(self) -> None:
-        if os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
             return
-        if not self.global_config.proxy_enabled:
+        if os.environ.get("TASKMUX_ALLOW_UNPRIVILEGED") == "1":
             return
-        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
-        if is_root:
+        from .global_config import privilegedNeeds
+
+        needs = privilegedNeeds(self.global_config)
+        if not needs:
             return
-        needs_priv: list[str] = []
-        if self.global_config.proxy_https_port < 1024:
-            needs_priv.append(f"binding the proxy on :{self.global_config.proxy_https_port}")
-        rport = self.global_config.proxy_http_redirect_port
-        if 0 < rport < 1024:
-            needs_priv.append(f"binding the http→https redirect on :{rport}")
-        if self.global_config.host_resolver in ("etc_hosts", "dns_server"):
-            target = (
-                "/etc/hosts"
-                if self.global_config.host_resolver == "etc_hosts"
-                else f"/etc/resolver/{self.global_config.dns_managed_tld}"
-            )
-            needs_priv.append(f"writing {target}")
-        if not needs_priv:
-            return
+        # The CLI/IPC spawn paths refuse this case before reaching start(); this
+        # backstop covers a daemon started another way (e.g. a direct call).
         self.logger.error(
             "Daemon started WITHOUT root — the following will fail: "
-            + "; ".join(needs_priv)
+            + "; ".join(needs)
             + ". Run `sudo taskmux daemon` (the daemon binds privileged "
             "resources as root, then drops to your user). To run unprivileged "
             "anyway: set proxy_enabled = false (or proxy_https_port >= 1024 + "

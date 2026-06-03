@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -41,6 +42,36 @@ def is_daemon_running() -> bool:
     return get_daemon_pid() is not None
 
 
+def _refuse_unprivileged_autospawn() -> None:
+    """Refuse to auto-spawn a daemon that needs root when we're not root.
+
+    The daemon binds :443/:80 (and writes system DNS) as root, then drops to
+    the invoking user. Auto-spawning it unprivileged would fail the fatal :443
+    bind and silently break every *.localhost URL. Refuse loudly with the fix
+    instead of spawning a half-dead daemon. TASKMUX_ALLOW_UNPRIVILEGED=1 (set by
+    `--force`) opts out.
+    """
+    if (hasattr(os, "geteuid") and os.geteuid() == 0) or os.environ.get(
+        "TASKMUX_ALLOW_UNPRIVILEGED"
+    ) == "1":
+        return
+    from .global_config import loadGlobalConfig, privilegedNeeds
+
+    needs = privilegedNeeds(loadGlobalConfig())
+    if not needs:
+        return
+    raise TaskmuxError(
+        ErrorCode.INTERNAL,
+        detail=(
+            "taskmux daemon isn't running and needs root to "
+            + ", ".join(needs)
+            + " — start it with `sudo taskmux daemon` (it drops to your user "
+            "after binding). To run unprivileged anyway (proxy/DNS disabled): "
+            "set proxy_enabled = false in ~/.taskmux/config.toml."
+        ),
+    )
+
+
 def ensure_daemon_running(port: int | None = None, timeout: float = 8.0) -> int | None:
     """Ping; spawn detached if absent; poll until it answers `ping`."""
     from .daemon import get_daemon_pid
@@ -50,6 +81,7 @@ def ensure_daemon_running(port: int | None = None, timeout: float = 8.0) -> int 
     if pid is not None:
         return pid
 
+    _refuse_unprivileged_autospawn()
     ensureTaskmuxDir()
     log_fh = open(globalDaemonLogPath(), "ab")  # noqa: SIM115
     cmd = [sys.executable, "-m", "taskmux", "daemon"]

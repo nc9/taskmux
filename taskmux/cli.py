@@ -301,37 +301,44 @@ def inject(
         console.print(f"[{color}]✓ {action}[/{color}] {entry['path']}")
 
 
-def _warn_unprivileged_daemon() -> None:
+def _is_root() -> bool:
     import os as _os
 
-    from .global_config import loadGlobalConfig
+    return hasattr(_os, "geteuid") and _os.geteuid() == 0
 
-    cfg = loadGlobalConfig()
-    if _os.environ.get("TASKMUX_DISABLE_PROXY") == "1":
+
+def _refuse_unprivileged_daemon(action: str, retry_cmd: str, *, force: bool) -> None:
+    """Refuse a root-needing daemon (re)spawn invoked without root (refuse-only).
+
+    A daemon started via `sudo` binds :443/:80 (+ system DNS) as root then drops
+    to the invoking user — so it survives, but any non-root start/restart that
+    *replaces* it comes up unprivileged and fails the fatal :443 bind, breaking
+    every *.localhost URL. Rather than warn-and-proceed into that broken state,
+    we refuse here (before stopping anything, on restart) with an actionable fix.
+
+    Raises typer.Exit(1) when gated. `--force` (or TASKMUX_ALLOW_UNPRIVILEGED=1)
+    bypasses for operators who knowingly want an unprivileged, proxy-less daemon.
+    """
+    import os as _os
+
+    if force or _is_root() or _os.environ.get("TASKMUX_ALLOW_UNPRIVILEGED") == "1":
         return
-    if not cfg.proxy_enabled:
-        return
-    if hasattr(_os, "geteuid") and _os.geteuid() == 0:
-        return
-    needs: list[str] = []
-    if cfg.proxy_https_port < 1024:
-        needs.append(f"bind :{cfg.proxy_https_port}")
-    if 0 < cfg.proxy_http_redirect_port < 1024:
-        needs.append(f"bind :{cfg.proxy_http_redirect_port}")
-    if cfg.host_resolver in ("etc_hosts", "dns_server"):
-        target = (
-            "/etc/hosts"
-            if cfg.host_resolver == "etc_hosts"
-            else f"/etc/resolver/{cfg.dns_managed_tld}"
-        )
-        needs.append(f"write {target}")
+    from .global_config import loadGlobalConfig, privilegedNeeds
+
+    needs = privilegedNeeds(loadGlobalConfig())
     if not needs:
         return
-    if not is_json_mode():
-        console.print(
-            f"[yellow]Warning: starting daemon without root — these will fail: "
-            f"{', '.join(needs)}. Use `sudo taskmux daemon` for proxy + DNS to work.[/yellow]"
-        )
+    detail = (
+        f"Refusing to {action} the taskmux daemon as a non-root user: it needs "
+        f"root to {', '.join(needs)} (binds as root, then drops to your user). "
+        f"Re-run `{retry_cmd}`. Pass --force to run unprivileged anyway — the "
+        f"proxy and https://*.localhost URLs will not work."
+    )
+    if is_json_mode():
+        print_result({"ok": False, "error": "needs_root", "action": action, "message": detail})
+    else:
+        console.print(f"[red]{detail}[/red]")
+    raise typer.Exit(1)
 
 
 def _identifyPortHolder(host: str, port: int) -> str | None:
@@ -415,8 +422,15 @@ def _warn_port_conflict() -> None:
         )
 
 
-def _spawn_detached_daemon(port: int | None = None) -> int | None:
-    """Fork the global taskmux daemon as a detached background process."""
+def _spawn_detached_daemon(
+    port: int | None = None, *, allow_unprivileged: bool = False
+) -> int | None:
+    """Fork the global taskmux daemon as a detached background process.
+
+    `allow_unprivileged` (from `--force`) is propagated to the child as
+    TASKMUX_ALLOW_UNPRIVILEGED=1 so the daemon's own root gate stands down.
+    """
+    import os as _os
     import subprocess
 
     existing = get_daemon_pid()
@@ -427,6 +441,7 @@ def _spawn_detached_daemon(port: int | None = None) -> int | None:
     cmd = [sys.executable, "-m", "taskmux", "daemon"]
     if port is not None:
         cmd += ["--port", str(port)]
+    child_env = {**_os.environ, "TASKMUX_ALLOW_UNPRIVILEGED": "1"} if allow_unprivileged else None
     proc = subprocess.Popen(
         cmd,
         stdout=log_fh,
@@ -434,6 +449,7 @@ def _spawn_detached_daemon(port: int | None = None) -> int | None:
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
+        env=child_env,
     )
     for _ in range(20):
         if get_daemon_pid() is not None:
@@ -1374,7 +1390,7 @@ def daemon(
     """Run a foreground daemon when no subcommand is given."""
     if ctx.invoked_subcommand is not None:
         return
-    _warn_unprivileged_daemon()
+    _refuse_unprivileged_daemon("start", "sudo taskmux daemon", force=False)
     _warn_port_conflict()
     d = TaskmuxDaemon(api_port=port)
     asyncio.run(d.start())
@@ -1472,6 +1488,11 @@ def daemon_start(
     port: int | None = typer.Option(  # noqa: B008
         None, "--port", help="WebSocket API port (overrides ~/.taskmux/config.toml)"
     ),
+    force: bool = typer.Option(  # noqa: B008
+        False,
+        "--force",
+        help="Start unprivileged even if the proxy needs root (proxy/DNS won't work).",
+    ),
 ):
     """Spawn the global detached daemon (idempotent)."""
     existing = get_daemon_pid()
@@ -1483,9 +1504,9 @@ def daemon_start(
             console.print(f"Daemon already running (pid {existing})")
         return
     _autoRegisterCwd()
-    _warn_unprivileged_daemon()
+    _refuse_unprivileged_daemon("start", "sudo taskmux daemon start", force=force)
     _warn_port_conflict()
-    pid = _spawn_detached_daemon(port=port)
+    pid = _spawn_detached_daemon(port=port, allow_unprivileged=force)
     if pid is None:
         if is_json_mode():
             print_result({"ok": False, "error": "failed to start daemon"})
@@ -1573,8 +1594,16 @@ def daemon_restart(
         "--timeout",
         help="Seconds to wait for graceful SIGTERM shutdown before escalating to SIGKILL.",
     ),
+    force: bool = typer.Option(  # noqa: B008
+        False,
+        "--force",
+        help="Restart unprivileged even if the proxy needs root (proxy/DNS won't work).",
+    ),
 ):
     """Stop (SIGTERM → SIGKILL escalation) the global daemon and spawn a fresh one."""
+    # Gate BEFORE stopping: a non-root restart of a root-bootstrapped daemon would
+    # otherwise kill the working daemon, then fail to rebind :443 — leaving nothing.
+    _refuse_unprivileged_daemon("restart", "sudo taskmux daemon restart", force=force)
     pid = get_daemon_pid()
     stop_action: str | None = None
     if pid is not None:
@@ -1586,7 +1615,7 @@ def daemon_restart(
                 console.print(f"Failed to stop daemon (pid {pid}): {action}", style="red")
             return
         stop_action = action
-    new_pid = _spawn_detached_daemon(port=port)
+    new_pid = _spawn_detached_daemon(port=port, allow_unprivileged=force)
     if new_pid is None:
         if is_json_mode():
             print_result({"ok": False, "error": "failed to start daemon"})

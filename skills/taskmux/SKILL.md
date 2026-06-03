@@ -167,6 +167,8 @@ proxy_bind = "127.0.0.1"           # "0.0.0.0" exposes to LAN (be deliberate)
 
 `taskmux status` flips host-routed tasks to `healthy: false` when the proxy listener isn't bound or this project's host route isn't registered. The reason is in `last_health.reason`; the top-level `proxy: {bound, port, reason}` summarises overall state.
 
+**Privileged daemon (sudo) — do not replace it unprivileged.** With `proxy_https_port`/`proxy_http_redirect_port` <1024 or an `etc_hosts`/`dns_server` resolver, the daemon must bind those as root: run `sudo taskmux daemon`. It binds the privileged sockets as root, then drops to your user. Because it runs as your user afterward, a **non-root** `taskmux daemon start|restart` (or an auto-spawn triggered by any task command) would come up unprivileged and fail the fatal `:443` bind — breaking every `*.localhost` URL. taskmux now **refuses** those non-root (re)spawns with an actionable error instead of half-starting; re-run under `sudo`, or pass `--force` (sets `TASKMUX_ALLOW_UNPRIVILEGED=1`) to run unprivileged on purpose. To run unprivileged permanently, set `proxy_https_port >= 1024` (+ `proxy_http_redirect_port = 0`, `host_resolver = "noop"`) or `proxy_enabled = false`.
+
 ## Public access (tunnels)
 
 To expose a host-routed task on the public internet (webhooks, mobile, remote agents): the existing local URL is unaffected — public access is **additive**.
