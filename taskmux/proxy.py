@@ -365,9 +365,7 @@ class RedirectServer:
             site = web.TCPSite(self._runner, host=self.bind, port=self.http_port)
             await site.start()
             self._sites.append(site)
-            self.logger.info(
-                f"HTTP→HTTPS redirect on http://{self.bind}:{self.http_port}"
-            )
+            self.logger.info(f"HTTP→HTTPS redirect on http://{self.bind}:{self.http_port}")
 
     async def stop(self) -> None:
         for site in self._sites:

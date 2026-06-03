@@ -147,9 +147,7 @@ class TestConfigWatcherDebounce:
     unregisters the project on the delete and re-registers on the create,
     killing every task in the project on every save."""
 
-    def test_delete_followed_by_create_within_debounce_skips_missing(
-        self, tmp_path: Path
-    ):
+    def test_delete_followed_by_create_within_debounce_skips_missing(self, tmp_path: Path):
         async def run():
             cfg_path = tmp_path / "taskmux.toml"
             cfg_path.write_text('name = "alpha"\n')
@@ -167,8 +165,7 @@ class TestConfigWatcherDebounce:
             cfg_path.write_text('name = "alpha"\n')
             await asyncio.sleep(daemon_mod.MISSING_DEBOUNCE_SECONDS + 0.1)
             assert fired == [], (
-                "missing should not fire when the file reappears inside the "
-                "debounce window"
+                "missing should not fire when the file reappears inside the debounce window"
             )
 
         asyncio.run(run())

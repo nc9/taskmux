@@ -1405,10 +1405,8 @@ def _reap_if_zombie(pid: int) -> None:
     """
     import os
 
-    try:
+    with contextlib.suppress(OSError):
         os.waitpid(pid, os.WNOHANG)
-    except OSError:
-        pass
 
 
 def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
@@ -1563,7 +1561,9 @@ def daemon_stop(
     else:
         messages = {
             "term": f"Daemon stopped (pid {pid})",
-            "kill": f"Daemon force-killed (pid {pid}) — graceful shutdown timed out after {timeout}s",
+            "kill": (
+                f"Daemon force-killed (pid {pid}) — graceful shutdown timed out after {timeout}s"
+            ),
             "term_then_gone": f"Daemon stopped (pid {pid})",
             "already_gone": f"Daemon was already gone (cleaned stale pidfile for {pid})",
         }

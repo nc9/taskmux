@@ -173,9 +173,7 @@ class ConfigWatcher(FileSystemEventHandler):
         # pending check first so back-to-back delete events don't pile up.
         if self._missing_handle is not None:
             self._missing_handle.cancel()
-        self._missing_handle = self.loop.call_later(
-            MISSING_DEBOUNCE_SECONDS, self._check_missing
-        )
+        self._missing_handle = self.loop.call_later(MISSING_DEBOUNCE_SECONDS, self._check_missing)
 
     def _check_missing(self) -> None:
         self._missing_handle = None
@@ -636,9 +634,7 @@ class TaskmuxDaemon:
         family = socket.AF_INET6 if ":" in bind else socket.AF_INET
         return [(family, bind)]
 
-    def _pre_bind_one_port(
-        self, port: int, label: str, *, fatal: bool
-    ) -> list[socket.socket]:
+    def _pre_bind_one_port(self, port: int, label: str, *, fatal: bool) -> list[socket.socket]:
         """Bind listeners for one port across the bind's address families.
 
         `fatal=True`: a primary-bind failure logs an error and returns []
@@ -680,8 +676,7 @@ class TaskmuxDaemon:
                     return []
                 if primary:
                     self.logger.warning(
-                        f"Pre-bind {label} to {display} failed: {e}; "
-                        f"continuing without it."
+                        f"Pre-bind {label} to {display} failed: {e}; continuing without it."
                     )
                     return []
                 self.logger.warning(

@@ -171,10 +171,7 @@ def test_redirect_preserves_path_and_query():
 
 
 def test_redirect_appends_non_default_https_port():
-    assert (
-        _redirect("api.proj.localhost:80", https_port=4443)
-        == "https://api.proj.localhost:4443/"
-    )
+    assert _redirect("api.proj.localhost:80", https_port=4443) == "https://api.proj.localhost:4443/"
 
 
 def test_redirect_rejects_empty_host():
