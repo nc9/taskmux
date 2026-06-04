@@ -70,6 +70,7 @@ taskmux prune --apply               # actually clean
 
 # Daemon (auto-restart + WebSocket API on api_port)
 taskmux daemon [start|stop|status|restart|list]
+taskmux daemon status               # pid + proxy/port binding (is :443/:80 bound?)
 taskmux daemon register [--force]   # register cwd in global registry
 
 # Proxy / certs

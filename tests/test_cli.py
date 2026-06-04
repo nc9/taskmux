@@ -936,3 +936,69 @@ class TestEnvCommand:
         result = runner.invoke(app, ["env", "--prefix", "1bad-prefix"])
         assert result.exit_code == 1
         assert "invalid --prefix" in result.output
+
+
+class TestDaemonStatusProxy:
+    """`daemon status` reports proxy/port binding so a disabled or unbound proxy
+    is obvious (the 'daemon up but *.localhost dead' footgun)."""
+
+    @staticmethod
+    def _cfg(**over):
+        from types import SimpleNamespace
+
+        base = {
+            "proxy_enabled": True,
+            "proxy_https_port": 443,
+            "proxy_bind": "127.0.0.1",
+            "proxy_http_redirect_port": 80,
+            "host_resolver": "dns_server",
+            "dns_server_port": 5454,
+        }
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def _patch(self, monkeypatch, *, pid, cfg, listening, owner_pid=None):
+        import taskmux.cli as climod
+        import taskmux.global_config as gcmod
+
+        monkeypatch.setattr(climod, "get_daemon_pid", lambda: pid)
+        monkeypatch.setattr(climod, "listRegistered", lambda: [])
+        monkeypatch.setattr(gcmod, "loadGlobalConfig", lambda: cfg)
+        monkeypatch.setattr(climod, "_port_listening", lambda h, p, timeout=0.5: listening)
+        monkeypatch.setattr(climod, "_listening_pid", lambda h, p: owner_pid)
+
+    def test_proxy_disabled(self, monkeypatch):
+        self._patch(monkeypatch, pid=123, cfg=self._cfg(proxy_enabled=False), listening=False)
+        result = runner.invoke(app, ["daemon", "status"])
+        assert result.exit_code == 0
+        assert "disabled" in result.output
+
+    def test_proxy_bound_and_owned_by_daemon(self, monkeypatch):
+        self._patch(monkeypatch, pid=123, cfg=self._cfg(), listening=True, owner_pid=123)
+        result = runner.invoke(app, ["daemon", "status"])
+        assert result.exit_code == 0
+        assert "bound" in result.output
+
+    def test_proxy_port_held_by_another_process(self, monkeypatch):
+        # Listener present, but a DIFFERENT pid owns :443 → not a false-green.
+        self._patch(monkeypatch, pid=123, cfg=self._cfg(), listening=True, owner_pid=999)
+        result = runner.invoke(app, ["daemon", "status"])
+        assert result.exit_code == 0
+        assert "held by another process" in result.output
+
+    def test_proxy_enabled_but_not_listening(self, monkeypatch):
+        self._patch(monkeypatch, pid=123, cfg=self._cfg(), listening=False)
+        result = runner.invoke(app, ["daemon", "status"])
+        assert result.exit_code == 0
+        assert "listening" in result.output
+
+    def test_json_shape(self, monkeypatch):
+        import json as _json
+
+        self._patch(monkeypatch, pid=123, cfg=self._cfg(proxy_enabled=False), listening=False)
+        result = runner.invoke(app, ["--json", "daemon", "status"])
+        assert result.exit_code == 0
+        data = _json.loads(result.output)
+        assert data["pid"] == 123
+        assert data["proxy"]["enabled"] is False
+        assert data["dns"]["resolver"] == "dns_server"

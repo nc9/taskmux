@@ -370,6 +370,62 @@ def _identifyPortHolder(host: str, port: int) -> str | None:
     return None
 
 
+def _port_listening(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if something accepts a TCP connection on host:port (any addr family).
+
+    Connect-probe (not bind) so it works unprivileged and reflects OS reality —
+    used by `daemon status` to report whether the proxy actually bound its ports.
+    """
+    import socket as _socket
+
+    try:
+        addrs = _socket.getaddrinfo(host, port, type=_socket.SOCK_STREAM)
+    except _socket.gaierror:
+        return False
+    for family, _type, _proto, _canon, sockaddr in addrs:
+        s = _socket.socket(family, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(sockaddr)
+            return True
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return False
+
+
+def _listening_pid(host: str, port: int) -> int | None:
+    """PID of the process LISTENing on host:port via lsof, else None.
+
+    None when lsof is unavailable, nothing listens, or the holder is owned by a
+    different user (unprivileged lsof can't see it). Used by `daemon status` to
+    confirm taskmux — not Tailscale/OrbStack/etc — actually owns the proxy port.
+    """
+    import shutil
+    import subprocess
+
+    _ = host  # lsof matches by port; host kept for signature symmetry
+    if shutil.which("lsof") is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in out.stdout.splitlines():
+        if line.startswith("p"):
+            try:
+                return int(line[1:])
+            except ValueError:
+                return None
+    return None
+
+
 def _warn_port_conflict() -> None:
     """Probe the configured proxy port; warn if a non-taskmux process is already listening.
 
@@ -1575,16 +1631,90 @@ def daemon_stop(
 
 @daemon_app.command("status")
 def daemon_status():
-    """Show daemon status + count of registered projects."""
+    """Show daemon status: pid, registered projects, and proxy/DNS port binding."""
+    from .global_config import loadGlobalConfig
+
     pid = get_daemon_pid()
     entries = listRegistered()
+    gc = loadGlobalConfig()
+    host = gc.proxy_bind or "127.0.0.1"
+
+    proxy: dict = {"enabled": gc.proxy_enabled, "https_port": gc.proxy_https_port}
+    if gc.proxy_enabled and pid is not None:
+        proxy["https_bound"] = _port_listening(host, gc.proxy_https_port)
+        proxy["redirect_port"] = gc.proxy_http_redirect_port
+        proxy["redirect_bound"] = _port_listening(host, gc.proxy_http_redirect_port)
+        # Confirm the daemon — not some other process (Tailscale, OrbStack…) —
+        # owns :443, so we don't report a false-green "bound".
+        proxy["https_owner_pid"] = (
+            _listening_pid(host, gc.proxy_https_port) if proxy["https_bound"] else None
+        )
+    dns = {
+        "resolver": gc.host_resolver,
+        # DNS server always binds loopback regardless of proxy_bind.
+        "bind": "127.0.0.1",
+        "port": gc.dns_server_port if gc.host_resolver == "dns_server" else None,
+    }
+
     if is_json_mode():
-        print_result({"running": pid is not None, "pid": pid, "registered_projects": len(entries)})
+        print_result(
+            {
+                "running": pid is not None,
+                "pid": pid,
+                "registered_projects": len(entries),
+                "proxy": proxy,
+                "dns": dns,
+            }
+        )
         return
+
     if pid is not None:
         console.print(f"Daemon running (pid {pid}) — {len(entries)} project(s) registered")
     else:
         console.print(f"No daemon running — {len(entries)} project(s) registered")
+
+    # Proxy / port binding — the line that tells you whether *.localhost forwards.
+    if not gc.proxy_enabled:
+        console.print(
+            "Proxy:   [yellow]disabled in config[/yellow] (proxy_enabled = false) — "
+            "https://*.localhost URLs won't forward. Re-enable in ~/.taskmux/config.toml "
+            "then `sudo taskmux daemon restart`."
+        )
+    elif pid is None:
+        console.print(f"Proxy:   enabled (https_port {gc.proxy_https_port}) — daemon not running")
+    elif not proxy.get("https_bound"):
+        console.print(
+            f"Proxy:   [red]enabled but NOT listening on :{gc.proxy_https_port}[/red] — "
+            "run `sudo taskmux daemon restart` (binds privileged ports as root, then drops to you)."
+        )
+    elif proxy.get("https_owner_pid") not in (pid, None):
+        holder = _identifyPortHolder(host, gc.proxy_https_port) or (
+            f"pid {proxy['https_owner_pid']}"
+        )
+        console.print(
+            f"Proxy:   [red]:{gc.proxy_https_port} held by another process ({holder})[/red] — "
+            "taskmux proxy did NOT bind. Stop it or change proxy_https_port in "
+            "~/.taskmux/config.toml."
+        )
+    elif proxy.get("https_owner_pid") is None:
+        console.print(
+            f"Proxy:   [yellow]a listener is present on :{gc.proxy_https_port} but its owner "
+            "could not be verified[/yellow] (taskmux may or may not have bound it)."
+        )
+    else:
+        redir = (
+            f" (+ :{gc.proxy_http_redirect_port} → HTTPS redirect)"
+            if proxy.get("redirect_bound")
+            else ""
+        )
+        console.print(
+            f"Proxy:   [green]bound[/green] on https://{host}:{gc.proxy_https_port}{redir}"
+        )
+
+    if gc.host_resolver == "dns_server":
+        console.print(f"DNS:     dns_server on 127.0.0.1:{gc.dns_server_port}")
+    else:
+        console.print(f"DNS:     resolver = {gc.host_resolver}")
 
 
 @daemon_app.command("restart")
