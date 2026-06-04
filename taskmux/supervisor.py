@@ -1228,7 +1228,12 @@ class PosixSupervisor:
         tasks = []
         for task_name, task_cfg in self.config.tasks.items():
             status = self.get_task_status(task_name)
-            last = self.restart_tracker.last_health(task_name)
+            # Only surface health for a currently-running task. A stopped task's
+            # last_health is a stale result from before it was stopped — reporting
+            # it makes `status` print bogus "connect refused" fail rows for tasks
+            # the user already knows are down. Mirrors inspect_task(), which only
+            # attaches last_health when the process is live.
+            last = self.restart_tracker.last_health(task_name) if status["running"] else None
             url = taskUrl(self.project_id, task_cfg.host) if task_cfg.host is not None else None
             public_url = (
                 f"https://{task_cfg.public_hostname}/" if task_cfg.public_hostname else None

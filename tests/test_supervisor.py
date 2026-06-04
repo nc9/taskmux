@@ -1022,3 +1022,19 @@ class TestListTasksPortShape:
         assert rows["job"]["port"] is None
         assert rows["job"]["internal_port"] is None
         assert rows["job"]["internal_url"] is None
+
+    def test_stopped_task_drops_stale_last_health(self, tmp_path, monkeypatch):
+        """A stopped task must not carry its pre-stop last_health into status —
+        otherwise `status` prints bogus 'connect refused' fail rows for tasks the
+        user already knows are down."""
+        _patch_global(monkeypatch, proxy_port=443)
+        cfg = _make_config(tasks={"web": {"command": "echo", "host": "web"}})
+        sup = _make_supervisor(cfg, tmp_path)
+        # Simulate a stale failure recorded while the task was last alive.
+        sup.restart_tracker.record_health_result(
+            "web", HealthResult(False, "tcp", "connect refused: [Errno 61]", 0.0)
+        )
+        # Task is not in _tasks → stopped.
+        rows = {t["name"]: t for t in sup.list_tasks()["tasks"]}
+        assert rows["web"]["running"] is False
+        assert rows["web"]["last_health"] is None

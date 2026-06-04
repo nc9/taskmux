@@ -1042,8 +1042,11 @@ def _status():
             row.append(t.get("public_url") or "")
         row.extend([t["command"], " ".join(notes)])
         table.add_row(*row)
+        # Skip fail rows for stopped tasks: their last_health is stale (from
+        # before they were stopped), not a live probe. Guard here too in case an
+        # older daemon still ships last_health for non-running tasks.
         last = t.get("last_health")
-        if last and not last.get("ok") and last.get("reason"):
+        if state != "stopped" and last and not last.get("ok") and last.get("reason"):
             fail_rows.append((t["name"], last.get("method", ""), last.get("reason", "")))
 
     console.print(table)
