@@ -140,6 +140,14 @@ class TestRestartTracker:
         rt.record_health_result("a", result)
         assert rt.last_health("a") == result
 
+    def test_explicit_start(self):
+        rt = RestartTracker()
+        assert not rt.was_explicitly_started("a")
+        rt.mark_explicit_start("a")
+        assert rt.was_explicitly_started("a")
+        rt.clear_explicit_start("a")
+        assert not rt.was_explicitly_started("a")
+
     def test_mark_cap_reached_edge_trigger(self):
         """First call returns True (emit), subsequent return False (suppress)."""
         rt = RestartTracker()
@@ -708,6 +716,73 @@ class TestAutoRestart:
         with patch.object(sup, "_restart_task_locked", side_effect=_ok) as m:
             _run(sup.auto_restart_tasks())
             m.assert_called_once_with("a")
+
+    def test_never_starts_auto_start_false_task(self, tmp_path):
+        """auto_start=false + never explicitly started → must NOT be (re)started
+        by the auto-restart loop, and must not even be health-probed. This is the
+        fleet-fanout-on-daemon-boot bug."""
+        cfg = _make_config(
+            tasks={
+                "a": {
+                    "command": "echo",
+                    "auto_start": False,
+                    "restart_policy": RestartPolicy.ON_FAILURE,
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        with (
+            patch.object(sup, "_restart_task_locked") as m,
+            patch.object(sup, "check_task_health") as probe,
+        ):
+            _run(sup.auto_restart_tasks())
+            m.assert_not_called()
+            probe.assert_not_called()
+
+    def test_auto_start_false_revives_after_explicit_start(self, tmp_path):
+        """Once the user explicitly starts an auto_start=false task, it opts into
+        crash-revival for the rest of the daemon's lifetime."""
+        cfg = _make_config(
+            tasks={
+                "a": {
+                    "command": "echo",
+                    "auto_start": False,
+                    "restart_policy": RestartPolicy.ON_FAILURE,
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.restart_tracker.mark_explicit_start("a")  # as _start_task_locked would
+
+        async def _ok(_name):
+            return {"ok": True}
+
+        with patch.object(sup, "_restart_task_locked", side_effect=_ok) as m:
+            _run(sup.auto_restart_tasks())
+            m.assert_called_once_with("a")
+
+    def test_explicit_restart_opts_in_internal_restart_does_not(self, tmp_path):
+        """User `restart` opts a task into auto-restart; the internal
+        auto_restart_tasks path (explicit=False) must not — else a live-reload
+        to auto_start=false would keep reviving a never-explicitly-started task."""
+        cfg = _make_config(tasks={"a": "sleep 5"})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            # Internal auto-restart path: explicit defaults False → no opt-in.
+            await sup._restart_task_locked("a")
+            assert not sup.restart_tracker.was_explicitly_started("a")
+            await sup.stop_all()
+            # Public restart command: explicit=True → opt-in.
+            await sup.restart_task("a")
+            assert sup.restart_tracker.was_explicitly_started("a")
+            await sup.stop_all()
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
 
     def test_max_restarts_respected(self, tmp_path):
         cfg = _make_config(

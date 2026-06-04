@@ -100,6 +100,13 @@ class RestartTracker:
         self._data: dict[str, dict[str, float]] = {}
         self._consecutive_failures: dict[str, int] = {}
         self._manually_stopped: set[str] = set()
+        # Tasks the user explicitly launched this daemon-lifetime (via `start`
+        # or `restart` of that task). This is the ONLY opt-in for auto_start=false
+        # tasks into the auto-restart loop — without it they must never be
+        # (re)started by boot, start_all, restart_all, or crash-revival. Not
+        # persisted: a daemon restart is a fresh start, so auto_start=false
+        # tasks stay down until the user starts them again.
+        self._explicit_start: set[str] = set()
         self._last_health: dict[str, HealthResult] = {}
         # Tasks for which `max_restarts_reached` was already emitted. Cleared
         # on a successful manual restart / start (via `reset()`). Without this
@@ -146,6 +153,15 @@ class RestartTracker:
 
     def is_manually_stopped(self, task_name: str) -> bool:
         return task_name in self._manually_stopped
+
+    def mark_explicit_start(self, task_name: str) -> None:
+        self._explicit_start.add(task_name)
+
+    def clear_explicit_start(self, task_name: str) -> None:
+        self._explicit_start.discard(task_name)
+
+    def was_explicitly_started(self, task_name: str) -> bool:
+        return task_name in self._explicit_start
 
     def record_health_result(self, task_name: str, result: HealthResult) -> None:
         self._last_health[task_name] = result
@@ -893,6 +909,9 @@ class PosixSupervisor:
         self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
+        # Explicit user start opts an auto_start=false task into auto-restart.
+        # After the config check so a bogus name leaves no stale opt-in.
+        self.restart_tracker.mark_explicit_start(task_name)
         if task_name in self._tasks:
             return self._err(ErrorCode.TASK_ALREADY_RUNNING, task=task_name)
 
@@ -934,6 +953,7 @@ class PosixSupervisor:
 
     async def _stop_task_locked(self, task_name: str) -> dict:
         self.restart_tracker.mark_manually_stopped(task_name)
+        self.restart_tracker.clear_explicit_start(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
         if task_name not in self._tasks:
@@ -954,12 +974,18 @@ class PosixSupervisor:
 
     async def restart_task(self, task_name: str) -> dict:
         async with self._lock_for(task_name):
-            return await self._restart_task_locked(task_name)
+            return await self._restart_task_locked(task_name, explicit=True)
 
-    async def _restart_task_locked(self, task_name: str) -> dict:
+    async def _restart_task_locked(self, task_name: str, *, explicit: bool = False) -> dict:
         self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
+        # Only a user-initiated restart opts an auto_start=false task into
+        # auto-restart. The internal auto_restart_tasks path (explicit=False)
+        # must NOT — otherwise a later live-reload to auto_start=false would
+        # keep reviving a task the user never explicitly started.
+        if explicit:
+            self.restart_tracker.mark_explicit_start(task_name)
 
         task_cfg = self.config.tasks[task_name]
         if task_name in self._tasks:
@@ -987,6 +1013,7 @@ class PosixSupervisor:
 
     async def _kill_task_locked(self, task_name: str) -> dict:
         self.restart_tracker.mark_manually_stopped(task_name)
+        self.restart_tracker.clear_explicit_start(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
         if task_name not in self._tasks:
@@ -1083,6 +1110,7 @@ class PosixSupervisor:
     async def stop_all(self, *, grace: float | None = None) -> dict:
         for task_name in self.config.tasks:
             self.restart_tracker.mark_manually_stopped(task_name)
+            self.restart_tracker.clear_explicit_start(task_name)
 
         if not self._tasks:
             return self._err(ErrorCode.SESSION_NOT_FOUND, session=self.config.name)
@@ -1390,6 +1418,15 @@ class PosixSupervisor:
 
         for task_name, task_cfg in self.config.tasks.items():
             if task_cfg.restart_policy == RestartPolicy.NO:
+                continue
+            # Invariant: auto_start=false means NEVER auto-(re)started — not on
+            # daemon boot, start_all, restart_all, or crash-revival. The only
+            # opt-in is an explicit `start`/`restart` of THIS task, which sets
+            # _explicit_start. Checked before check_task_health so these tasks
+            # aren't even probed (no stale "connect refused" rows either).
+            if not task_cfg.auto_start and not self.restart_tracker.was_explicitly_started(
+                task_name
+            ):
                 continue
             if self.restart_tracker.is_manually_stopped(task_name):
                 continue

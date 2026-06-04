@@ -413,7 +413,8 @@ auto_daemon = false
 
 [tasks.<name>]
 command = "..."
-auto_start = true
+auto_start = true           # false ⇒ never auto-started (not on daemon boot,
+                            #   `start`, or `restart`); only explicit `start <task>`
 cwd = "..."                 # relative to taskmux.toml dir
 host = "api" | "@" | "*"    # → proxy URL; PORT exported into command only
 tunnel = "cloudflare"       # optional: "cloudflare" | "noop"
