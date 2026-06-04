@@ -1789,9 +1789,11 @@ class TaskmuxDaemon:
             if sup is not None and cfg is not None:
                 row["session_exists"] = sup.session_exists()
                 row["task_count"] = len(cfg.tasks)
+                row["running_count"] = sup.running_count()
             else:
                 row["session_exists"] = False
                 row["task_count"] = 0
+                row["running_count"] = 0
             out.append(row)
         return out
 

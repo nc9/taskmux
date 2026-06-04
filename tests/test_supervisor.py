@@ -485,6 +485,28 @@ class TestLifecycle:
         finally:
             _stop_log_redirect(sup)
 
+    def test_running_count(self, tmp_path):
+        """running_count reflects live processes, not configured tasks."""
+        cfg = _make_config(tasks={"a": "sleep 5", "b": "sleep 5"})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            assert sup.running_count() == 0
+            await sup.start_task("a")
+            assert sup.running_count() == 1
+            await sup.start_task("b")
+            assert sup.running_count() == 2
+            await sup.stop_task("a")
+            assert sup.running_count() == 1
+            await sup.stop_all()
+            assert sup.running_count() == 0
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
     def test_start_writes_log(self, tmp_path):
         cfg = _make_config(tasks={"hello": "echo hello-from-task"})
         sup = _make_supervisor(cfg, tmp_path)

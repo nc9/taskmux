@@ -395,6 +395,9 @@ class FakeSupervisor:
     def list_windows(self) -> list[str]:
         return list(self._windows)
 
+    def running_count(self) -> int:
+        return len(self._windows)
+
     def reload_state(self) -> None:
         from taskmux.paths import projectStatePath
 
@@ -535,6 +538,9 @@ def test_daemon_serves_list_projects(isolated):
             sessions = sorted(p["session"] for p in resp["projects"])
             assert sessions == ["alpha", "beta"]
             assert all("config_path" in p for p in resp["projects"])
+            # Overview counts: total tasks + currently-running (nothing started).
+            assert all("task_count" in p and "running_count" in p for p in resp["projects"])
+            assert all(p["running_count"] == 0 for p in resp["projects"])
 
             resp = await _ws_request(port, {"command": "status", "params": {"session": "alpha"}})
             assert resp["session"] == "alpha"

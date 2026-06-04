@@ -1682,15 +1682,23 @@ def daemon_list(
     table = Table(show_header=True, header_style="bold")
     table.add_column("Session")
     table.add_column("State", justify="left")
+    table.add_column("Running", justify="right")
     table.add_column("Tasks", justify="right")
     table.add_column("Config")
     for entry in registered:
         info = live.get(entry["session"], {})
         state = info.get("state", "[dim]unmanaged[/dim]" if pid is None else "ok")
         task_count = info.get("task_count", "?")
+        running_count = info.get("running_count", "?")
+        running_display = (
+            f"[green]{running_count}[/green]"
+            if isinstance(running_count, int) and running_count > 0
+            else str(running_count)
+        )
         table.add_row(
             entry["session"],
             str(state),
+            running_display,
             str(task_count),
             entry["config_path"],
         )
