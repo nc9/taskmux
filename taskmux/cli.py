@@ -1725,6 +1725,156 @@ def daemon_status():
         console.print(f"DNS:     resolver = {gc.host_resolver}")
 
 
+@daemon_app.command("install")
+def daemon_install(
+    dry_run: bool = typer.Option(  # noqa: B008
+        False,
+        "--dry-run",
+        help="Print the generated service file and exit without installing.",
+    ),
+):
+    """Install an OS supervisor so the daemon auto-restarts across crashes, sleep,
+    closed terminals, and reboot (launchd on macOS, systemd on Linux).
+
+    Run under sudo — it binds privileged ports as root, then drops to your user.
+    """
+    import time
+
+    from . import service
+
+    platform = service.detect_platform()
+    try:
+        target = service.resolve_target(allow_current_user=dry_run)
+        plan = service.build_plan(target, platform)
+    except service.ServiceError as e:
+        if is_json_mode():
+            print_result({"ok": False, "error": str(e)})
+        else:
+            console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    if dry_run:
+        if is_json_mode():
+            print_result(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "platform": plan.platform,
+                    "path": plan.path,
+                    "content": plan.content,
+                }
+            )
+        else:
+            console.print(f"[dim]# would write {plan.path}[/dim]")
+            console.print(plan.content)
+        return
+
+    # Linux: write the unit but leave enabling to the user — auto-running systemctl
+    # with an unverified unit isn't worth the blast radius.
+    if plan.platform == "linux":
+        res = service.write_linux_unit(plan)
+        cmds = service.systemd_enable_commands()
+        if is_json_mode():
+            print_result({"ok": True, "platform": "linux", "path": res["path"], "next": cmds})
+        else:
+            console.print(f"Wrote systemd unit → {res['path']}")
+            console.print("[yellow]Linux support is experimental — enable it yourself:[/yellow]")
+            for c in cmds:
+                console.print(f"  sudo {c}")
+        return
+
+    # macOS: stop any running daemon so the freshly bootstrapped one can bind :443.
+    # A clean SIGTERM exits 0, so launchd's KeepAlive won't race-respawn the old one.
+    old_pid = service.running_daemon_pid(target.home)
+    if old_pid is not None:
+        ok_stop, action = _stop_daemon_with_escalation(old_pid, term_timeout=5.0)
+        if not ok_stop:
+            # If we can't free the port, launchd's instance exits "already running"
+            # and we'd falsely report success off the surviving old pid.
+            msg = f"Could not stop the running daemon (pid {old_pid}): {action}. Aborting install."
+            if is_json_mode():
+                print_result({"ok": False, "error": msg, "pid": old_pid})
+            else:
+                console.print(f"[red]{msg}[/red]")
+            raise typer.Exit(1)
+    res = service.install_macos(plan, target)
+
+    new_pid = None
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline:
+        new_pid = service.running_daemon_pid(target.home)
+        # Require a *new* pid: if the old daemon survived, new_pid would equal
+        # old_pid and the supervised instance never actually took over.
+        if new_pid is not None and new_pid != old_pid:
+            break
+        time.sleep(0.5)
+
+    ok = res["bootstrap_rc"] == 0 and new_pid is not None and new_pid != old_pid
+    if is_json_mode():
+        print_result(
+            {
+                "ok": ok,
+                "platform": "macos",
+                "path": res["path"],
+                "pid": new_pid,
+                "bootstrap_rc": res["bootstrap_rc"],
+                "bootstrap_err": res["bootstrap_err"] or None,
+            }
+        )
+        if not ok:
+            raise typer.Exit(1)
+        return
+    if ok:
+        console.print(f"Supervisor installed → {res['path']}")
+        console.print(
+            f"Daemon now launchd-supervised (pid {new_pid}) — auto-restarts on crash, "
+            "sleep, and reboot."
+        )
+        console.print("[dim]Stop supervising: sudo taskmux daemon uninstall[/dim]")
+    else:
+        console.print("[red]Supervisor installed but the daemon did not come up cleanly.[/red]")
+        if res["bootstrap_err"]:
+            console.print(f"  launchctl: {res['bootstrap_err']}")
+        console.print(f"  Check {target.home}/.taskmux/launchd.err.log")
+        raise typer.Exit(1)
+
+
+@daemon_app.command("uninstall")
+def daemon_uninstall():
+    """Remove the OS supervisor (launchd/systemd) and stop the supervised daemon.
+
+    Unloading the job also stops the running daemon; re-run `sudo taskmux daemon`
+    (or `daemon start`) to run it again without supervision. Needs root.
+    """
+    from . import service
+
+    if not _is_root():
+        msg = "Removing the system supervisor needs root. Re-run: `sudo taskmux daemon uninstall`."
+        if is_json_mode():
+            print_result({"ok": False, "error": msg})
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(1)
+    try:
+        res = service.uninstall()
+    except service.ServiceError as e:
+        if is_json_mode():
+            print_result({"ok": False, "error": str(e)})
+        else:
+            console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+    if is_json_mode():
+        print_result({"ok": True, **res})
+    else:
+        if res.get("removed"):
+            console.print(
+                "Supervisor removed and the supervised daemon stopped. "
+                "Run `sudo taskmux daemon` to start it again (unsupervised)."
+            )
+        else:
+            console.print("No supervisor was installed (nothing to remove).")
+
+
 @daemon_app.command("restart")
 def daemon_restart(
     port: int | None = typer.Option(  # noqa: B008

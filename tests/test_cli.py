@@ -1031,3 +1031,27 @@ class TestDaemonStatusProxy:
         data = _json.loads(result.output)
         assert data["running"] is False
         assert data["proxy"]["https_bound"] is True
+        assert data["proxy"]["https_owner_pid"] == 999
+
+
+class TestDaemonInstall:
+    """`daemon install/uninstall` — the OS supervisor shortcut."""
+
+    def test_dry_run_json_renders_without_root(self):
+        import json as _json
+
+        result = runner.invoke(app, ["--json", "daemon", "install", "--dry-run"])
+        assert result.exit_code == 0
+        data = _json.loads(result.output)
+        assert data["ok"] is True
+        assert data["dry_run"] is True
+        assert data["platform"] in {"macos", "linux"}
+        assert "taskmux" in data["content"]
+
+    def test_uninstall_non_root_refuses(self, monkeypatch):
+        import taskmux.cli as climod
+
+        monkeypatch.setattr(climod, "_is_root", lambda: False)
+        result = runner.invoke(app, ["--json", "daemon", "uninstall"])
+        assert result.exit_code == 1
+        assert "root" in result.output.lower()
