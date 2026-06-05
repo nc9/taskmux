@@ -626,9 +626,37 @@ taskmux daemon list               # all registered projects + live state
 taskmux daemon register [-c PATH] # add cwd's (or PATH's) project to the registry
 taskmux daemon register -f        # overwrite an existing entry whose config moved
 taskmux daemon unregister NAME    # remove a project from the registry
+taskmux daemon install            # install an OS supervisor (auto-restart) — see below
+taskmux daemon uninstall          # remove the OS supervisor
 ```
 
 `start`, `restart`, and `list` take `--port` to override the configured `api_port`; when omitted they fall back to `~/.taskmux/config.toml`. All commands accept `--json` (global flag). Daemon log: `~/.taskmux/daemon.log`.
+
+### Keep it running across crashes, sleep & reboot
+
+`taskmux daemon start` is a one-shot detached process — nothing restarts it if it crashes, the laptop sleeps hard, the launching terminal closes, or the machine reboots. For a daemon that always comes back, install an OS supervisor:
+
+```bash
+sudo taskmux daemon install        # detects the OS, installs + starts the supervisor
+sudo taskmux daemon install --dry-run   # print the generated unit, change nothing
+sudo taskmux daemon uninstall      # remove the supervisor and stop the supervised daemon
+```
+
+Run it under `sudo`: the daemon binds `:443`/`:80` as root, then drops to the user behind `sudo` (taken from `SUDO_USER`). The generated unit pins that user's `HOME` and `SUDO_UID`/`SUDO_GID` so the privilege drop works without an interactive `sudo`, and seeds a `PATH` (homebrew/`~/.local`/cargo/bun/volta) so spawned tasks find their interpreters — edit the unit if a task needs more.
+
+**macOS (launchd).** Writes `/Library/LaunchDaemons/com.taskmux.daemon.plist` and bootstraps it into the system domain. `KeepAlive` relaunches on any abnormal exit (crash, `SIGKILL`, a closed terminal's `SIGHUP`) but **not** after a clean `taskmux daemon stop` — so `stop` still stops it; to fully resume supervision after a manual stop, `daemon install` again or `launchctl kickstart system/com.taskmux.daemon`. Pre-priv-drop crash output (the kind that never reaches `daemon.log`) is captured to `~/.taskmux/launchd.{out,err}.log`.
+
+```bash
+sudo launchctl print system/com.taskmux.daemon   # inspect the live job
+sudo launchctl bootout system/com.taskmux.daemon # same as `daemon uninstall` (leaves the plist)
+```
+
+**Linux (systemd, experimental).** `daemon install` writes `/etc/systemd/system/taskmux.service` and prints the enable steps rather than running them — review the unit, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now taskmux.service
+```
 
 Each project carries a `state`: `ok` while loaded, `config_missing` if its `taskmux.toml` is absent or was deleted (entry stays in the registry, health checks pause), `error` if loading the config raised. Surfaced in `daemon list` and the `list_projects` WS command.
 

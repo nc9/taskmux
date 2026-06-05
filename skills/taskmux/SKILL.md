@@ -72,6 +72,8 @@ taskmux prune --apply               # actually clean
 taskmux daemon [start|stop|status|restart|list]
 taskmux daemon status               # pid + proxy/port binding (is :443/:80 bound?)
 taskmux daemon register [--force]   # register cwd in global registry
+sudo taskmux daemon install         # OS supervisor (launchd/systemd): auto-restart on crash/sleep/reboot
+sudo taskmux daemon uninstall       # remove the OS supervisor
 
 # Proxy / certs
 taskmux ca install                  # one-time mkcert root install (OS keychain)
@@ -335,6 +337,9 @@ Linked git worktrees get an auto-suffixed `project_id` (e.g. `myproject-feat-foo
 ### "URL says healthy but my browser can't reach it"
 - Check `taskmux status --json | jq .proxy` — `bound: false` means daemon proxy isn't listening (run `sudo taskmux daemon` or set `proxy_https_port` >=1024).
 - Check `last_health.method == "proxy"` on the task — reason text says exactly which gate failed.
+
+### "Daemon keeps dying / won't stay up"
+- `taskmux daemon status` shows `running: false` repeatedly → it's an unsupervised foreground process (dies on crash/sleep/closed terminal/reboot). Install an OS supervisor: `sudo taskmux daemon install` (launchd on macOS, systemd on Linux). It auto-restarts on abnormal exit but honors a clean `taskmux daemon stop`.
 
 ### "Add a new dev task"
 ```bash
