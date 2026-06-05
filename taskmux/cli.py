@@ -1640,7 +1640,11 @@ def daemon_status():
     host = gc.proxy_bind or "127.0.0.1"
 
     proxy: dict = {"enabled": gc.proxy_enabled, "https_port": gc.proxy_https_port}
-    if gc.proxy_enabled and pid is not None:
+    if gc.proxy_enabled:
+        # Connect-probe actual OS state regardless of whether *our* daemon is up.
+        # Gating these on `pid is not None` made `--json` emit a bare
+        # {enabled, https_port} when the daemon was down — which reads as "bound"
+        # to a consumer. Always report https_bound so a dead daemon never looks live.
         proxy["https_bound"] = _port_listening(host, gc.proxy_https_port)
         proxy["redirect_port"] = gc.proxy_http_redirect_port
         proxy["redirect_bound"] = _port_listening(host, gc.proxy_http_redirect_port)
@@ -1654,6 +1658,9 @@ def daemon_status():
         # DNS server always binds loopback regardless of proxy_bind.
         "bind": "127.0.0.1",
         "port": gc.dns_server_port if gc.host_resolver == "dns_server" else None,
+        # In-process UDP listener — only exists while the daemon runs. Reported so
+        # the dns block can't imply an active resolver when nothing is serving it.
+        "active": gc.host_resolver == "dns_server" and pid is not None,
     }
 
     if is_json_mode():
@@ -1712,7 +1719,8 @@ def daemon_status():
         )
 
     if gc.host_resolver == "dns_server":
-        console.print(f"DNS:     dns_server on 127.0.0.1:{gc.dns_server_port}")
+        suffix = "" if pid is not None else " [yellow]— daemon not running (not serving)[/yellow]"
+        console.print(f"DNS:     dns_server on 127.0.0.1:{gc.dns_server_port}{suffix}")
     else:
         console.print(f"DNS:     resolver = {gc.host_resolver}")
 

@@ -1002,3 +1002,32 @@ class TestDaemonStatusProxy:
         assert data["pid"] == 123
         assert data["proxy"]["enabled"] is False
         assert data["dns"]["resolver"] == "dns_server"
+
+    def test_json_daemon_down_reports_unbound(self, monkeypatch):
+        # Regression: daemon down + proxy enabled must NOT emit a bare
+        # {enabled, https_port} (reads as "bound"). https_bound/dns.active must
+        # reflect that nothing is actually listening.
+        import json as _json
+
+        self._patch(monkeypatch, pid=None, cfg=self._cfg(), listening=False)
+        result = runner.invoke(app, ["--json", "daemon", "status"])
+        assert result.exit_code == 0
+        data = _json.loads(result.output)
+        assert data["running"] is False
+        assert data["proxy"]["enabled"] is True
+        assert data["proxy"]["https_bound"] is False
+        assert data["proxy"]["redirect_bound"] is False
+        assert data["proxy"]["https_owner_pid"] is None
+        assert data["dns"]["active"] is False
+
+    def test_json_daemon_down_foreign_listener(self, monkeypatch):
+        # Daemon down but something else holds :443 → https_bound true, but the
+        # owner pid is surfaced so a consumer sees it isn't our daemon.
+        import json as _json
+
+        self._patch(monkeypatch, pid=None, cfg=self._cfg(), listening=True, owner_pid=999)
+        result = runner.invoke(app, ["--json", "daemon", "status"])
+        assert result.exit_code == 0
+        data = _json.loads(result.output)
+        assert data["running"] is False
+        assert data["proxy"]["https_bound"] is True
