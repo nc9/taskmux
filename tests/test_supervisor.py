@@ -884,6 +884,118 @@ class TestAutoRestart:
             m.assert_not_called()
 
 
+class TestPtyLeak:
+    """Regression tests for pty-master exhaustion (issue #3): a task with a
+    deleted cwd made every auto-restart sweep leak one pty master until the
+    OS pool (511 on macOS) was exhausted."""
+
+    def test_spawn_failure_closes_both_pty_fds(self, tmp_path):
+        import pty as _pty
+
+        cfg = _make_config(tasks={"web": {"command": "echo", "cwd": str(tmp_path / "gone")}})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+        captured: dict[str, tuple[int, int]] = {}
+        real_openpty = _pty.openpty
+
+        def capture():
+            fds = real_openpty()
+            captured["fds"] = fds
+            return fds
+
+        async def _go():
+            with (
+                patch("taskmux.supervisor.pty.openpty", side_effect=capture),
+                pytest.raises(FileNotFoundError),
+            ):
+                await sup._spawn("web")
+            for fd in captured["fds"]:
+                with pytest.raises(OSError):
+                    os.fstat(fd)
+            assert "web" not in sup._tasks
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_failed_restart_attempt_still_backs_off(self, tmp_path):
+        """A spawn that raises must count as a restart attempt — without this
+        the loop retried (and pre-fix, leaked a pty) every ~5 s sweep forever."""
+        cfg = _make_config(
+            tasks={
+                "web": {
+                    "command": "echo",
+                    "cwd": str(tmp_path / "gone"),
+                    "restart_policy": RestartPolicy.ALWAYS,
+                    "restart_backoff": 5,
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            with pytest.raises(FileNotFoundError):
+                await sup.auto_restart_tasks()
+            assert sup.restart_tracker.get("web")["count"] == 1
+            # Second sweep lands inside the backoff window → no retry, no raise.
+            await sup.auto_restart_tasks()
+            assert sup.restart_tracker.get("web")["count"] == 1
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_stale_exit_does_not_untrack_replacement(self, tmp_path):
+        """An exit notification from a replaced process must not tear down the
+        TaskProcess that now owns the name (it would close the live master and
+        untrack the task, leaving a running duplicate)."""
+        cfg = _make_config(tasks={"t": "sleep 5"})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            await sup._spawn("t")
+            sup._on_task_exited("t", 0, MagicMock())
+            assert "t" in sup._tasks
+            await sup._stop_one("t", 1)
+            assert "t" not in sup._tasks
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_respawn_over_stale_entry_closes_old_master(self, tmp_path):
+        """If a prior TaskProcess survived its stop (exit-waiter cancelled),
+        spawning over it must close the old master fd, not drop it open."""
+        cfg = _make_config(tasks={"t": "sleep 5"})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            old = await sup._spawn("t")
+            old_fd = old.master_fd
+            # Simulate the cancelled exit-waiter: process dead, entry stale.
+            sup._killpg(old.pgid, 9)
+            await sup._wait_proc_exit(old.proc, 2)
+            if old.exit_task is not None:
+                old.exit_task.cancel()
+            sup._tasks["t"] = old  # ensure entry still present (stale)
+            new = await sup._spawn("t")
+            with pytest.raises(OSError):
+                os.fstat(old_fd)
+            assert sup._tasks["t"] is new
+            await sup._stop_one("t", 1)
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
+
 class TestProbeUpstreamCache:
     """probe_upstream caches results for 1.5 s and respects cache invalidation."""
 

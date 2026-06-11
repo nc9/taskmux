@@ -632,6 +632,13 @@ class PosixSupervisor:
                 preexec_fn=self._build_preexec(),
                 close_fds=True,
             )
+        except BaseException:
+            # Spawn failed (e.g. deleted cwd) — release the master too, or every
+            # auto-restart attempt leaks one pty until the OS pool (511 on
+            # macOS) is exhausted and no task can start anywhere.
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+            raise
         finally:
             os.close(slave_fd)
 
@@ -640,18 +647,27 @@ class PosixSupervisor:
         except OSError:
             pgid = proc.pid
 
-        log_path = _logPath(self.config.name, task_name, task_cfg, self.worktree_id)
-        banner, annotator = self._build_log_decor(task_name, task_cfg)
-        log_writer = LogWriter(
-            log_path,
-            _parseSize(task_cfg.log_max_size),
-            task_cfg.log_max_files,
-            banner=banner,
-            annotator=annotator,
-        )
+        try:
+            log_path = _logPath(self.config.name, task_name, task_cfg, self.worktree_id)
+            banner, annotator = self._build_log_decor(task_name, task_cfg)
+            log_writer = LogWriter(
+                log_path,
+                _parseSize(task_cfg.log_max_size),
+                task_cfg.log_max_files,
+                banner=banner,
+                annotator=annotator,
+            )
 
-        loop = asyncio.get_running_loop()
-        loop.add_reader(master_fd, lambda: self._on_pty_data(task_name, master_fd, log_writer))
+            loop = asyncio.get_running_loop()
+            loop.add_reader(master_fd, lambda: self._on_pty_data(task_name, master_fd, log_writer))
+        except BaseException:
+            # The child exists but won't be tracked — kill it and release the
+            # master, or it lingers as an unsupervised duplicate.
+            self._detach_reader(master_fd)
+            with contextlib.suppress(OSError):
+                os.close(master_fd)
+            self._killpg(pgid, signal.SIGKILL)
+            raise
 
         tp = TaskProcess(
             proc=proc,
@@ -662,6 +678,18 @@ class PosixSupervisor:
             started_at=time.time(),
         )
         tp.exit_task = asyncio.create_task(self._wait_for_exit(task_name, proc))
+        stale = self._tasks.pop(task_name, None)
+        if stale is not None:
+            # A prior TaskProcess survived its stop (exit-waiter cancelled or
+            # timed out) — close its master before overwriting or the fd leaks.
+            # If its process is somehow still alive, kill it too: untracked it
+            # would linger as a duplicate fighting the replacement for ports.
+            if stale.proc.returncode is None:
+                self._killpg(stale.pgid, signal.SIGKILL)
+            self._detach_reader(stale.master_fd)
+            with contextlib.suppress(OSError):
+                os.close(stale.master_fd)
+            stale.log_writer.close()
         self._tasks[task_name] = tp
         self._running[task_name] = {
             "pid": proc.pid,
@@ -692,9 +720,20 @@ class PosixSupervisor:
 
     async def _wait_for_exit(self, task_name: str, proc: asyncio.subprocess.Process) -> None:
         exit_code = await proc.wait()
-        self._on_task_exited(task_name, exit_code)
+        self._on_task_exited(task_name, exit_code, proc)
 
-    def _on_task_exited(self, task_name: str, exit_code: int) -> None:
+    def _on_task_exited(
+        self,
+        task_name: str,
+        exit_code: int,
+        proc: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        current = self._tasks.get(task_name)
+        if current is not None and proc is not None and current.proc is not proc:
+            # Stale exit from a replaced spawn — the new TaskProcess owns this
+            # name now; its own exit-waiter handles cleanup. Tearing down here
+            # would close the live task's master and untrack it.
+            return
         tp = self._tasks.pop(task_name, None)
         if self._running.pop(task_name, None) is not None:
             self._save_state()
@@ -866,6 +905,14 @@ class PosixSupervisor:
         if tp.exit_task is not None and not tp.exit_task.done():
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await asyncio.wait_for(tp.exit_task, timeout=2)
+        self._finalize_if_exited(task_name, tp)
+
+    def _finalize_if_exited(self, task_name: str, tp: TaskProcess) -> None:
+        """Inline fallback when the exit-waiter didn't finish (wait_for timeout
+        cancels it) — without this the dead task stays in _tasks with an open
+        master fd, and the next spawn would leak it."""
+        if self._tasks.get(task_name) is tp and tp.proc.returncode is not None:
+            self._on_task_exited(task_name, tp.proc.returncode, tp.proc)
 
     def _err(self, code: ErrorCode, **kwargs: str | int) -> dict:
         err = TaskmuxError(code, **kwargs)
@@ -1030,6 +1077,7 @@ class PosixSupervisor:
         if tp.exit_task is not None and not tp.exit_task.done():
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await asyncio.wait_for(tp.exit_task, timeout=2)
+        self._finalize_if_exited(task_name, tp)
 
         cfg = self.config.tasks.get(task_name)
         if cfg is not None and cfg.host is not None:
@@ -1501,10 +1549,15 @@ class PosixSupervisor:
 
             reason = "process_exited" if not proc_alive else "health_retries_exceeded"
             recordEvent("auto_restart", session=self.project_id, task=task_name, reason=reason)
-            async with self._lock_for(task_name):
-                await self._restart_task_locked(task_name)
-            self.restart_tracker.record(task_name)
-            self.restart_tracker.reset_health_failures(task_name)
+            try:
+                async with self._lock_for(task_name):
+                    await self._restart_task_locked(task_name)
+            finally:
+                # Count the attempt even when the spawn raised (deleted cwd,
+                # exec failure) so backoff applies — otherwise the loop retries
+                # at sweep cadence forever, hammering a permanently-broken task.
+                self.restart_tracker.record(task_name)
+                self.restart_tracker.reset_health_failures(task_name)
 
 
 def make_supervisor(
