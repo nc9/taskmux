@@ -1032,6 +1032,51 @@ class TestSpawnPrecheck:
         finally:
             _stop_log_redirect(sup)
 
+    def test_failed_hook_start_leaves_tracker_state_untouched(self, tmp_path):
+        """before_start hook failure (after the precheck) must also leave
+        manual-stop and explicit-start state unchanged — mutations happen only
+        after a successful spawn."""
+        cfg = _make_config(
+            tasks={
+                "web": {
+                    "command": "echo",
+                    "auto_start": False,
+                    "hooks": {"before_start": "false"},
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.restart_tracker.mark_manually_stopped("web")
+        _redirect_logs(sup, tmp_path)
+        try:
+            result = _run(sup.start_task("web"))
+            assert not result["ok"]
+            assert result["error_code"] == ErrorCode.HOOK_FAILED.value
+            assert not sup.restart_tracker.was_explicitly_started("web")
+            assert sup.restart_tracker.is_manually_stopped("web")
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_spawn_exception_leaves_tracker_state_untouched(self, tmp_path):
+        cfg = _make_config(tasks={"web": {"command": "echo", "auto_start": False}})
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.restart_tracker.mark_manually_stopped("web")
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            with (
+                patch.object(sup, "_spawn", side_effect=OSError("exec failed")),
+                pytest.raises(OSError),
+            ):
+                await sup.start_task("web")
+            assert not sup.restart_tracker.was_explicitly_started("web")
+            assert sup.restart_tracker.is_manually_stopped("web")
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
     def test_restart_missing_cwd_does_not_stop_running_task(self, tmp_path):
         """A respawn that can't succeed must not take down the live process."""
         cfg = _make_config(tasks={"web": {"command": "sleep 5", "cwd": str(tmp_path / "d")}})

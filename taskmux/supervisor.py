@@ -978,10 +978,6 @@ class PosixSupervisor:
         # nothing started, so no state should change.
         if (precheck_err := self._precheck_spawn(task_name)) is not None:
             return precheck_err
-        self.restart_tracker.clear_manually_stopped(task_name)
-        # Explicit user start opts an auto_start=false task into auto-restart.
-        # After the config check so a bogus name leaves no stale opt-in.
-        self.restart_tracker.mark_explicit_start(task_name)
 
         task_cfg = self.config.tasks[task_name]
 
@@ -1002,6 +998,12 @@ class PosixSupervisor:
             )
 
         await self._spawn(task_name)
+
+        # Tracker mutations only after the spawn actually succeeded — a hook
+        # failure or spawn exception above must not clear a manual stop or opt
+        # an auto_start=false task into auto-restart (explicit-start opt-in).
+        self.restart_tracker.clear_manually_stopped(task_name)
+        self.restart_tracker.mark_explicit_start(task_name)
 
         runHook(task_cfg.hooks.after_start, task_name)
         runHook(self.config.hooks.after_start, task_name)
@@ -1052,13 +1054,6 @@ class PosixSupervisor:
         # an auto_start=false task into auto-restart.
         if (precheck_err := self._precheck_spawn(task_name)) is not None:
             return precheck_err
-        self.restart_tracker.clear_manually_stopped(task_name)
-        # Only a user-initiated restart opts an auto_start=false task into
-        # auto-restart. The internal auto_restart_tasks path (explicit=False)
-        # must NOT — otherwise a later live-reload to auto_start=false would
-        # keep reviving a task the user never explicitly started.
-        if explicit:
-            self.restart_tracker.mark_explicit_start(task_name)
 
         task_cfg = self.config.tasks[task_name]
         if task_name in self._tasks:
@@ -1072,6 +1067,17 @@ class PosixSupervisor:
 
         runHook(task_cfg.hooks.before_start, task_name)
         await self._spawn(task_name)
+
+        # Tracker mutations only after the spawn actually succeeded — a spawn
+        # exception above must not clear a manual stop, and only a successful
+        # user-initiated restart opts an auto_start=false task into
+        # auto-restart. The internal auto_restart_tasks path (explicit=False)
+        # must NOT — otherwise a later live-reload to auto_start=false would
+        # keep reviving a task the user never explicitly started.
+        self.restart_tracker.clear_manually_stopped(task_name)
+        if explicit:
+            self.restart_tracker.mark_explicit_start(task_name)
+
         runHook(task_cfg.hooks.after_start, task_name)
 
         if task_cfg.host is not None:
