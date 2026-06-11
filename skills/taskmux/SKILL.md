@@ -54,8 +54,10 @@ taskmux logs-clean [<task>]                 # alias for `clean --logs`
 # Config
 taskmux add <task> "<cmd>" [--host api]     # adds to taskmux.toml
 taskmux remove <task>
-taskmux check                               # lint config: missing cwd, bad names,
-                                            #   unknown deps, executables (exit 1 on error)
+taskmux check                               # validate config: structure (bad task
+                                            #   names, dup hosts, dep cycles) + env
+                                            #   (missing cwd, executable not on PATH,
+                                            #   bad health_url); exit 1 on errors
 taskmux inject [CLAUDE.md|AGENTS.md|all]    # refresh agent context block
                                             #   (or create file if missing)
 
@@ -113,8 +115,9 @@ taskmux inspect <task> --json
 taskmux events --task <task> --since 1h --json | jq '.events[-5:]'
 taskmux logs <task> --since 10m -g "error|exception|fatal"
 
-# Recent restarts
-taskmux events --since 1h --json | jq '.events[] | select(.event | test("auto_restart|max_restarts_reached"))'
+# Recent restarts (auto_restart_failed = restart attempted but spawn failed,
+# e.g. cwd deleted; reason field says why)
+taskmux events --since 1h --json | jq '.events[] | select(.event | test("auto_restart|auto_restart_failed|max_restarts_reached"))'
 ```
 
 Result shape: `{"ok": true|false, ...}`. Error: `{"ok": false, "error": "..."}`.
@@ -342,6 +345,26 @@ Linked git worktrees get an auto-suffixed `project_id` (e.g. `myproject-feat-foo
 
 ### "Daemon keeps dying / won't stay up"
 - `taskmux daemon status` shows `running: false` repeatedly → it's an unsupervised foreground process (dies on crash/sleep/closed terminal/reboot). Install an OS supervisor: `sudo taskmux daemon install` (launchd on macOS, systemd on Linux). It auto-restarts on abnormal exit but honors a clean `taskmux daemon stop`.
+
+### "Task won't start: `E213` / `cwd does not exist`"
+The task's `cwd` points at a deleted/renamed directory (common after removing
+an app from a monorepo or deleting a worktree). `start`/`restart` fail fast
+with `E213` without touching a running instance; the auto-restart loop backs
+off and parks at `max_restarts` (events: `auto_restart_failed` →
+`max_restarts_reached`).
+```bash
+taskmux check          # flags every cwd_missing task in the config
+```
+Fix the `cwd`, or remove the task / set `auto_start = false` +
+`restart_policy = "no"` if the directory is gone for good.
+
+### "Did I break the config?"
+`taskmux check` (exit 1 on errors) validates structure (task names, duplicate
+hosts, unknown deps, cycles) and environment (missing cwd, executable not on
+PATH, malformed health_url, auto_start task depending on a manual task).
+The daemon also logs these as warnings on every config (re)load. Task names
+must match `[A-Za-z0-9_][A-Za-z0-9_.-]*` — they appear in log filenames and
+CLI args, so no spaces, slashes, or leading `-`/`.`.
 
 ### "Add a new dev task"
 ```bash
