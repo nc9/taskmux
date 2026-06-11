@@ -1,6 +1,6 @@
 [project]
 name = "taskmux"
-version = "0.9.10"
+version = "0.9.11"
 description = "Modern tmux-based task manager for LLM development tools"
 readme = "README.md"
 license-file = "LICENSE"
