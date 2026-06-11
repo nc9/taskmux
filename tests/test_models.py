@@ -187,6 +187,21 @@ class TestTaskmuxConfig:
             TaskmuxConfig(name="x", mystery=42)  # type: ignore[call-arg]
         assert exc_info.value.code == ErrorCode.CONFIG_UNKNOWN_KEYS
 
+    def test_task_name_rejects_unsafe_chars(self):
+        for bad in ("has space", "slash/y", "-leadingdash", "", ".hidden", "tab\tname"):
+            with pytest.raises(TaskmuxError) as exc_info:
+                TaskmuxConfig(tasks={bad: TaskConfig(command="echo")})
+            assert exc_info.value.code == ErrorCode.CONFIG_INVALID_TASK, bad
+
+    def test_task_name_accepts_safe_chars(self):
+        c = TaskmuxConfig(
+            tasks={
+                n: TaskConfig(command="echo")
+                for n in ("web", "worker-agent", "log_pipe", "v2.api", "1task", "_db")
+            }
+        )
+        assert len(c.tasks) == 6
+
     def test_depends_on_unknown_task(self):
         with pytest.raises(TaskmuxError) as exc_info:
             TaskmuxConfig(tasks={"a": TaskConfig(command="echo a", depends_on=["nonexistent"])})

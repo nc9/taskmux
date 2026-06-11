@@ -54,6 +54,8 @@ taskmux logs-clean [<task>]                 # alias for `clean --logs`
 # Config
 taskmux add <task> "<cmd>" [--host api]     # adds to taskmux.toml
 taskmux remove <task>
+taskmux check                               # lint config: missing cwd, bad names,
+                                            #   unknown deps, executables (exit 1 on error)
 taskmux inject [CLAUDE.md|AGENTS.md|all]    # refresh agent context block
                                             #   (or create file if missing)
 

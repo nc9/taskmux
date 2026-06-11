@@ -498,6 +498,7 @@ class TaskmuxDaemon:
         self.projects[session] = sup
         self.project_states[session] = "ok"
         self._warned_missing_configs.pop(session, None)
+        self._log_config_lint(session, cfg, config_path.parent)
 
         if self._proxy_eligible and self.proxy is not None:
             self._mint_and_register_proxy(session)
@@ -1235,6 +1236,18 @@ class TaskmuxDaemon:
         self._sync_hostnames()
         self.logger.info(f"Project '{session}' marked config_missing — health checks paused")
 
+    def _log_config_lint(self, session: str, cfg, config_dir) -> None:  # type: ignore[no-untyped-def]
+        """Surface environment lint (missing cwd etc.) in the daemon log so a
+        broken task is visible before it churns the auto-restart loop."""
+        from .validate import validateEnvironment
+
+        with contextlib.suppress(Exception):
+            for issue in validateEnvironment(cfg, config_dir):
+                self.logger.warning(
+                    f"config lint [{session}] {issue.severity} {issue.code} "
+                    f"task {issue.task!r}: {issue.message}"
+                )
+
     def _on_config_reload(self, session: str) -> None:
         """ConfigWatcher reload — reload the parsed config + refresh routes."""
         if self._loop is None:
@@ -1255,6 +1268,7 @@ class TaskmuxDaemon:
             self.configs[session] = cfg
             recordEvent("config_reloaded", session=session)
             self.logger.info(f"Reloaded config for '{session}'")
+            self._log_config_lint(session, cfg, cfg_path.parent)
             await self._resync_project_routes(session)
             self._sync_hostnames()
 

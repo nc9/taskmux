@@ -1191,6 +1191,76 @@ def health(
 
 
 @app.command()
+def check():
+    """Validate taskmux.toml: structure plus environment (missing cwd, executables, deps).
+
+    Exit code 1 when any error-severity issue is found. Warnings don't fail.
+    """
+    from .errors import ErrorCode
+    from .validate import validateEnvironment
+
+    config_path = Path("taskmux.toml").resolve()
+    try:
+        if not config_path.exists():
+            # loadConfig falls back to a default empty config when the file is
+            # absent — for a validation command that must be an error, not
+            # "config OK (0 tasks)".
+            raise TaskmuxError(ErrorCode.CONFIG_NOT_FOUND, path=str(config_path))
+        cli = TaskmuxCLI()
+    except TaskmuxError as e:
+        issue = {
+            "severity": "error",
+            "code": e.code.value,
+            "task": None,
+            "message": e.message,
+        }
+        if is_json_mode():
+            print_result(
+                {"ok": False, "config": str(config_path), "errors": [issue], "warnings": []}
+            )
+        else:
+            console.print(f"[red]✗[/red] {e.message}")
+        raise typer.Exit(1) from None
+
+    issues = [i.to_dict() for i in validateEnvironment(cli.config, cli.config_path.parent)]
+    errors = [i for i in issues if i["severity"] == "error"]
+    warnings = [i for i in issues if i["severity"] == "warning"]
+
+    if is_json_mode():
+        print_result(
+            {
+                "ok": not errors,
+                "config": str(cli.config_path),
+                "errors": errors,
+                "warnings": warnings,
+            }
+        )
+        if errors:
+            raise typer.Exit(1)
+        return
+
+    for i in errors:
+        task_str = f" [magenta]{i['task']}[/magenta]:" if i["task"] else ""
+        console.print(f"[red]✗ {i['code']}[/red]{task_str} {i['message']}")
+    for i in warnings:
+        task_str = f" [magenta]{i['task']}[/magenta]:" if i["task"] else ""
+        console.print(f"[yellow]⚠ {i['code']}[/yellow]{task_str} {i['message']}")
+
+    if errors:
+        console.print(
+            f"[red]{len(errors)} error(s)[/red], {len(warnings)} warning(s) "
+            f"in {len(cli.config.tasks)} task(s)"
+        )
+        raise typer.Exit(1)
+    if warnings:
+        console.print(
+            f"[yellow]{len(warnings)} warning(s)[/yellow] in {len(cli.config.tasks)} task(s)"
+        )
+    else:
+        console.print(f"[green]✓[/green] config OK ({len(cli.config.tasks)} task(s))")
+
+
+@app.command()
 def events(
     task: str | None = typer.Option(None, "--task", help="Filter by task name"),
     since: str | None = typer.Option(None, "--since", help="Time filter (e.g. 10m, 1h, 2d)"),

@@ -918,6 +918,15 @@ class PosixSupervisor:
         err = TaskmuxError(code, **kwargs)
         return {"ok": False, "error_code": code.value, "error": err.message}
 
+    def _precheck_spawn(self, task_name: str) -> dict | None:
+        """Catch doomed spawns before any resource is allocated or a running
+        task is stopped. A deleted cwd previously surfaced as a raw
+        FileNotFoundError after the pty was already open (issue #3)."""
+        cwd = self._resolve_cwd(self.config.tasks[task_name].cwd)
+        if cwd is not None and not Path(cwd).is_dir():
+            return self._err(ErrorCode.TASK_CWD_MISSING, task=task_name, cwd=cwd)
+        return None
+
     def _toposort_tasks(self, task_names: list[str]) -> list[str]:
         in_degree: dict[str, int] = {n: 0 for n in task_names}
         dependents: dict[str, list[str]] = {n: [] for n in task_names}
@@ -958,14 +967,21 @@ class PosixSupervisor:
             return await self._start_task_locked(task_name)
 
     async def _start_task_locked(self, task_name: str) -> dict:
-        self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
+        if task_name in self._tasks:
+            self.restart_tracker.clear_manually_stopped(task_name)
+            self.restart_tracker.mark_explicit_start(task_name)
+            return self._err(ErrorCode.TASK_ALREADY_RUNNING, task=task_name)
+        # Precheck before any tracker mutation: a doomed start must not clear
+        # a manual stop or opt an auto_start=false task into auto-restart —
+        # nothing started, so no state should change.
+        if (precheck_err := self._precheck_spawn(task_name)) is not None:
+            return precheck_err
+        self.restart_tracker.clear_manually_stopped(task_name)
         # Explicit user start opts an auto_start=false task into auto-restart.
         # After the config check so a bogus name leaves no stale opt-in.
         self.restart_tracker.mark_explicit_start(task_name)
-        if task_name in self._tasks:
-            return self._err(ErrorCode.TASK_ALREADY_RUNNING, task=task_name)
 
         task_cfg = self.config.tasks[task_name]
 
@@ -1029,9 +1045,14 @@ class PosixSupervisor:
             return await self._restart_task_locked(task_name, explicit=True)
 
     async def _restart_task_locked(self, task_name: str, *, explicit: bool = False) -> dict:
-        self.restart_tracker.clear_manually_stopped(task_name)
         if task_name not in self.config.tasks:
             return self._err(ErrorCode.TASK_NOT_FOUND, task=task_name)
+        # Before stopping anything or mutating tracker state: a doomed respawn
+        # must not take down the running instance, clear a manual stop, or opt
+        # an auto_start=false task into auto-restart.
+        if (precheck_err := self._precheck_spawn(task_name)) is not None:
+            return precheck_err
+        self.restart_tracker.clear_manually_stopped(task_name)
         # Only a user-initiated restart opts an auto_start=false task into
         # auto-restart. The internal auto_restart_tasks path (explicit=False)
         # must NOT — otherwise a later live-reload to auto_start=false would
@@ -1132,6 +1153,9 @@ class PosixSupervisor:
             async with self._lock_for(task_name):
                 if task_name in self._tasks:
                     warnings.append(f"Task '{task_name}' already running, skipped")
+                    continue
+                if (precheck_err := self._precheck_spawn(task_name)) is not None:
+                    warnings.append(f"Skipping '{task_name}': {precheck_err['error']}")
                     continue
 
                 runHook(task_cfg.hooks.before_start, task_name)
@@ -1551,13 +1575,22 @@ class PosixSupervisor:
             recordEvent("auto_restart", session=self.project_id, task=task_name, reason=reason)
             try:
                 async with self._lock_for(task_name):
-                    await self._restart_task_locked(task_name)
+                    result = await self._restart_task_locked(task_name)
             finally:
                 # Count the attempt even when the spawn raised (deleted cwd,
                 # exec failure) so backoff applies — otherwise the loop retries
                 # at sweep cadence forever, hammering a permanently-broken task.
                 self.restart_tracker.record(task_name)
                 self.restart_tracker.reset_health_failures(task_name)
+            if not result.get("ok"):
+                # Bounded spam: record() above means max_restarts (default 5)
+                # caps these, then the edge-triggered cap event takes over.
+                recordEvent(
+                    "auto_restart_failed",
+                    session=self.project_id,
+                    task=task_name,
+                    reason=result.get("error"),
+                )
 
 
 def make_supervisor(

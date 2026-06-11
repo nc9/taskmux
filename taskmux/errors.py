@@ -23,6 +23,7 @@ class ErrorCode(StrEnum):
     TASK_DEPENDENCY_MISSING = "E210"
     TASK_DEPENDENCY_SELF = "E211"
     TASK_DEPENDENCY_CYCLE = "E212"
+    TASK_CWD_MISSING = "E213"
 
     # Session errors (E3xx)
     SESSION_NOT_FOUND = "E300"
@@ -56,6 +57,7 @@ MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.TASK_DEPENDENCY_MISSING: "Task '{task}' depends on unknown task '{dep}'",
     ErrorCode.TASK_DEPENDENCY_SELF: "Task '{task}' depends on itself",
     ErrorCode.TASK_DEPENDENCY_CYCLE: "Dependency cycle detected involving '{dep}'",
+    ErrorCode.TASK_CWD_MISSING: "Task '{task}' cwd does not exist: {cwd}",
     ErrorCode.SESSION_NOT_FOUND: "Session '{session}' doesn't exist. Run 'taskmux start' first.",
     ErrorCode.SESSION_EXISTS: "Session '{session}' already exists",
     ErrorCode.SESSION_ALREADY_REGISTERED: (

@@ -16,6 +16,12 @@ _DNS_SLUG = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 # are valid in some records (e.g. SRV) but not for HTTPS names.
 _DNS_LABEL = re.compile(r"^(?=.{1,63}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 
+# Task names land in log filenames, ps markers, CLI args, and event records —
+# path separators or whitespace break those downstream consumers. Leading `-`
+# clashes with CLI flags; leading `.` makes hidden log files (and `..` would
+# traverse). Leading `_` is harmless and allowed.
+_TASK_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
 
 class TunnelKind(StrEnum):
     """Per-task public-tunnel backend."""
@@ -265,6 +271,21 @@ class TaskmuxConfig(_StrictConfig):
                 ),
             )
         return v
+
+    @model_validator(mode="after")
+    def _validate_task_names(self) -> "TaskmuxConfig":
+        for name in self.tasks:
+            if not _TASK_NAME.match(name):
+                raise TaskmuxError(
+                    ErrorCode.CONFIG_INVALID_TASK,
+                    task=name,
+                    detail=(
+                        "task name must start with a letter, digit, or '_' and contain "
+                        "only letters, digits, '_', '.', '-' (it is used in log "
+                        "filenames, process markers, and CLI arguments)"
+                    ),
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_unique_hosts(self) -> "TaskmuxConfig":

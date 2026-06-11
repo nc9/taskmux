@@ -465,6 +465,59 @@ class TestUrlCommand:
         assert result.exit_code == 1
 
 
+class TestCheckCommand:
+    def test_clean_config_exits_zero(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "sleep 5"\n')
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["check"])
+        assert result.exit_code == 0, result.output
+        assert "config OK" in result.output
+
+    def test_missing_cwd_exits_one(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "sleep 5"\ncwd = "apps/gone"\n')
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["check"])
+        assert result.exit_code == 1
+        assert "cwd_missing" in result.output
+
+    def test_json_shape(self, tmp_path: Path, monkeypatch):
+        import json as _json
+
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "sleep 5"\ncwd = "apps/gone"\n')
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["--json", "check"])
+        assert result.exit_code == 1
+        data = _json.loads(result.output)
+        assert data["ok"] is False
+        assert data["errors"][0]["code"] == "cwd_missing"
+        assert data["errors"][0]["task"] == "api"
+
+    def test_structural_error_reported(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks."bad name"]\ncommand = "x"\n')
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["check"])
+        assert result.exit_code == 1
+        assert "bad name" in result.output
+
+    def test_no_config_file_exits_one(self, tmp_path: Path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["check"])
+        assert result.exit_code == 1
+        assert "not found" in result.output
+
+    def test_warning_only_exits_zero(self, tmp_path: Path, monkeypatch):
+        cfg = tmp_path / "taskmux.toml"
+        cfg.write_text('name = "demo"\n[tasks.api]\ncommand = "definitely-not-a-real-binary-xyz"\n')
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["check"])
+        assert result.exit_code == 0, result.output
+        assert "command_not_found" in result.output
+
+
 class TestOpenCommand:
     def test_open_with_host(self, tmp_path: Path, monkeypatch):
         cfg = tmp_path / "taskmux.toml"

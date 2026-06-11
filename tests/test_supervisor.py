@@ -9,7 +9,7 @@ import socket
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -921,12 +921,13 @@ class TestPtyLeak:
 
     def test_failed_restart_attempt_still_backs_off(self, tmp_path):
         """A spawn that raises must count as a restart attempt — without this
-        the loop retried (and pre-fix, leaked a pty) every ~5 s sweep forever."""
+        the loop retried (and pre-fix, leaked a pty) every ~5 s sweep forever.
+        (Missing cwd is now caught by the precheck, so simulate a spawn-time
+        failure the precheck can't see.)"""
         cfg = _make_config(
             tasks={
                 "web": {
                     "command": "echo",
-                    "cwd": str(tmp_path / "gone"),
                     "restart_policy": RestartPolicy.ALWAYS,
                     "restart_backoff": 5,
                 }
@@ -936,11 +937,13 @@ class TestPtyLeak:
         _redirect_logs(sup, tmp_path)
 
         async def _go():
-            with pytest.raises(FileNotFoundError):
+            with patch.object(sup, "_spawn", side_effect=OSError("exec failed")) as spawn:
+                with pytest.raises(OSError):
+                    await sup.auto_restart_tasks()
+                assert sup.restart_tracker.get("web")["count"] == 1
+                # Second sweep lands inside the backoff window → no retry.
                 await sup.auto_restart_tasks()
-            assert sup.restart_tracker.get("web")["count"] == 1
-            # Second sweep lands inside the backoff window → no retry, no raise.
-            await sup.auto_restart_tasks()
+                assert spawn.call_count == 1
             assert sup.restart_tracker.get("web")["count"] == 1
 
         try:
@@ -992,6 +995,113 @@ class TestPtyLeak:
 
         try:
             _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
+
+class TestSpawnPrecheck:
+    """Doomed spawns (missing cwd) are caught before any resource allocation
+    and surface as clean E213 result dicts, not raw FileNotFoundError."""
+
+    def test_start_missing_cwd_returns_e213(self, tmp_path):
+        cfg = _make_config(tasks={"web": {"command": "echo", "cwd": str(tmp_path / "gone")}})
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+        try:
+            result = _run(sup.start_task("web"))
+            assert not result["ok"]
+            assert result["error_code"] == ErrorCode.TASK_CWD_MISSING.value
+            assert "gone" in result["error"]
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_failed_start_leaves_tracker_state_untouched(self, tmp_path):
+        """A precheck-failed start must not clear a manual stop or opt an
+        auto_start=false task into auto-restart — nothing started."""
+        cfg = _make_config(
+            tasks={"web": {"command": "echo", "cwd": str(tmp_path / "gone"), "auto_start": False}}
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        sup.restart_tracker.mark_manually_stopped("web")
+        _redirect_logs(sup, tmp_path)
+        try:
+            result = _run(sup.start_task("web"))
+            assert not result["ok"]
+            assert not sup.restart_tracker.was_explicitly_started("web")
+            assert sup.restart_tracker.is_manually_stopped("web")
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_restart_missing_cwd_does_not_stop_running_task(self, tmp_path):
+        """A respawn that can't succeed must not take down the live process."""
+        cfg = _make_config(tasks={"web": {"command": "sleep 5", "cwd": str(tmp_path / "d")}})
+        (tmp_path / "d").mkdir()
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            await sup.start_task("web")
+            assert "web" in sup._tasks
+            (tmp_path / "d").rename(tmp_path / "moved")
+            result = await sup.restart_task("web")
+            assert not result["ok"]
+            assert result["error_code"] == ErrorCode.TASK_CWD_MISSING.value
+            assert "web" in sup._tasks  # still running
+            await sup.stop_all()
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_start_all_skips_missing_cwd_with_warning(self, tmp_path):
+        (tmp_path / "ok").mkdir()
+        cfg = _make_config(
+            tasks={
+                "good": {"command": "sleep 5", "cwd": str(tmp_path / "ok")},
+                "bad": {"command": "echo", "cwd": str(tmp_path / "gone")},
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+
+        async def _go():
+            result = await sup.start_all()
+            assert result["ok"]
+            assert result["tasks"] == ["good"]
+            assert any("bad" in w for w in result.get("warnings", []))
+            await sup.stop_all()
+
+        try:
+            _run(_go())
+        finally:
+            _stop_log_redirect(sup)
+
+    def test_auto_restart_missing_cwd_records_failure_event(self, tmp_path):
+        cfg = _make_config(
+            tasks={
+                "web": {
+                    "command": "echo",
+                    "cwd": str(tmp_path / "gone"),
+                    "restart_policy": RestartPolicy.ALWAYS,
+                }
+            }
+        )
+        sup = _make_supervisor(cfg, tmp_path)
+        _redirect_logs(sup, tmp_path)
+        events: list[tuple] = []
+        import taskmux.supervisor as supmod
+
+        try:
+            with patch.object(
+                supmod, "recordEvent", side_effect=lambda ev, **kw: events.append((ev, kw))
+            ):
+                _run(sup.auto_restart_tasks())  # must not raise
+            assert ("auto_restart_failed", ANY) in [(e, ANY) for e, _ in events]
+            failed = [kw for e, kw in events if e == "auto_restart_failed"]
+            assert failed and "gone" in str(failed[0].get("reason"))
+            # attempt counted → backoff applies
+            assert sup.restart_tracker.get("web")["count"] == 1
         finally:
             _stop_log_redirect(sup)
 
